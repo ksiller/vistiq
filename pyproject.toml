@@ -1,0 +1,83 @@
+[project]
+name = "vistiq"
+dynamic = ["version"]
+dependencies = [
+    "numpy",
+    "opencv-python-headless",
+    "scikit-image",
+    "scipy",
+    "torch",
+    "torchvision",
+    "trackastra<0.4",
+    "tifffile",
+    "prefect=3",
+]
+requires-python = ">=3.12"
+description = "Turn complex imaging data into actionable, quantitative insight with modular, multi-step analysis."
+readme = "README.md"
+classifiers = [
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+
+[project.optional-dependencies]
+napari = ["vistiq-napari"]
+
+[project.scripts]
+vistiq = "vistiq.app:main"
+
+[project.gui-scripts]
+vistiq = "vistiq.app:main"
+
+[project.urls]
+Homepage = "https://github.com/ksiller/vistiq"
+Issues = "https://github.com/ksiller/vistiq/issues"
+
+[build-system]
+requires = [
+    "hatchling",
+    "versioningit",
+]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "versioningit"
+
+[tool.versioningit.vcs]
+match = ["[0-9]*.[0-9]*.[0-9]*", "[0-9]*.[0-9]*.[0-9]*.dev[0-9]*"]
+default-tag = "0.0.0"
+
+[tool.versioningit.next-version]
+method = "smallest-release"
+
+[tool.versioningit.write]
+method = { module = "write_version_info", value = "write_version_info"}
+path = "src/vistiq/_version.py"
+
+[tool.versioningit.format]
+distance = "{base_version}.post{distance}+{vcs}{rev}"
+dirty = "{base_version}+d{build_date:%Y%m%d}"
+distance-dirty = "{base_version}.post{distance}+{vcs}{rev}.d{build_date:%Y%m%d}"
+
+[tool.hatch.build.targets.sdist]
+include = ["/src/vistiq", "/README.md", "/LICENSE", "/pyproject.toml"]
+
+[tool.black]
+line-length = 88
+target-version = ['py312']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
