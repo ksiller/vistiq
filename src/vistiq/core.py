@@ -1,15 +1,18 @@
 from abc import ABC, abstractmethod
-from typing import Generic, TypeVar, Literal
+from typing import Generic, TypeVar, Literal, Any
 from pydantic import BaseModel, ConfigDict
 from pydantic.dataclasses import dataclass
 import numpy as np
 from joblib import Parallel, delayed
+import logging
 
 from vistiq.utils import ArrayIterator, ArrayIteratorConfig
 
+logger = logging.getLogger(__name__)
+
 ConfigType = TypeVar("ConfigType", bound=BaseModel)
 
-@dataclass(config=ConfigDict(arbitrary_types_allowed=True))
+#@dataclass(config=ConfigDict(arbitrary_types_allowed=True))
 class Configuration(BaseModel):
     """Base configuration class for all vistiq components.
 
@@ -20,10 +23,17 @@ class Configuration(BaseModel):
     classname: str | None = None
 
     class Config:
-        """Pydantic configuration."""
+        """Pydantic configuration.
+        
+        Configures Pydantic model behavior:
+        - extra: "forbid" prevents extra fields from being accepted
+        - validate_assignment: Validates fields when assigned
+        - arbitrary_types_allowed: Allows arbitrary types (e.g., numpy arrays)
+        """
 
         extra = "forbid"  # Prevent extra fields
         validate_assignment = True  # Validate on assignment
+        arbitrary_types_allowed=True
 
 
 class Configurable(ABC, Generic[ConfigType]):
@@ -104,6 +114,11 @@ class StackProcessorConfig(Configuration):
 
     This configuration defines how image stacks should be processed, including
     iteration strategy, output format, and result reshaping options.
+    
+    Attributes:
+        iterator_config: Configuration for array iteration (which axes to iterate over).
+        output_type: Output format ("stack" for single array, "list" for list of results).
+        squeeze: Whether to squeeze singleton dimensions from output.
     """
 
     iterator_config: ArrayIteratorConfig = ArrayIteratorConfig(slice_def=(-2, -1))
@@ -143,12 +158,12 @@ class StackProcessor(Configurable):
         return cls(config)
 
     def run(
-        self, img: np.ndarray, *args, workers: int = -1, verbose: int = 10
-    ) -> np.ndarray:
+        self, stack: np.ndarray, *args, workers: int = -1, verbose: int = 10
+    ) -> np.ndarray | tuple[Any,...]:
         """Run the stack processor on an image.
 
         Args:
-            img: Input image array.
+            stack: Input stack array.
             *args: Additional arguments to pass to _process_slice.
             workers: Number of parallel workers (-1 for all cores).
             verbose: Verbosity level for parallel processing.
@@ -156,40 +171,25 @@ class StackProcessor(Configurable):
         Returns:
             Processed result array or tuple of lists depending on output_type.
         """
-        iterator = ArrayIterator(img, self.config.iterator_config)
+        logger.info(f"Running {type(self).__name__} with config: {self.config}")
+        iterator = ArrayIterator(stack, self.config.iterator_config)
         n_iterations = len(iterator)
         if n_iterations == 1:
             results = self._process_slice(
-                img, *args, workers=workers, verbose=verbose
+                stack, *args
             )
         else:
             results = Parallel(n_jobs=workers, verbose=verbose)(
                 delayed(self._process_slice)(
-                    slice, *args, workers=workers, verbose=verbose
-                )
-                for slice in iterator
+                    stack_slice, *args)
+                for stack_slice in iterator
             )
             # reshape results
-            if self.config.output_type == "stack":
-                if not isinstance(results, np.ndarray):
-                    results = np.stack(results, axis=0)
-                results = results.reshape(img.shape)
-                if self.config.squeeze:
-                    results = results.squeeze()
-            elif self.config.output_type == "list":
-                if self.config.squeeze:
-                    results = [
-                        result for result in results if result is not None
-                    ]
-                # convert list of tuples to tuple of lists
-                zipped_elements = zip(*results)
-                list_of_lists = [list(item) for item in zipped_elements]
-                results = tuple(list_of_lists)
+            results = self._reshape_slice_results(results, slice_indices=iterator.indices, input_shape=stack.shape)
         return results
 
     def _process_slice(
-        self, slice: np.ndarray, *args, workers: int = -1, verbose: int = 10
-    ) -> np.ndarray:
+        self, slice: np.ndarray, *args) -> np.ndarray | tuple[Any,...]:
         """Process a single slice of the image stack.
 
         This method must be implemented by subclasses to define the actual
@@ -207,14 +207,53 @@ class StackProcessor(Configurable):
         Raises:
             NotImplementedError: If not implemented by subclass.
         """
-        print(f"Processing slice with shape {slice.shape}")
+        logger.info(f"Processing slice with shape {slice.shape}")
         raise NotImplementedError("Subclasses must implement this method")
 
+    def _reshape_slice_results(self, results: list[Any], slice_indices: list[tuple[int,...]], input_shape: tuple[int,...]) -> np.ndarray | tuple[Any,...]:
+        """Reshape the results of slice processing according to output configuration.
+        
+        Reshapes the list of slice results into the desired output format:
+        - "stack": Stacks results into a single array matching input shape
+        - "list": Returns as list or tuple of lists (for tuple results)
+        
+        Args:
+            results: List of results from processing each slice.
+            slice_indices: List of index tuples for each slice (not used currently).
+            input_shape: Shape of the input array.
+            
+        Returns:
+            Reshaped results as array or tuple/list depending on output_type.
+        """
+        if self.config.output_type == "stack":
+            if not isinstance(results, np.ndarray):
+                results = np.stack(results, axis=0)
+            results = results.reshape(input_shape)
+            if self.config.squeeze:
+                results = results.squeeze()
+        elif self.config.output_type == "list":
+            if self.config.squeeze:
+                results = [
+                    result for result in results if result is not None
+                ]
+            # convert list of tuples to tuple of lists [(r)]
+            if isinstance(results[0], tuple):
+                logger.info(f"Reshaping results, type(results)={type(results)}")
+                zipped_elements = zip(*results)
+                list_of_lists = [list(item) for item in zipped_elements]
+                results = tuple(list_of_lists)
+            else:
+                logger.info(f"Not reshaping results, type(results)={type(results)}")
+            #    results = [list(item) for item in results]
+        return results
 
 class ChainProcessorConfig(Configuration):
     """Configuration for chain processor operations.
 
     This configuration defines how multiple stack processors should be chained together.
+    
+    Attributes:
+        processors: List of configurable processors to apply in sequence.
     """
 
     processors: list[Configurable[Configuration]] = []

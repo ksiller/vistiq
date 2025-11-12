@@ -80,7 +80,7 @@ venv/
 .DS_Store
 
 # build metadata written by hatch
-src/mitosisanalyzer/_version.py
+src/vistiq/_version.py
 
 # dask performance reports
 *report.html

@@ -2,7 +2,7 @@ import argparse
 import logging
 from pathlib import Path
 from typing import Optional, Literal
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .utils import load_mp4, check_device
 
@@ -10,20 +10,58 @@ from .utils import load_mp4, check_device
 logger = logging.getLogger(__name__)
 
 
-def configure_logger(level: str = "INFO") -> logging.Logger:
-    """Configure the logger.
+def configure_logger(level: str = "INFO", force: bool = False) -> logging.Logger:
+    """Configure the logger for use in CLI or interactive environments (Jupyter/IPython).
+
+    This function configures the root logger with appropriate handlers and formatting.
+    It works in both command-line applications and interactive environments like
+    Jupyter notebooks or IPython.
 
     Args:
         level (str): The logging level to use (DEBUG, INFO, WARNING, ERROR, CRITICAL).
+        force (bool): If True, force reconfiguration even if handlers already exist.
+            Useful in Jupyter/IPython where logging might already be configured.
 
     Returns:
         logging.Logger: The configured logger instance.
     """
     lmap = logging.getLevelNamesMapping()
     level_int = lmap.get(level.upper(), logging.INFO)
-    logging.basicConfig(
-        level=level_int, format="%(asctime)s - %(levelname)s - %(message)s"
-    )
+    
+    # Get root logger
+    root_logger = logging.getLogger()
+    
+    # Check if we need to configure handlers
+    needs_config = force or len(root_logger.handlers) == 0
+    
+    if needs_config:
+        # Use basicConfig with force parameter if available (Python 3.8+)
+        # Otherwise, manually configure
+        try:
+            # Python 3.8+ supports force parameter
+            logging.basicConfig(
+                level=level_int,
+                format="%(asctime)s - %(levelname)s - %(message)s",
+                force=force,
+            )
+        except TypeError:
+            # Python < 3.8: manually remove handlers if force=True
+            if force:
+                root_logger.handlers.clear()
+            logging.basicConfig(
+                level=level_int,
+                format="%(asctime)s - %(levelname)s - %(message)s",
+            )
+    else:
+        # Just update the level on existing handlers
+        root_logger.setLevel(level_int)
+        for handler in root_logger.handlers:
+            handler.setLevel(level_int)
+            # Update format if it's a StreamHandler
+            if isinstance(handler, logging.StreamHandler):
+                formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+                handler.setFormatter(formatter)
+    
     logger = logging.getLogger(__name__)
     return logger
 
@@ -69,7 +107,18 @@ def parse_frames(frames: Optional[str]) -> tuple[Optional[int], Optional[int]]:
 
 
 class AppConfig(BaseModel):
-    """Base configuration for all vistiq commands."""
+    """Base configuration for all vistiq commands.
+    
+    Provides common configuration options shared across all subcommands,
+    including input/output paths, logging, and frame selection.
+    
+    Attributes:
+        loglevel: Logging level for the application.
+        input_path: Path to input file or directory.
+        output_path: Path to output file or directory.
+        grayscale: Whether to convert loaded images/videos to grayscale.
+        frames: Frame specification string (e.g., '10' or '2-40').
+    """
 
     loglevel: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
         default="INFO", description="Logging level"
@@ -89,19 +138,38 @@ class AppConfig(BaseModel):
 
     @property
     def start_frame(self) -> Optional[int]:
-        """Get start frame index (0-based)."""
+        """Get start frame index (0-based).
+        
+        Returns:
+            Start frame index (0-based), or None if not specified.
+        """
         start, _ = parse_frames(self.frames)
         return start
 
     @property
     def end_frame(self) -> Optional[int]:
-        """Get end frame index (0-based, inclusive)."""
+        """Get end frame index (0-based, inclusive).
+        
+        Returns:
+            End frame index (0-based, inclusive), or None if not specified.
+        """
         _, end = parse_frames(self.frames)
         return end
 
 
 class SegmentConfig(AppConfig):
-    """Configuration for the segment subcommand."""
+    """Configuration for the segment subcommand.
+    
+    Defines parameters for image segmentation including thresholding method,
+    connectivity, and area filtering options.
+    
+    Attributes:
+        threshold_method: Method to use for thresholding ("otsu", "local", "niblack", "sauvola").
+        block_size: Block size for local thresholding (must be odd).
+        connectivity: Connectivity for labeling (1 for 4-connected, 2 for 8-connected).
+        min_area: Minimum object area for filtering (None = no minimum).
+        max_area: Maximum object area for filtering (None = no maximum).
+    """
 
     threshold_method: Literal["otsu", "local", "niblack", "sauvola"] = Field(
         default="otsu", description="Thresholding method"
@@ -122,6 +190,17 @@ class SegmentConfig(AppConfig):
     @field_validator("block_size")
     @classmethod
     def validate_block_size(cls, v: Optional[int]) -> Optional[int]:
+        """Validate that block_size is odd if provided.
+        
+        Args:
+            v: Block size value to validate.
+            
+        Returns:
+            Validated block size.
+            
+        Raises:
+            ValueError: If block_size is even.
+        """
         if v is not None and v % 2 == 0:
             raise ValueError("block_size must be odd")
         return v
@@ -129,13 +208,32 @@ class SegmentConfig(AppConfig):
     @field_validator("connectivity")
     @classmethod
     def validate_connectivity(cls, v: int) -> int:
+        """Validate that connectivity is 1 or 2.
+        
+        Args:
+            v: Connectivity value to validate.
+            
+        Returns:
+            Validated connectivity value.
+            
+        Raises:
+            ValueError: If connectivity is not 1 or 2.
+        """
         if v not in (1, 2):
             raise ValueError("connectivity must be 1 or 2")
         return v
 
 
 class AnalyzeConfig(AppConfig):
-    """Configuration for the analyze subcommand."""
+    """Configuration for the analyze subcommand.
+    
+    Defines parameters for analyzing segmented images and extracting
+    object properties and coordinates.
+    
+    Attributes:
+        include_stats: Whether to include object statistics in analysis.
+        include_coords: Whether to include coordinate extraction.
+    """
 
     include_stats: bool = Field(
         default=True, description="Include object statistics in analysis"
@@ -145,8 +243,92 @@ class AnalyzeConfig(AppConfig):
     )
 
 
+class PreprocessConfig(AppConfig):
+    """Configuration for the preprocess subcommand.
+    
+    Defines parameters for image preprocessing including denoising and
+    Difference of Gaussians (DoG) filtering.
+    
+    Attributes:
+        preprocess_method: Method to use for preprocessing ("dog", "noise2stack", or "none").
+        sigma_low: Sigma for lower Gaussian blur in DoG (default: 1.0).
+        sigma_high: Sigma for higher Gaussian blur in DoG (default: 5.0).
+        mode: Border handling mode for Gaussian filtering (default: "reflect").
+        window: Temporal window size for Noise2Stack denoising (default: 5).
+        exclude_center: Exclude center frame from Noise2Stack average (default: True).
+        normalize: Normalize output to [0, 1] range (default: True).
+    """
+
+    preprocess_method: Literal["dog", "noise2stack", "none"] = Field(
+        default="dog", description="Preprocessing method"
+    )
+    sigma_low: float = Field(
+        default=1.0, description="Sigma for lower Gaussian blur in DoG"
+    )
+    sigma_high: float = Field(
+        default=5.0, description="Sigma for higher Gaussian blur in DoG"
+    )
+    mode: Literal["reflect", "constant", "nearest", "mirror", "wrap"] = Field(
+        default="reflect", description="Border handling mode for Gaussian filtering"
+    )
+    window: int = Field(
+        default=5, description="Temporal window size for Noise2Stack denoising (odd recommended)"
+    )
+    exclude_center: bool = Field(
+        default=True, description="Exclude center frame from Noise2Stack average"
+    )
+    normalize: bool = Field(
+        default=True, description="Normalize output to [0, 1] range"
+    )
+
+    @field_validator("window")
+    @classmethod
+    def validate_window(cls, v: int) -> int:
+        """Validate that window is >= 1.
+        
+        Args:
+            v: Window size value to validate.
+            
+        Returns:
+            Validated window size.
+            
+        Raises:
+            ValueError: If window is < 1.
+        """
+        if v < 1:
+            raise ValueError("window must be >= 1")
+        return v
+
+    @model_validator(mode="after")
+    def validate_window_exclude_center(self) -> "PreprocessConfig":
+        """Validate that window is >= 2 when exclude_center is True.
+        
+        Returns:
+            Validated configuration.
+            
+        Raises:
+            ValueError: If exclude_center is True and window < 2.
+        """
+        if self.exclude_center and self.window < 2:
+            raise ValueError("window must be >= 2 when exclude_center=True")
+        return self
+
+
 class FullConfig(AppConfig):
-    """Configuration for the full subcommand (segment + analyze)."""
+    """Configuration for the full subcommand (segment + analyze).
+    
+    Combines segmentation and analysis parameters for running the complete
+    pipeline in a single command.
+    
+    Attributes:
+        threshold_method: Method to use for thresholding ("otsu", "local", "niblack", "sauvola").
+        block_size: Block size for local thresholding (must be odd).
+        connectivity: Connectivity for labeling (1 for 4-connected, 2 for 8-connected).
+        min_area: Minimum object area for filtering (None = no minimum).
+        max_area: Maximum object area for filtering (None = no maximum).
+        include_stats: Whether to include object statistics in analysis.
+        include_coords: Whether to include coordinate extraction.
+    """
 
     threshold_method: Literal["otsu", "local", "niblack", "sauvola"] = Field(
         default="otsu", description="Thresholding method"
@@ -173,6 +355,17 @@ class FullConfig(AppConfig):
     @field_validator("block_size")
     @classmethod
     def validate_block_size(cls, v: Optional[int]) -> Optional[int]:
+        """Validate that block_size is odd if provided.
+        
+        Args:
+            v: Block size value to validate.
+            
+        Returns:
+            Validated block size.
+            
+        Raises:
+            ValueError: If block_size is even.
+        """
         if v is not None and v % 2 == 0:
             raise ValueError("block_size must be odd")
         return v
@@ -180,6 +373,17 @@ class FullConfig(AppConfig):
     @field_validator("connectivity")
     @classmethod
     def validate_connectivity(cls, v: int) -> int:
+        """Validate that connectivity is 1 or 2.
+        
+        Args:
+            v: Connectivity value to validate.
+            
+        Returns:
+            Validated connectivity value.
+            
+        Raises:
+            ValueError: If connectivity is not 1 or 2.
+        """
         if v not in (1, 2):
             raise ValueError("connectivity must be 1 or 2")
         return v
@@ -346,6 +550,103 @@ def build_parser() -> argparse.ArgumentParser:
         help="exclude coordinate extraction",
     )
 
+    # Preprocess subcommand
+    preprocess_parser = subparsers.add_parser(
+        "preprocess", help="Preprocess images with denoising and filtering"
+    )
+    preprocess_parser.add_argument(
+        "-i",
+        "--input",
+        dest="input_path",
+        required=True,
+        help="single image file or directory with image files to be processed",
+    )
+    preprocess_parser.add_argument(
+        "-o",
+        "--output",
+        dest="output_path",
+        required=True,
+        help="output file or directory",
+    )
+    preprocess_parser.add_argument(
+        "-g",
+        "--grayscale",
+        dest="grayscale",
+        action="store_true",
+        help="convert loaded images/videos to grayscale before processing",
+    )
+    preprocess_parser.add_argument(
+        "-f",
+        "--frames",
+        dest="frames",
+        type=str,
+        default=None,
+        help="frames to process; examples: '10' or '2-40' (inclusive). Default: all frames",
+    )
+    preprocess_parser.add_argument(
+        "--preprocess-method",
+        dest="preprocess_method",
+        type=str,
+        default="dog",
+        choices=["dog", "noise2stack", "none"],
+        help="preprocessing method to use (default: dog)",
+    )
+    preprocess_parser.add_argument(
+        "--sigma-low",
+        dest="sigma_low",
+        type=float,
+        default=1.0,
+        help="sigma for lower Gaussian blur in DoG (default: 1.0)",
+    )
+    preprocess_parser.add_argument(
+        "--sigma-high",
+        dest="sigma_high",
+        type=float,
+        default=5.0,
+        help="sigma for higher Gaussian blur in DoG (default: 5.0)",
+    )
+    preprocess_parser.add_argument(
+        "--mode",
+        dest="mode",
+        type=str,
+        default="reflect",
+        choices=["reflect", "constant", "nearest", "mirror", "wrap"],
+        help="border handling mode for Gaussian filtering (default: reflect)",
+    )
+    preprocess_parser.add_argument(
+        "--window",
+        dest="window",
+        type=int,
+        default=5,
+        help="temporal window size for Noise2Stack denoising (odd recommended, default: 5)",
+    )
+    preprocess_parser.add_argument(
+        "--exclude-center",
+        dest="exclude_center",
+        action="store_true",
+        default=True,
+        help="exclude center frame from Noise2Stack average (default: True)",
+    )
+    preprocess_parser.add_argument(
+        "--no-exclude-center",
+        dest="exclude_center",
+        action="store_false",
+        help="include center frame in Noise2Stack average",
+    )
+    preprocess_parser.add_argument(
+        "--normalize",
+        dest="normalize",
+        action="store_true",
+        default=True,
+        help="normalize output to [0, 1] range (default: True)",
+    )
+    preprocess_parser.add_argument(
+        "--no-normalize",
+        dest="normalize",
+        action="store_false",
+        help="do not normalize output",
+    )
+
     # Full subcommand
     full_parser = subparsers.add_parser(
         "full", help="Run full pipeline (segment + analyze)"
@@ -482,6 +783,17 @@ def args_to_config(args: argparse.Namespace) -> AppConfig:
             include_stats=getattr(args, "include_stats", True),
             include_coords=getattr(args, "include_coords", True),
         )
+    elif args.command == "preprocess":
+        return PreprocessConfig(
+            **base_kwargs,
+            preprocess_method=getattr(args, "preprocess_method", "dog"),
+            sigma_low=getattr(args, "sigma_low", 1.0),
+            sigma_high=getattr(args, "sigma_high", 5.0),
+            mode=getattr(args, "mode", "reflect"),
+            window=getattr(args, "window", 5),
+            exclude_center=getattr(args, "exclude_center", True),
+            normalize=getattr(args, "normalize", True),
+        )
     elif args.command == "full":
         return FullConfig(
             **base_kwargs,
@@ -534,6 +846,35 @@ def run_analyze(config: AnalyzeConfig) -> None:
     logger.info("Would analyze with stats=%s, coords=%s", config.include_stats, config.include_coords)
 
 
+def run_preprocess(config: PreprocessConfig) -> None:
+    """Run the preprocess command.
+
+    Args:
+        config: Preprocess configuration.
+    """
+    logger.info("Running preprocess command with config: %s", config)
+    logger.info("Opening: %s", config.input_path)
+    
+    # Load image stack
+    image_stack = load_mp4(
+        str(config.input_path),
+        to_grayscale=config.grayscale,
+        start_frame=config.start_frame,
+        end_frame=config.end_frame,
+    )
+    logger.info("Image stack: %s", image_stack.shape)
+
+    # TODO: Implement preprocessing logic
+    logger.info("Preprocessing not yet implemented")
+    logger.info("Would preprocess with method: %s", config.preprocess_method)
+    if config.preprocess_method == "dog":
+        logger.info("DoG parameters: sigma_low=%s, sigma_high=%s, mode=%s", 
+                   config.sigma_low, config.sigma_high, config.mode)
+    elif config.preprocess_method == "noise2stack":
+        logger.info("Noise2Stack parameters: window=%s, exclude_center=%s", 
+                   config.window, config.exclude_center)
+
+
 def run_full(config: FullConfig) -> None:
     """Run the full pipeline (segment + analyze).
 
@@ -582,7 +923,7 @@ def main() -> None:
     args = parser.parse_args()
 
     # Configure logging as early as possible
-    logger_instance = configure_logger(args.loglevel)
+    configure_logger(args.loglevel)
 
     # Convert args to Pydantic config
     try:
@@ -603,6 +944,8 @@ def main() -> None:
         run_segment(config)  # type: ignore
     elif args.command == "analyze":
         run_analyze(config)  # type: ignore
+    elif args.command == "preprocess":
+        run_preprocess(config)  # type: ignore
     elif args.command == "full":
         run_full(config)  # type: ignore
     else:

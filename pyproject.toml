@@ -10,7 +10,7 @@ dependencies = [
     "torchvision",
     "trackastra<0.4",
     "tifffile",
-    "prefect=3",
+    "prefect>=3.0.0",
 ]
 requires-python = ">=3.12"
 description = "Turn complex imaging data into actionable, quantitative insight with modular, multi-step analysis."

@@ -1,8 +1,11 @@
 import numpy as np
 from typing import List
 from pydantic import BaseModel
+import logging
 
 from vistiq.core import Configuration, StackProcessor, StackProcessorConfig
+
+logger = logging.getLogger(__name__)
 
 
 class WorkflowStepConfig(Configuration):

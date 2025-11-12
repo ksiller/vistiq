@@ -6,8 +6,11 @@ from pydantic import Field, field_validator, model_validator
 from scipy.ndimage import uniform_filter1d
 from skimage.filters import gaussian
 from joblib import Parallel, delayed
+import logging
 
 from vistiq.core import Configuration, Configurable, StackProcessorConfig, StackProcessor
+
+logger = logging.getLogger(__name__)
 
 
 class PreprocessConfig(StackProcessorConfig):
@@ -17,15 +20,13 @@ class PreprocessConfig(StackProcessorConfig):
     filtering operations on image stacks.
     """
 
-    preprocessors: list[Configurable[StackProcessorConfig]] = Field(
-        default=[], description="List of preprocessors to apply"
-    )
     normalize: bool = Field(
         default=True, description="Normalize DoG output to [0, 1] range"
     )
+    output_type: Literal[int, np.uint8, np.uint32, np.uint64, float, np.float32, np.float64] | None = Field(default=None, description="dtype of processed stack. If None, same as input dtype.")
 
 
-class Preprocessor(Configurable[PreprocessConfig]):
+class Preprocessor(StackProcessor):
     """Preprocessor for image stacks using denoising and Difference of Gaussians filtering.
 
     This class provides configurable preprocessing operations including temporal denoising
@@ -51,6 +52,122 @@ class Preprocessor(Configurable[PreprocessConfig]):
             A new Preprocessor instance.
         """
         return cls(config)
+
+    def normalize(self, stack: np.ndarray) -> np.ndarray:
+        """Normalize the output of the preprocess chain.
+
+        Args:
+            stack: Input image stack.
+        """
+        stack_min = np.min(stack)
+        stack_max = np.max(stack)
+        if stack_max > stack_min:
+            stack = (stack - stack_min) / (stack_max - stack_min)
+        else:
+            # All values are the same; set to 0
+            stack = np.zeros_like(stack, dtype=np.float32)
+        logger.info(f"Normalized stack with shape {stack.shape}, min:max {stack_min}:{stack_max} -> {np.min(stack)}:{np.max(stack)}")
+        return stack.astype(np.float32, copy=False)
+
+    def run(self, stack: np.ndarray, *args, workers: int = -1, verbose: int = 10) -> np.ndarray:
+        """Run the preprocess chain on an image stack.
+
+        Args:
+            stack: Input image stack.
+        """
+        input_dtype = stack.dtype
+        logger.info(f"Running preprocessor {self.__class__.__name__}, on stack of type {input_dtype}, {np.issubdtype(input_dtype, np.integer)}")
+        preprocessed = super().run(stack, *args, workers=workers, verbose=verbose)
+
+        # normalize
+        if self.config.normalize:
+            preprocessed = self.normalize(preprocessed)
+        
+        # Determine output type
+        if self.config.output_type is not None:
+            out_type = self.config.output_type
+        else:
+            out_type = input_dtype
+        
+        # Scale to the min/max range of the output type
+        if np.issubdtype(out_type, np.integer):
+            # For integer types, scale to [type_min, type_max]
+            type_info = np.iinfo(out_type)
+            type_min = type_info.min
+            type_max = type_info.max
+            
+            if self.config.normalize:
+                # Already normalized to [0, 1], just scale to output type range
+                preprocessed = preprocessed * (type_max - type_min) + type_min
+            else:
+                # Get current range and normalize, then scale to output type range
+                stack_min = np.min(preprocessed)
+                stack_max = np.max(preprocessed)
+                if stack_max > stack_min:
+                    preprocessed = (preprocessed - stack_min) / (stack_max - stack_min)
+                    preprocessed = preprocessed * (type_max - type_min) + type_min
+                else:
+                    # All values are the same; set to middle of range
+                    preprocessed = np.full_like(preprocessed, (type_min + type_max) // 2, dtype=np.float64)
+            
+            preprocessed = np.clip(preprocessed, type_min, type_max)
+        elif np.issubdtype(out_type, np.floating):
+            # For float types, if normalized, keep [0, 1] range
+            # Otherwise, scale to [0, 1] to match typical float expectations
+            if not self.config.normalize:
+                stack_min = np.min(preprocessed)
+                stack_max = np.max(preprocessed)
+                if stack_max > stack_min:
+                    preprocessed = (preprocessed - stack_min) / (stack_max - stack_min)
+                else:
+                    preprocessed = np.zeros_like(preprocessed, dtype=np.float32)
+        
+        preprocessed = preprocessed.astype(out_type, copy=False)
+        
+        return preprocessed
+
+class PreprocessChainConfig(Configuration):
+    """Configuration for chain of preprocessors.
+
+    This configuration class defines parameters for chaining multiple preprocessors.
+    """
+
+    preprocessors: list[PreprocessConfig] = Field(
+        default=[], description="List of preprocessors to apply"
+    )
+
+
+class PreprocessChain(Configurable):
+    """Chain of preprocessors for image processing.
+
+    This class chains multiple preprocessors together, applying each one in sequence to the input stack.
+    """
+
+    def __init__(self, config: PreprocessChainConfig):
+        """Initialize the preprocess chain.
+
+        Args:
+            config: Preprocess chain configuration.
+        """
+        super().__init__(config)
+
+    @classmethod
+    def from_config(cls, config: PreprocessChainConfig) -> "PreprocessChain":
+        """Create a PreprocessChain instance from a configuration.
+
+        Args:
+            config: Preprocess chain configuration.
+        """
+        return cls(config)
+
+
+    def run(self, stack: np.ndarray, *args, workers: int = -1, verbose: int = 10) -> np.ndarray:
+        """Run the preprocess chain on an image stack.
+
+        Args:
+            stack: Input image stack.
+        """
+        return super().run(stack, *args, workers=workers, verbose=verbose)
 
 class DoG(Preprocessor):
     """Difference of Gaussians (DoG) filter for image processing.
@@ -88,6 +205,7 @@ class DoG(Preprocessor):
         Returns:
             Difference of Gaussians (DoG) for the single slice.
         """
+        logger.info(f"Processing slice, slice.shape={slice.shape}")
         g_low = gaussian(
             slice,
             sigma=self.config.sigma_low,
@@ -101,37 +219,6 @@ class DoG(Preprocessor):
             preserve_range=True,
         )
         return g_low - g_high
-
-    def run(self, stack: np.ndarray, normalize: bool = True) -> np.ndarray:
-        """Run the Difference of Gaussians (DoG) filter on an image stack.
-
-        Args:
-            stack: Input image stack.
-            normalize: Whether to normalize DoG output to [0, 1] range. Defaults to True.
-
-        Returns:
-            DoG filtered image stack.
-        """
-        input_dtype = stack.dtype
-        dog = super().run(stack)
-        # Normalize to [0, 1] if requested
-        if normalize:
-            dog_min = np.min(dog)
-            dog_max = np.max(dog)
-            if dog_max > dog_min:
-                dog = (dog - dog_min) / (dog_max - dog_min)
-            else:
-                # All values are the same; set to 0
-                dog = np.zeros_like(dog, dtype=np.float32)
-            return dog.astype(np.float32, copy=False)
-
-        # Cast back to original dtype
-        if np.issubdtype(input_dtype, np.integer):
-            info = np.iinfo(input_dtype)
-            dog = np.clip(dog, info.min, info.max).astype(input_dtype, copy=False)
-        else:
-            dog = dog.astype(input_dtype, copy=False)
-        return dog
 
 
 class DoGConfig(PreprocessConfig):
