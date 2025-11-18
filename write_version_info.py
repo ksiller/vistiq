@@ -50,3 +50,4 @@ def write_version_info(
     with open(path, "w") as f:
         f.write(build_info)
 
+

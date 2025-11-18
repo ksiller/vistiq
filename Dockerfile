@@ -33,3 +33,4 @@ COPY scripts/entrypoint.sh ./entrypoint.sh
 RUN chmod +x ./entrypoint.sh
 ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/opt/vistiq/entrypoint.sh"]
 
+

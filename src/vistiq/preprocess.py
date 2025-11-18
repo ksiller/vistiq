@@ -16,14 +16,14 @@ logger = logging.getLogger(__name__)
 class PreprocessConfig(StackProcessorConfig):
     """Configuration for image preprocessing operations.
 
-    This configuration class defines parameters for denoising and Difference of Gaussians (DoG)
-    filtering operations on image stacks.
+    This configuration class defines parameters for preprocessing steps, e.g. normalization, denoising and Difference of Gaussians (DoG)
+    filtering.
     """
 
     normalize: bool = Field(
-        default=True, description="Normalize DoG output to [0, 1] range"
+        default=True, description="Normalize output to [0, 1] range"
     )
-    output_type: Literal[int, np.uint8, np.uint32, np.uint64, float, np.float32, np.float64] | None = Field(default=None, description="dtype of processed stack. If None, same as input dtype.")
+    dtype: Literal[int, np.uint8, np.uint32, np.uint64, float, np.float32, np.float64] | None = Field(default=None, description="dtype of processed stack. If None, same as input dtype.")
 
 
 class Preprocessor(StackProcessor):
@@ -85,14 +85,14 @@ class Preprocessor(StackProcessor):
         
         # Determine output type
         if self.config.output_type is not None:
-            out_type = self.config.output_type
+            dtype = self.config.dtype
         else:
-            out_type = input_dtype
+            dtype = input_dtype
         
         # Scale to the min/max range of the output type
-        if np.issubdtype(out_type, np.integer):
+        if np.issubdtype(dtype, np.integer):
             # For integer types, scale to [type_min, type_max]
-            type_info = np.iinfo(out_type)
+            type_info = np.iinfo(dtype)
             type_min = type_info.min
             type_max = type_info.max
             
@@ -111,7 +111,7 @@ class Preprocessor(StackProcessor):
                     preprocessed = np.full_like(preprocessed, (type_min + type_max) // 2, dtype=np.float64)
             
             preprocessed = np.clip(preprocessed, type_min, type_max)
-        elif np.issubdtype(out_type, np.floating):
+        elif np.issubdtype(dtype, np.floating):
             # For float types, if normalized, keep [0, 1] range
             # Otherwise, scale to [0, 1] to match typical float expectations
             if not self.config.normalize:
@@ -122,7 +122,7 @@ class Preprocessor(StackProcessor):
                 else:
                     preprocessed = np.zeros_like(preprocessed, dtype=np.float32)
         
-        preprocessed = preprocessed.astype(out_type, copy=False)
+        preprocessed = preprocessed.astype(dtype, copy=False)
         
         return preprocessed
 

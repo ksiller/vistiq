@@ -1,10 +1,25 @@
 import argparse
 import logging
+import os
+import itertools
 from pathlib import Path
 from typing import Optional, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from .utils import load_mp4, check_device
+import numpy as np
+
+from .utils import load_mp4, check_device, load_image, get_scenes, to_tif
+from .core import ArrayIteratorConfig
+from .preprocess import DoG, DoGConfig
+from .seg import MicroSAMSegmenter, MicroSAMSegmenterConfig, RegionFilter, RegionFilterConfig, RangeFilter, RangeFilterConfig
+from .analysis import CoincidenceDetector, CoincidenceDetectorConfig
+from .workflow_builder import (
+    ComponentRegistry,
+    get_registry,
+    ConfigArgumentBuilder,
+    WorkflowBuilder,
+    auto_register_configurables
+)
 
 
 logger = logging.getLogger(__name__)
@@ -312,6 +327,71 @@ class PreprocessConfig(AppConfig):
         if self.exclude_center and self.window < 2:
             raise ValueError("window must be >= 2 when exclude_center=True")
         return self
+
+
+class CoincidenceConfig(AppConfig):
+    """Configuration for the coincidence subcommand.
+    
+    Defines parameters for running the coincidence detection workflow
+    with DoG preprocessing, MicroSAM segmentation, and coincidence detection.
+    
+    Attributes:
+        sigma_low: Sigma for lower Gaussian blur in DoG (default: 1.0).
+        sigma_high: Sigma for higher Gaussian blur in DoG (default: 12.0).
+        normalize: Normalize DoG output to [0, 1] range (default: True).
+        area_lower: Lower bound for area filter (default: 100).
+        area_upper: Upper bound for area filter (default: 10000).
+        model_type: MicroSAM model type (default: "vit_l_lm").
+        threshold: Threshold for coincidence detection (default: 0.1).
+        method: Coincidence detection method: 'iou' or 'dice' (default: "dice").
+        mode: Coincidence detection mode: 'bounding_box' or 'outline' (default: "outline").
+    """
+
+    sigma_low: float = Field(
+        default=1.0, description="Sigma for lower Gaussian blur in DoG"
+    )
+    sigma_high: float = Field(
+        default=12.0, description="Sigma for higher Gaussian blur in DoG"
+    )
+    normalize: bool = Field(
+        default=True, description="Normalize DoG output to [0, 1] range"
+    )
+    area_lower: float = Field(
+        default=100, description="Lower bound for area filter"
+    )
+    area_upper: float = Field(
+        default=10000, description="Upper bound for area filter"
+    )
+    model_type: Literal["vit_l_lm", "vit_b_lm", "vit_t_lm", "vit_h_lm"] = Field(
+        default="vit_l_lm", description="MicroSAM model type"
+    )
+    threshold: float = Field(
+        default=0.1, description="Threshold for coincidence detection"
+    )
+    method: Literal["iou", "dice"] = Field(
+        default="dice", description="Coincidence detection method: 'iou' or 'dice'"
+    )
+    mode: Literal["bounding_box", "outline"] = Field(
+        default="outline", description="Coincidence detection mode: 'bounding_box' or 'outline'"
+    )
+
+    @field_validator("threshold")
+    @classmethod
+    def validate_threshold(cls, v: float) -> float:
+        """Validate that threshold is between 0.0 and 1.0.
+        
+        Args:
+            v: Threshold value to validate.
+            
+        Returns:
+            Validated threshold value.
+            
+        Raises:
+            ValueError: If threshold is not between 0.0 and 1.0.
+        """
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("threshold must be between 0.0 and 1.0")
+        return v
 
 
 class FullConfig(AppConfig):
@@ -744,6 +824,153 @@ def build_parser() -> argparse.ArgumentParser:
         help="exclude coordinate extraction",
     )
 
+    # Coincidence subcommand
+    coincidence_parser = subparsers.add_parser(
+        "coincidence", help="Run coincidence detection workflow with DoG preprocessing and MicroSAM segmentation"
+    )
+    coincidence_parser.add_argument(
+        "-i",
+        "--input",
+        dest="input_path",
+        required=True,
+        help="input image file path",
+    )
+    coincidence_parser.add_argument(
+        "--sigma-low",
+        dest="sigma_low",
+        type=float,
+        default=1.0,
+        help="sigma for lower Gaussian blur in DoG (default: 1.0)",
+    )
+    coincidence_parser.add_argument(
+        "--sigma-high",
+        dest="sigma_high",
+        type=float,
+        default=12.0,
+        help="sigma for higher Gaussian blur in DoG (default: 12.0)",
+    )
+    coincidence_parser.add_argument(
+        "--normalize",
+        dest="normalize",
+        action="store_true",
+        default=True,
+        help="normalize DoG output to [0, 1] range (default: True)",
+    )
+    coincidence_parser.add_argument(
+        "--no-normalize",
+        dest="normalize",
+        action="store_false",
+        help="disable normalization of DoG output",
+    )
+    coincidence_parser.add_argument(
+        "--area-lower",
+        dest="area_lower",
+        type=float,
+        default=100,
+        help="lower bound for area filter (default: 100)",
+    )
+    coincidence_parser.add_argument(
+        "--area-upper",
+        dest="area_upper",
+        type=float,
+        default=10000,
+        help="upper bound for area filter (default: 10000)",
+    )
+    coincidence_parser.add_argument(
+        "--model-type",
+        dest="model_type",
+        type=str,
+        default="vit_l_lm",
+        choices=["vit_l_lm", "vit_b_lm", "vit_t_lm", "vit_h_lm"],
+        help="MicroSAM model type (default: vit_l_lm)",
+    )
+    coincidence_parser.add_argument(
+        "--threshold",
+        dest="threshold",
+        type=float,
+        default=0.1,
+        help="threshold for coincidence detection (default: 0.1)",
+    )
+    coincidence_parser.add_argument(
+        "--method",
+        dest="method",
+        type=str,
+        default="dice",
+        choices=["iou", "dice"],
+        help="coincidence detection method: 'iou' or 'dice' (default: dice)",
+    )
+    coincidence_parser.add_argument(
+        "--mode",
+        dest="mode",
+        type=str,
+        default="outline",
+        choices=["bounding_box", "outline"],
+        help="coincidence detection mode: 'bounding_box' or 'outline' (default: outline)",
+    )
+
+    # Workflow subcommand - modular workflow builder
+    workflow_parser = subparsers.add_parser(
+        "workflow", help="Build and run modular workflows from CLI-specified components"
+    )
+    workflow_parser.add_argument(
+        "-i",
+        "--input",
+        dest="input_path",
+        required=True,
+        help="single image file or directory with image files to be processed",
+    )
+    workflow_parser.add_argument(
+        "-o",
+        "--output",
+        dest="output_path",
+        required=False,
+        help="output file or directory",
+    )
+    workflow_parser.add_argument(
+        "-g",
+        "--grayscale",
+        dest="grayscale",
+        action="store_true",
+        help="convert loaded images/videos to grayscale before processing",
+    )
+    workflow_parser.add_argument(
+        "-f",
+        "--frames",
+        dest="frames",
+        type=str,
+        default=None,
+        help="frames to process; examples: '10' or '2-40' (inclusive). Default: all frames",
+    )
+    workflow_parser.add_argument(
+        "--component",
+        dest="components",
+        action="append",
+        required=True,
+        help="Component to include in workflow (can be specified multiple times). "
+             "Available components will be auto-discovered from registered modules. "
+             "Example: --component DoG --component OtsuThreshold",
+    )
+    
+    # Auto-register components and add their arguments dynamically
+    auto_register_configurables([
+        "vistiq.preprocess",
+        "vistiq.seg",
+        "vistiq.analysis",
+        "vistiq.core"
+    ])
+    
+    registry = get_registry()
+    for config_name in registry.list_configs():
+        config_class = registry.get_config_class(config_name)
+        if config_class:
+            # Add arguments for this config class
+            # Use component index as prefix if multiple components
+            ConfigArgumentBuilder.add_config_arguments(
+                workflow_parser,
+                config_class,
+                prefix=""
+            )
+
     return parser
 
 
@@ -757,8 +984,8 @@ def args_to_config(args: argparse.Namespace) -> AppConfig:
         AppConfig or subclass: Appropriate configuration model instance.
     """
     # Convert Path strings to Path objects
-    input_path = Path(args.input_path) if args.input_path else None
-    output_path = Path(args.output_path) if args.output_path else None
+    input_path = Path(args.input_path) if getattr(args, "input_path", None) else None
+    output_path = Path(args.output_path) if getattr(args, "output_path", None) else None
 
     base_kwargs = {
         "loglevel": args.loglevel.upper(),
@@ -804,6 +1031,19 @@ def args_to_config(args: argparse.Namespace) -> AppConfig:
             max_area=getattr(args, "max_area", None),
             include_stats=getattr(args, "include_stats", True),
             include_coords=getattr(args, "include_coords", True),
+        )
+    elif args.command == "coincidence":
+        return CoincidenceConfig(
+            **base_kwargs,
+            sigma_low=getattr(args, "sigma_low", 1.0),
+            sigma_high=getattr(args, "sigma_high", 12.0),
+            normalize=getattr(args, "normalize", True),
+            area_lower=getattr(args, "area_lower", 100),
+            area_upper=getattr(args, "area_upper", 10000),
+            model_type=getattr(args, "model_type", "vit_l_lm"),
+            threshold=getattr(args, "threshold", 0.1),
+            method=getattr(args, "method", "dice"),
+            mode=getattr(args, "mode", "outline"),
         )
     else:
         return AppConfig(**base_kwargs)
@@ -911,6 +1151,164 @@ def run_full(config: FullConfig) -> None:
     run_analyze(analyze_config)
 
 
+def run_coincidence(config: CoincidenceConfig) -> None:
+    """Run the coincidence detection workflow.
+    
+    Args:
+        config: Coincidence configuration.
+    """
+    logger.info("Running coincidence command with config: %s", config)
+    
+    # Set up configurations
+    dog_config = DoGConfig(
+        sigma_low=config.sigma_low,
+        sigma_high=config.sigma_high,
+        normalize=config.normalize
+    )
+    region_filter_config = RegionFilterConfig(
+        filters=[RangeFilter(RangeFilterConfig(attribute="area", range=(config.area_lower, config.area_upper)))]
+    )
+    volume_it_cfg = ArrayIteratorConfig(slice_def=(-3, -2, -1))
+    coincidence_config = CoincidenceDetectorConfig(
+        method=config.method,
+        mode=config.mode,
+        iterator_config=volume_it_cfg,
+        threshold=config.threshold
+    )
+
+    # Get absolute path of input and strip extension for output directory
+    input_path_obj = Path(config.input_path).resolve()
+    input_path_str = str(config.input_path)
+
+    scenes = get_scenes(input_path_str)
+    for idx, sc in enumerate(scenes):
+        logger.info(f"Processing scene: {sc}")
+        # Load image
+        img, scale = load_image(input_path_str, scene_index=idx, squeeze=True)
+        img = img[:, 30:40, ]
+
+        output_dir = f"{input_path_obj.with_suffix('')}-{sc}-dog-{config.sigma_low}-{config.sigma_high}-threshold-{config.threshold}"
+        os.makedirs(output_dir, exist_ok=True)
+        logger.info(f"Output directory: {output_dir}")
+    
+        img_ch = np.unstack(img, axis=0)
+        logger.info(f"Image shape: {img.shape}, scale: {scale}")
+        for im in img_ch:
+            logger.debug(f"Channel shape: {im.shape}")
+
+        masks_ch = []
+        labels_ch = []
+        regions_ch = []
+
+        for i, im in enumerate(img_ch):
+            # 1. DoG preprocessing
+            dog = DoG(dog_config)
+            preprocessed = dog.run(im)
+            output_path = f"{output_dir}/Preprocessed_Ch{i}.tif"
+            to_tif(output_path, preprocessed)
+
+            # 2. MicroSAMSegmenter with RegionFilter
+            region_filter = RegionFilter(region_filter_config)
+            # need to set up new microsam config for each channel to deal with different embeddings
+            microsam_config = MicroSAMSegmenterConfig(
+                model_type=config.model_type,
+                region_filter=region_filter,
+                do_labels=True,
+                do_regions=True
+            )
+
+            microsam = MicroSAMSegmenter(microsam_config)
+            masks, labels, regions = microsam.run(preprocessed)
+            output_path = f"{output_dir}/Labels_Ch{i}.tif"
+            to_tif(output_path, labels)
+            masks_ch.append(masks)
+            labels_ch.append(labels)
+            regions_ch.append(regions)
+
+        # 3. CoincidenceDetector
+        # Create pairwise combinations of labels
+        label_index_combinations = list(itertools.combinations(range(len(labels_ch)), 2))
+        logger.info(f"Label index combinations: {label_index_combinations}")
+        feature_dfs = {}
+        for idx_combination in label_index_combinations:
+            coincidence_detector = CoincidenceDetector(coincidence_config)
+            _, dfs = coincidence_detector.run(
+                labels_ch[idx_combination[0]], 
+                labels_ch[idx_combination[1]], 
+                stack_names=(f"Ch{idx_combination[0]}", f"Ch{idx_combination[1]}")
+            )
+            for key, df in dfs.items():
+                if key not in feature_dfs:
+                    feature_dfs[key] = [df]
+                else:
+                    feature_dfs[key].append(df)
+        for key, dfs in feature_dfs.items():
+            output_path = f"{output_dir}/Coincidence_{key}.csv"
+            logger.info(f"Saving to: {output_path}")
+            dfs[0].join(dfs[1:]).to_csv(output_path, index=True)
+
+
+def run_workflow(config: AppConfig, args: argparse.Namespace) -> None:
+    """Run a modular workflow built from CLI-specified components.
+    
+    Args:
+        config: Base application configuration.
+        args: Parsed command-line arguments with workflow component specifications.
+    """
+    # Auto-register available components
+    auto_register_configurables([
+        "vistiq.preprocess",
+        "vistiq.seg",
+        "vistiq.analysis",
+        "vistiq.core"
+    ])
+    
+    # Get workflow components from args
+    components = getattr(args, "components", [])
+    if not components:
+        logger.error("No components specified for workflow")
+        raise ValueError("At least one component must be specified with --component")
+    
+    # Build workflow builder
+    builder = WorkflowBuilder()
+    
+    # Build each component
+    built_components = []
+    for i, component_name in enumerate(components):
+        try:
+            prefix = f"component{i}." if len(components) > 1 else ""
+            component = builder.build_component(component_name, args, prefix=prefix)
+            built_components.append(component)
+            logger.info(f"Built component {i+1}/{len(components)}: {component_name}")
+        except Exception as e:
+            logger.error(f"Failed to build component '{component_name}': {e}")
+            raise
+    
+    # Load input data
+    if config.input_path:
+        from .utils import load_image
+        logger.info(f"Loading input from: {config.input_path}")
+        # For now, assume single image - could be extended for stacks
+        data = load_image(str(config.input_path))
+    else:
+        logger.error("Input path required for workflow")
+        raise ValueError("--input is required")
+    
+    # Run components in sequence
+    result = data
+    for i, component in enumerate(built_components):
+        logger.info(f"Running component {i+1}/{len(built_components)}: {component.name()}")
+        result = component.run(result)
+    
+    # Save output if specified
+    if config.output_path:
+        import numpy as np
+        logger.info(f"Saving output to: {config.output_path}")
+        np.save(str(config.output_path), result)
+    else:
+        logger.warning("No output path specified, results not saved")
+
+
 def main() -> None:
     """Entry point for the vistiq CLI.
 
@@ -948,6 +1346,10 @@ def main() -> None:
         run_preprocess(config)  # type: ignore
     elif args.command == "full":
         run_full(config)  # type: ignore
+    elif args.command == "coincidence":
+        run_coincidence(config)  # type: ignore
+    elif args.command == "workflow":
+        run_workflow(config, args)
     else:
         logger.error("Unknown command: %s", args.command)
         parser.print_help()

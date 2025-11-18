@@ -11,12 +11,16 @@ from pydantic import (
 import pandas as pd
 from typing import Optional, List, Tuple, Union, Callable, Any, Literal, Dict
 import logging
+from micro_sam.automatic_segmentation import (
+    get_predictor_and_segmenter,
+    automatic_instance_segmentation,
+)
 from skimage.measure import label as sk_label
 from skimage.measure import regionprops, regionprops_table
 from skimage.morphology import disk, binary_dilation
 from vistiq.core import Configuration, Configurable, StackProcessorConfig, StackProcessor, ChainProcessorConfig, ChainProcessor
 from vistiq.workflow import Workflow
-from vistiq.utils import ArrayIterator, ArrayIteratorConfig
+from vistiq.utils import ArrayIterator, ArrayIteratorConfig, create_unique_folder
 
 logger = logging.getLogger(__name__)
 
@@ -824,7 +828,8 @@ class Labeller(StackProcessor):
         else:
             extra_properties = []
         logger.info(f"extra_properties={extra_properties}")
-        ra = RegionAnalyzer(RegionAnalyzerConfig(properties=extra_properties))
+        iterator_config = ArrayIteratorConfig(slice_def=self.config.iterator_config.slice_def)
+        ra = RegionAnalyzer(RegionAnalyzerConfig(iterator_config=iterator_config, properties=extra_properties))
         regions = ra.run(labels)
         logger.info(f"Labeller: len(regions)={len(regions)}")
 
@@ -1364,8 +1369,17 @@ class Segmenter(Workflow):
             config: Segmenter configuration.
         """
         super().__init__(config)
-
-
+        self.config.do_regions = self.config.do_regions and (self.config.region_analyzer is not None or self.config.region_filter is not None)
+        self.config.do_labels = self.config.do_regions or (self.config.do_labels and self.config.labeller is not None)
+        if self.config.do_labels and self.config.labeller is None:
+            logger.info("Labeller not provided, using default Labeller with connectivity=1 and region_filter=None")
+            self.config.labeller = Labeller(LabellerConfig(connectivity=1, region_filter=None, output_type="list"))
+        if self.config.do_regions and self.config.region_analyzer is None:
+            logger.info(f"RegionAnalyzer not provided, using default RegionAnalyzer with properties: {RegionAnalyzer.default_properties}")
+            iterator_config = self.config.labeller.config.iterator_config
+            properties = self.config.region_analyzer.config.properties if self.config.region_analyzer is not None else RegionAnalyzer.default_properties
+            self.config.region_analyzer = RegionAnalyzer(RegionAnalyzerConfig(iterator_config=iterator_config, output_type="list", properties=properties))
+    
     def run(
         self,
         img: np.ndarray,
@@ -1385,19 +1399,7 @@ class Segmenter(Workflow):
             Union[np.ndarray, Tuple[np.ndarray, List[RegionProps]]]: Binary mask or tuple of binary mask and regions.
         """
         # determine whether to compute regions and labels
-        do_regions = self.config.do_regions and (self.config.region_analyzer is not None or self.config.region_filter is not None)
-        do_labels = do_regions or (self.config.do_labels and self.config.labeller is not None)
-        if do_labels and self.config.labeller is None:
-            logger.info("Labeller not provided, using default Labeller with connectivity=1 and region_filter=None")
-            labeller = Labeller(LabellerConfig(connectivity=1, region_filter=None, output_type="list"))
-        else:
-            labeller = self.config.labeller
-        if do_regions and self.config.region_analyzer is None:
-            logger.info(f"RegionAnalyzer not provided, using default RegionAnalyzer with properties: {RegionAnalyzer.default_properties}")
-            properties = self.config.region_analyzer.config.properties if self.config.region_analyzer is not None else RegionAnalyzer.default_properties
-            region_analyzer = RegionAnalyzer(RegionAnalyzerConfig(output_type="list", properties=properties))
-        else:
-            region_analyzer = self.config.region_analyzer
+
 
         # process the image
         binary_mask = self.config.thresholder.run(img)
@@ -1407,19 +1409,19 @@ class Segmenter(Workflow):
             binary_mask = binary_mask & ~exclude_mask
         if self.config.binary_processor is not None:
             binary_mask = self.config.binary_processor.run(binary_mask)
-        if do_labels:
-            labels, _ = labeller.run(binary_mask)
+        if self.config.do_labels:
+            labels, _ = self.config.labeller.run(binary_mask)
             iterator_config = self.config.labeller.config.iterator_config
             # update the labels to ensure they are unique across the substacks
             relabeler = Relabeler(RelabelerConfig(iterator_config=iterator_config))
             labels = relabeler.run(labels)
-            if do_regions:
-                regions = region_analyzer.run(labels)
+            if self.config.do_regions:
+                regions = self.config.region_analyzer.run(labels)
                 if self.config.region_filter is not None:
                     regions, removed_regions = self.config.region_filter.run(regions)
                     # remove the areas in labels corresponding to the removed regions
                     label_remover = LabelRemover(LabelRemoverConfig(iterator_config=ArrayIteratorConfig(slice_def=()), output_type="stack", squeeze=False))
-                    labels = label_remover.run(removed_regions)
+                    labels = label_remover.run(labels, removed_regions)
                 return binary_mask, labels, regions
             else:
                 logger.info("No regions to compute, returning binary mask and labels")
@@ -1594,7 +1596,15 @@ class MicroSAMSegmenterConfig(SegmenterConfig):
     Attributes:
         model: MicroSAM model to use.
     """
-    model: str = "microsam-large"
+    #from segment_anything.predictor import SamPredictor
+    #from micro_sam.instance_segmentation import AMGBase
+    #from micro_sam.instance_segmentation import InstanceSegmentationWithDecoder
+    model_type: str = "vit_l_lm"
+    predictor: Optional[Any] = None
+    segmenter: Optional[Any] = None
+    checkpoint: Optional[str] = None
+    embedding_path: Optional[str] = None
+    device: Optional[str] = None
 
 class MicroSAMSegmenter(Workflow):
     """Segmenter that uses MicroSAM to segment images.
@@ -1604,7 +1614,36 @@ class MicroSAMSegmenter(Workflow):
     """
     def __init__(self, config: MicroSAMSegmenterConfig):
         super().__init__(config)
+        predictor, segmenter = get_predictor_and_segmenter(model_type=self.config.model_type)
+        if self.config.predictor is None:
+            self.config.predictor = predictor
+        if self.config.segmenter is None:
+            self.config.segmenter = segmenter
+        self.config.do_labels = True
+        self.config.do_regions = self.config.region_analyzer is not None
+
 
     def run(self, img: np.ndarray) -> np.ndarray:
         """Run the MicroSAM segmenter on an image.
         
+        Args:
+            img: Input image to segment.
+            
+        Returns:
+            Regions: List of regions.
+        """
+        if self.config.embedding_path is None:
+            self.config.embedding_path = create_unique_folder(base_path="embeddings")
+        labels = automatic_instance_segmentation(
+            predictor=self.config.predictor,
+            segmenter=self.config.segmenter,
+            input_path=img,   
+            embedding_path=self.config.embedding_path,
+        )
+        masks = np.zeros_like(labels).astype(np.bool)
+        masks[labels > 0] = True
+        if self.config.do_regions:
+            regions = self.config.region_analyzer.run(labels)
+        else:
+            regions = []
+        return masks, labels, regions

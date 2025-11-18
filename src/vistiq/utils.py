@@ -4,11 +4,12 @@ import os
 import logging
 import numpy as np
 from pydantic import BaseModel
-from typing import Union
+from typing import Union, Optional, List
 
 import cv2
 import tifffile
-# import torch
+import uuid
+import torch
 
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,12 @@ class ArrayIteratorConfig(Configuration):
         -1,
     )
 
+class VolumeStackIteratorConfig(Configuration):
+    slice_def: tuple[int, ...] = (
+        -3,
+        -2,
+        -1,
+    )
 
 class ArrayIterator:
     """Iterator over a numpy array with custom slicing.
@@ -96,6 +103,168 @@ class ArrayIterator:
     def __len__(self) -> int:
         """Return the number of iterations."""
         return len(self.indices)
+
+
+def create_unique_folder(base_path=".", prefix="", suffix="", exist_ok=True):
+    """
+    Creates a unique folder within the specified base_path using a UUID.
+    """
+    unique_id = (
+        uuid.uuid4().hex
+    )  # Generate a UUID and get its hexadecimal representation
+    dir_name = f"{prefix}{unique_id}{suffix}"
+    full_path = os.path.join(base_path, dir_name)
+
+    os.makedirs(full_path, exist_ok=exist_ok)
+    return full_path
+
+def load_image(
+    path: Union[str, os.PathLike],
+    scene_index: Optional[int] = None,
+    reader: Optional[type] = None,
+    options: Optional[dict[str, slice]] = None,
+    squeeze: bool = False,
+) -> np.ndarray:
+    """Load an image file using bioio, optionally selecting a specific scene and applying dimension slicing.
+    
+    Args:
+        path: Path to the image file.
+        scene_index: Optional scene index to load. If None, loads the first/default scene.
+        reader: Optional reader class to use. If None, bioio will auto-detect the appropriate reader.
+        options: Optional dictionary of dimension slices. Keys should be dimension names ('T', 'Z', 'C', 'Y', 'X')
+                 and values should be slice objects. For example: {'T': slice(0, 10), 'Z': slice(5, 15), 'C': slice(0, 2)}.
+        squeeze: If True, remove dimensions of size 1 from the array. Default is False.
+        
+    Returns:
+        np.ndarray: Image data as a numpy array, with optional slicing and squeezing applied.
+        
+    Raises:
+        FileNotFoundError: If the file does not exist.
+        ValueError: If the scene index is out of range, dimension names are invalid, or the image cannot be loaded.
+        ImportError: If bioio is not installed.
+    """
+    try:
+        from bioio import BioImage
+    except ImportError:
+        raise ImportError("bioio is required for load_image. Install it with: pip install bioio")
+    
+    file_path = os.fspath(path)
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+    
+    # Load the file with bioio - auto-detect reader or use specified one
+    if reader is not None:
+        reader_instance = BioImage(str(file_path), reader=reader)
+        logger.info("Using specified reader: %s", reader.__name__)
+    else:
+        reader_instance = BioImage(str(file_path))
+    
+    dim_str = ("".join([i[0] for i in reader_instance.dims.items()]))
+
+    # If scene_index is provided, validate it
+    if scene_index is not None:
+        scenes = reader_instance.scenes
+        if scenes is None:
+            raise ValueError("File has no scenes (scenes is None)")
+        
+        try:
+            num_scenes = len(scenes)
+        except (TypeError, AttributeError):
+            raise ValueError("Cannot determine number of scenes")
+        
+        if scene_index < 0 or scene_index >= num_scenes:
+            raise ValueError(f"Scene index {scene_index} is out of range (0-{num_scenes-1})")
+        
+        # Load the specific scene
+        reader_instance.set_scene(scene_index)
+        logger.debug (f"set scene to {scene_index}")
+    
+    # Load the image data, passing options directly to get_image_data
+    if options is not None and len(options) > 0:
+        reader_instance.set_scene(scene_index)
+        logger.debug (f"dim_str: {dim_str}, options: {options}")
+        scene_data = reader_instance.get_image_data(dim_str, **options).squeeze()
+    else:
+        scene_data = reader_instance.get_image_data()
+    
+    # Validate the data
+    if scene_data is None:
+        raise ValueError("Image data is None")
+    
+    if scene_data.size == 0:
+        raise ValueError("Image data is empty (size=0)")
+    
+    # Apply squeezing if requested
+    if squeeze:
+        scene_data = np.squeeze(scene_data)
+    
+    logger.info(
+        "Loaded image: %s scene=%s -> shape=%s dtype=%s",
+        file_path,
+        scene_index if scene_index is not None else "default",
+        scene_data.shape,
+        scene_data.dtype,
+    )
+    
+    return scene_data, reader_instance.physical_pixel_sizes
+
+
+def get_scenes(
+    path: Union[str, os.PathLike],
+    reader: Optional[type] = None,
+) -> List[Union[str, int]]:
+    """Get scene identifiers from an image file using bioio.
+    
+    Args:
+        path: Path to the image file.
+        reader: Optional reader class to use. If None, bioio will auto-detect the appropriate reader.
+        
+    Returns:
+        List of scene identifiers. The type depends on the file format:
+        - For formats with named scenes: List of strings (scene names/IDs)
+        - For formats with indexed scenes: List of integers (scene indices)
+        - Empty list if no scenes are found
+        
+    Raises:
+        FileNotFoundError: If the file does not exist.
+        ImportError: If bioio is not installed.
+    """
+    try:
+        from bioio import BioImage
+    except ImportError:
+        raise ImportError("bioio is required for get_scenes. Install it with: pip install bioio")
+    
+    file_path = os.fspath(path)
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+    
+    # Load the file with bioio - auto-detect reader or use specified one
+    if reader is not None:
+        reader_instance = BioImage(str(file_path), reader=reader)
+        logger.info("Using specified reader: %s", reader.__name__)
+    else:
+        reader_instance = BioImage(str(file_path))
+    
+    # Get scenes
+    scenes = reader_instance.scenes
+    
+    if scenes is None:
+        logger.warning("File has no scenes (scenes is None)")
+        return []
+    
+    try:
+        # Try to convert to list
+        if hasattr(scenes, '__iter__') and not isinstance(scenes, str):
+            scene_list = list(scenes)
+            logger.info("Found %d scenes in file: %s", len(scene_list), file_path)
+            return scene_list
+        else:
+            # Single scene or string
+            return [scenes]
+    except (TypeError, AttributeError) as e:
+        logger.warning("Could not convert scenes to list: %s", e)
+        return []
+
 
 def load_mp4(
     path: Union[str, os.PathLike],

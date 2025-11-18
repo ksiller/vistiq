@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
-from typing import Generic, TypeVar, Literal, Any
-from pydantic import BaseModel, ConfigDict
-from pydantic.dataclasses import dataclass
+from typing import Generic, TypeVar, Literal, Any, Optional, Tuple, Union
+from pydantic import BaseModel, PositiveInt
+#from pydantic.dataclasses import dataclass
 import numpy as np
 from joblib import Parallel, delayed
 import logging
@@ -122,6 +122,8 @@ class StackProcessorConfig(Configuration):
     """
 
     iterator_config: ArrayIteratorConfig = ArrayIteratorConfig(slice_def=(-2, -1))
+    batch_size: PositiveInt = 1
+    tile_shape: Optional[Tuple[int, int]] = None
     output_type: Literal["stack", "list"] = "stack"
     squeeze: bool = True
 
@@ -231,6 +233,7 @@ class StackProcessor(Configurable):
             results = results.reshape(input_shape)
             if self.config.squeeze:
                 results = results.squeeze()
+            logger.info(f"Reshaped results to shape {results.shape}")
         elif self.config.output_type == "list":
             if self.config.squeeze:
                 results = [

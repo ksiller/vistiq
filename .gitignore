@@ -82,5 +82,8 @@ venv/
 # build metadata written by hatch
 src/vistiq/_version.py
 
+# microsam embeddings
+embeddings/
+
 # dask performance reports
 *report.html
