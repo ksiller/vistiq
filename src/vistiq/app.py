@@ -1185,7 +1185,7 @@ def run_coincidence(config: CoincidenceConfig) -> None:
         logger.info(f"Processing scene: {sc}")
         # Load image
         img, scale = load_image(input_path_str, scene_index=idx, squeeze=True)
-        img = img[:, 30:40, ]
+        # img = img[:, 30:40, ]
 
         output_dir = f"{input_path_obj.with_suffix('')}-{sc}-dog-{config.sigma_low}-{config.sigma_high}-threshold-{config.threshold}"
         os.makedirs(output_dir, exist_ok=True)
