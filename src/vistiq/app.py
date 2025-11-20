@@ -11,7 +11,7 @@ import numpy as np
 from .utils import load_mp4, check_device, load_image, get_scenes, to_tif
 from .core import ArrayIteratorConfig
 from .preprocess import DoG, DoGConfig
-from .seg import MicroSAMSegmenter, MicroSAMSegmenterConfig, RegionFilter, RegionFilterConfig, RangeFilter, RangeFilterConfig
+from .seg import MicroSAMSegmenter, MicroSAMSegmenterConfig, RegionFilter, RegionFilterConfig, RangeFilter, RangeFilterConfig, RegionAnalyzer, RegionAnalyzerConfig
 from .analysis import CoincidenceDetector, CoincidenceDetectorConfig
 from .workflow_builder import (
     ComponentRegistry,
@@ -81,44 +81,139 @@ def configure_logger(level: str = "INFO", force: bool = False) -> logging.Logger
     return logger
 
 
-def parse_frames(frames: Optional[str]) -> tuple[Optional[int], Optional[int]]:
-    """Parse frames string into start/end frame indices.
+def parse_substack(substack: Optional[str]) -> tuple[Optional[int], Optional[int]]:
+    """Parse substack string into start/end frame indices (legacy format).
 
     Args:
-        frames: Frame specification string like '10' or '2-40' (1-based, inclusive).
+        substack: Substack specification string like '10' or '2-40' (1-based, inclusive).
 
     Returns:
         Tuple of (start_frame, end_frame) as zero-based indices, or (None, None) if not specified.
 
     Raises:
-        ValueError: If frames string is invalid.
+        ValueError: If substack string is invalid.
     """
-    if not frames:
+    if not substack:
         return None, None
 
-    fs = str(frames).strip()
+    fs = str(substack).strip()
     if "-" in fs:
         a, b = fs.split("-", 1)
         if not a.isdigit() or not b.isdigit():
             raise ValueError(
-                "--frames must be positive integers like '10' or '2-40'"
+                "--substack must be positive integers like '10' or '2-40'"
             )
         a_i = int(a)
         b_i = int(b)
         if a_i < 1 or b_i < 1:
-            raise ValueError("--frames indices are 1-based and must be >= 1")
+            raise ValueError("--substack indices are 1-based and must be >= 1")
         if b_i < a_i:
-            raise ValueError("--frames end must be >= start")
+            raise ValueError("--substack end must be >= start")
         # Convert to zero-based inclusive indices
         return a_i - 1, b_i - 1
     else:
         if not fs.isdigit():
-            raise ValueError("--frames must be a positive integer or a range 'A-B'")
+            raise ValueError("--substack must be a positive integer or a range 'A-B'")
         n = int(fs)
         if n < 1:
-            raise ValueError("--frames index is 1-based and must be >= 1")
+            raise ValueError("--substack index is 1-based and must be >= 1")
         start_frame = n - 1
         return start_frame, start_frame
+
+
+def parse_dimension_range(range_str: str) -> tuple[int, int]:
+    """Parse a single dimension range like '4-10' or '5' into start/end indices.
+    
+    Args:
+        range_str: Range string like '4-10' (1-based, inclusive) or '5' (single value).
+        
+    Returns:
+        Tuple of (start, end) as zero-based indices (both inclusive).
+        
+    Raises:
+        ValueError: If range string is invalid.
+    """
+    range_str = range_str.strip()
+    if "-" in range_str:
+        parts = range_str.split("-", 1)
+        if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+            raise ValueError(f"Invalid range format: '{range_str}'. Expected 'A-B' or 'A'")
+        start = int(parts[0])
+        end = int(parts[1])
+        if start < 1 or end < 1:
+            raise ValueError("Range indices are 1-based and must be >= 1")
+        if end < start:
+            raise ValueError(f"Range end ({end}) must be >= start ({start})")
+        # Convert to zero-based inclusive indices
+        return start - 1, end - 1
+    else:
+        if not range_str.isdigit():
+            raise ValueError(f"Invalid range format: '{range_str}'. Expected 'A-B' or 'A'")
+        val = int(range_str)
+        if val < 1:
+            raise ValueError("Range index is 1-based and must be >= 1")
+        # Single value: both start and end are the same (zero-based)
+        return val - 1, val - 1
+
+
+def substack_to_slices(substack: Optional[str]) -> Optional[dict[str, slice]]:
+    """Convert substack string to a dictionary of dimension slices for load_image.
+    
+    Supports two formats:
+    1. Legacy format: '10' or '2-40' (applied to first axis of the image)
+    2. New format: 'T:4-10,Z:2-20' (multiple dimensions with explicit names)
+    
+    For legacy format, use None as the key to indicate "first dimension".
+    load_image will detect the first dimension from image metadata and apply the slice.
+    
+    Args:
+        substack: Substack specification string.
+                 - Legacy: '10' or '2-40' (1-based, inclusive, applied to first axis)
+                 - New: 'T:4-10,Z:2-20' (dimension:range pairs, comma-separated)
+        
+    Returns:
+        Dictionary with dimension slices, or None if substack is not specified.
+        For legacy format, uses None as key: {None: slice(0, 10)} for substack='10'
+        Example: 
+        - {None: slice(0, 10)} for substack='10' (legacy, first axis)
+        - {None: slice(1, 40)} for substack='2-40' (legacy, first axis)
+        - {'T': slice(3, 10), 'Z': slice(1, 20)} for substack='T:4-10,Z:2-20' (new)
+    """
+    if not substack:
+        return None
+    
+    substack = str(substack).strip()
+    
+    # Check if it's the new format (contains ':' and possibly multiple dimensions)
+    if ":" in substack:
+        # New format: T:4-10,Z:2-20
+        slices_dict = {}
+        # Split by comma to get dimension:range pairs
+        parts = [p.strip() for p in substack.split(",")]
+        for part in parts:
+            if ":" not in part:
+                raise ValueError(f"Invalid substack format: '{part}'. Expected 'DIM:RANGE'")
+            dim_name, range_str = part.split(":", 1)
+            dim_name = dim_name.strip().upper()  # Normalize to uppercase
+            if not dim_name:
+                raise ValueError(f"Invalid dimension name in: '{part}'")
+            
+            # Parse the range
+            start, end = parse_dimension_range(range_str)
+            # end is inclusive, so we need end+1 for slice
+            slices_dict[dim_name] = slice(start, end + 1)
+        
+        return slices_dict if slices_dict else None
+    else:
+        # Legacy format: '10' or '2-40' (applied to first axis)
+        # Use None as key to indicate "first dimension"
+        start, end = parse_substack(substack)
+        if start is None or end is None:
+            return None
+        
+        # end is inclusive, so we need end+1 for slice
+        # Use None as key to indicate first dimension
+        return {None: slice(start, end + 1)}
 
 
 class AppConfig(BaseModel):
@@ -132,7 +227,9 @@ class AppConfig(BaseModel):
         input_path: Path to input file or directory.
         output_path: Path to output file or directory.
         grayscale: Whether to convert loaded images/videos to grayscale.
-        frames: Frame specification string (e.g., '10' or '2-40').
+        substack: Substack specification string. Supports two formats:
+                 - Legacy: '10' or '2-40' (applied to first axis of image, 1-based, inclusive)
+                 - New: 'T:4-10,Z:2-20' (multiple dimensions with explicit names, comma-separated)
     """
 
     loglevel: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
@@ -147,8 +244,8 @@ class AppConfig(BaseModel):
     grayscale: bool = Field(
         default=False, description="Convert loaded images/videos to grayscale"
     )
-    frames: Optional[str] = Field(
-        default=None, description="Frames to process (e.g., '10' or '2-40')"
+    substack: Optional[str] = Field(
+        default=None, description="Substack to process. Legacy: '10' or '2-40' (first axis). New: 'T:4-10,Z:2-20' (multiple dimensions)"
     )
 
     @property
@@ -158,7 +255,7 @@ class AppConfig(BaseModel):
         Returns:
             Start frame index (0-based), or None if not specified.
         """
-        start, _ = parse_frames(self.frames)
+        start, _ = parse_substack(self.substack)
         return start
 
     @property
@@ -168,7 +265,7 @@ class AppConfig(BaseModel):
         Returns:
             End frame index (0-based, inclusive), or None if not specified.
         """
-        _, end = parse_frames(self.frames)
+        _, end = parse_substack(self.substack)
         return end
 
 
@@ -341,6 +438,8 @@ class CoincidenceConfig(AppConfig):
         normalize: Normalize DoG output to [0, 1] range (default: True).
         area_lower: Lower bound for area filter (default: 100).
         area_upper: Upper bound for area filter (default: 10000).
+        volume_lower: Lower bound for volume filter (default: 100).
+        volume_upper: Upper bound for volume filter (default: 10000).
         model_type: MicroSAM model type (default: "vit_l_lm").
         threshold: Threshold for coincidence detection (default: 0.1).
         method: Coincidence detection method: 'iou' or 'dice' (default: "dice").
@@ -361,6 +460,12 @@ class CoincidenceConfig(AppConfig):
     )
     area_upper: float = Field(
         default=10000, description="Upper bound for area filter"
+    )
+    volume_lower: float = Field(
+        default=100, description="Lower bound for volume filter"
+    )
+    volume_upper: float = Field(
+        default=10000, description="Upper bound for volume filter"
     )
     model_type: Literal["vit_l_lm", "vit_b_lm", "vit_t_lm", "vit_h_lm"] = Field(
         default="vit_l_lm", description="MicroSAM model type"
@@ -469,6 +574,23 @@ class FullConfig(AppConfig):
         return v
 
 
+def _add_common_args(parser: argparse.ArgumentParser) -> None:
+    """Add common arguments to a parser (loglevel, etc.).
+    
+    Args:
+        parser: Argument parser to add common arguments to.
+    """
+    parser.add_argument(
+        "-l",
+        "--loglevel",
+        dest="loglevel",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Create and return the command-line argument parser with subcommands.
 
@@ -483,16 +605,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    # Common arguments for all subcommands
-    parser.add_argument(
-        "-l",
-        "--loglevel",
-        dest="loglevel",
-        type=str,
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        help="logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)",
-    )
+    # Common arguments for main parser (can be used before subcommand)
+    _add_common_args(parser)
 
     # Create subparsers
     subparsers = parser.add_subparsers(
@@ -503,6 +617,7 @@ def build_parser() -> argparse.ArgumentParser:
     segment_parser = subparsers.add_parser(
         "segment", help="Segment images to identify objects"
     )
+    _add_common_args(segment_parser)
     segment_parser.add_argument(
         "-i",
         "--input",
@@ -526,11 +641,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     segment_parser.add_argument(
         "-f",
-        "--frames",
-        dest="frames",
+        "--substack",
+        dest="substack",
         type=str,
         default=None,
-        help="frames to process; examples: '10' or '2-40' (inclusive). Default: all frames",
+        help="substack to process; examples: '10' or '2-40' (legacy, first axis) or 'T:4-10,Z:2-20' (new format). Default: all frames",
     )
     segment_parser.add_argument(
         "--threshold-method",
@@ -574,6 +689,7 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser = subparsers.add_parser(
         "analyze", help="Analyze segmented images"
     )
+    _add_common_args(analyze_parser)
     analyze_parser.add_argument(
         "-i",
         "--input",
@@ -597,11 +713,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     analyze_parser.add_argument(
         "-f",
-        "--frames",
-        dest="frames",
+        "--substack",
+        dest="substack",
         type=str,
         default=None,
-        help="frames to process; examples: '10' or '2-40' (inclusive). Default: all frames",
+        help="substack to process; examples: '10' or '2-40' (legacy, first axis) or 'T:4-10,Z:2-20' (new format). Default: all frames",
     )
     analyze_parser.add_argument(
         "--include-stats",
@@ -634,6 +750,7 @@ def build_parser() -> argparse.ArgumentParser:
     preprocess_parser = subparsers.add_parser(
         "preprocess", help="Preprocess images with denoising and filtering"
     )
+    _add_common_args(preprocess_parser)
     preprocess_parser.add_argument(
         "-i",
         "--input",
@@ -657,11 +774,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     preprocess_parser.add_argument(
         "-f",
-        "--frames",
-        dest="frames",
+        "--substack",
+        dest="substack",
         type=str,
         default=None,
-        help="frames to process; examples: '10' or '2-40' (inclusive). Default: all frames",
+        help="substack to process; examples: '10' or '2-40' (legacy, first axis) or 'T:4-10,Z:2-20' (new format). Default: all frames",
     )
     preprocess_parser.add_argument(
         "--preprocess-method",
@@ -731,6 +848,7 @@ def build_parser() -> argparse.ArgumentParser:
     full_parser = subparsers.add_parser(
         "full", help="Run full pipeline (segment + analyze)"
     )
+    _add_common_args(full_parser)
     full_parser.add_argument(
         "-i",
         "--input",
@@ -754,11 +872,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     full_parser.add_argument(
         "-f",
-        "--frames",
-        dest="frames",
+        "--substack",
+        dest="substack",
         type=str,
         default=None,
-        help="frames to process; examples: '10' or '2-40' (inclusive). Default: all frames",
+        help="substack to process; examples: '10' or '2-40' (legacy, first axis) or 'T:4-10,Z:2-20' (new format). Default: all frames",
     )
     full_parser.add_argument(
         "--threshold-method",
@@ -828,12 +946,35 @@ def build_parser() -> argparse.ArgumentParser:
     coincidence_parser = subparsers.add_parser(
         "coincidence", help="Run coincidence detection workflow with DoG preprocessing and MicroSAM segmentation"
     )
+    _add_common_args(coincidence_parser)
     coincidence_parser.add_argument(
         "-i",
         "--input",
         dest="input_path",
         required=True,
         help="input image file path",
+    )
+    coincidence_parser.add_argument(
+        "-o",
+        "--output",
+        dest="output_path",
+        required=False,
+        help="output directory (default: current directory)",
+    )
+    coincidence_parser.add_argument(
+        "-g",
+        "--grayscale",
+        dest="grayscale",
+        action="store_true",
+        help="convert loaded images/videos to grayscale before processing",
+    )
+    coincidence_parser.add_argument(
+        "-f",
+        "--substack",
+        dest="substack",
+        type=str,
+        default=None,
+        help="substack to process; examples: '10' or '2-40' (legacy, first axis) or 'T:4-10,Z:2-20' (new format). Default: all frames",
     )
     coincidence_parser.add_argument(
         "--sigma-low",
@@ -877,6 +1018,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="upper bound for area filter (default: 10000)",
     )
     coincidence_parser.add_argument(
+        "--volume-lower",
+        dest="volume_lower",
+        type=float,
+        default=100,
+        help="lower bound for volume filter (default: 100)",
+    )
+    coincidence_parser.add_argument(
+        "--volume-upper",
+        dest="volume_upper",
+        type=float,
+        default=10000,
+        help="upper bound for volume filter (default: 10000)",
+    )
+    coincidence_parser.add_argument(
         "--model-type",
         dest="model_type",
         type=str,
@@ -912,6 +1067,7 @@ def build_parser() -> argparse.ArgumentParser:
     workflow_parser = subparsers.add_parser(
         "workflow", help="Build and run modular workflows from CLI-specified components"
     )
+    _add_common_args(workflow_parser)
     workflow_parser.add_argument(
         "-i",
         "--input",
@@ -935,11 +1091,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     workflow_parser.add_argument(
         "-f",
-        "--frames",
-        dest="frames",
+        "--substack",
+        dest="substack",
         type=str,
         default=None,
-        help="frames to process; examples: '10' or '2-40' (inclusive). Default: all frames",
+        help="substack to process; examples: '10' or '2-40' (legacy, first axis) or 'T:4-10,Z:2-20' (new format). Default: all frames",
     )
     workflow_parser.add_argument(
         "--component",
@@ -985,14 +1141,14 @@ def args_to_config(args: argparse.Namespace) -> AppConfig:
     """
     # Convert Path strings to Path objects
     input_path = Path(args.input_path) if getattr(args, "input_path", None) else None
-    output_path = Path(args.output_path) if getattr(args, "output_path", None) else None
+    output_path = Path(args.output_path) if getattr(args, "output_path", None) else Path.cwd()
 
     base_kwargs = {
         "loglevel": args.loglevel.upper(),
         "input_path": input_path,
         "output_path": output_path,
         "grayscale": getattr(args, "grayscale", False),
-        "frames": getattr(args, "frames", None),
+        "substack": getattr(args, "substack", None),
     }
 
     if args.command == "segment":
@@ -1040,6 +1196,8 @@ def args_to_config(args: argparse.Namespace) -> AppConfig:
             normalize=getattr(args, "normalize", True),
             area_lower=getattr(args, "area_lower", 100),
             area_upper=getattr(args, "area_upper", 10000),
+            volume_lower=getattr(args, "volume_lower", 100),
+            volume_upper=getattr(args, "volume_upper", 10000),
             model_type=getattr(args, "model_type", "vit_l_lm"),
             threshold=getattr(args, "threshold", 0.1),
             method=getattr(args, "method", "dice"),
@@ -1129,7 +1287,7 @@ def run_full(config: FullConfig) -> None:
         input_path=config.input_path,
         output_path=config.output_path,  # Could be intermediate path
         grayscale=config.grayscale,
-        frames=config.frames,
+        substack=config.substack,
         threshold_method=config.threshold_method,
         block_size=config.block_size,
         connectivity=config.connectivity,
@@ -1144,7 +1302,7 @@ def run_full(config: FullConfig) -> None:
         input_path=config.output_path,  # Use segment output as analyze input
         output_path=config.output_path,
         grayscale=config.grayscale,
-        frames=config.frames,
+        substack=config.substack,
         include_stats=config.include_stats,
         include_coords=config.include_coords,
     )
@@ -1160,15 +1318,15 @@ def run_coincidence(config: CoincidenceConfig) -> None:
     logger.info("Running coincidence command with config: %s", config)
     
     # Set up configurations
+    volume_it_cfg = ArrayIteratorConfig(slice_def=(-3, -2, -1))
+
     dog_config = DoGConfig(
         sigma_low=config.sigma_low,
         sigma_high=config.sigma_high,
         normalize=config.normalize
     )
-    region_filter_config = RegionFilterConfig(
-        filters=[RangeFilter(RangeFilterConfig(attribute="area", range=(config.area_lower, config.area_upper)))]
-    )
-    volume_it_cfg = ArrayIteratorConfig(slice_def=(-3, -2, -1))
+    region_analyzer_config = RegionAnalyzerConfig(properties=["centroid", "bbox", "volume", "aspect_ratio", "sphericity"], iterator_config=volume_it_cfg, output_type="dataframe")
+    region_filter_config = RegionFilterConfig(filters=[RangeFilter(RangeFilterConfig(attribute="volume", range=(config.volume_lower, config.volume_upper)))])
     coincidence_config = CoincidenceDetectorConfig(
         method=config.method,
         mode=config.mode,
@@ -1176,6 +1334,9 @@ def run_coincidence(config: CoincidenceConfig) -> None:
         threshold=config.threshold
     )
 
+    # Determine output directory (defaults to current directory if not specified)
+    output_base = Path(config.output_path or Path.cwd()).resolve()
+    
     # Get absolute path of input and strip extension for output directory
     input_path_obj = Path(config.input_path).resolve()
     input_path_str = str(config.input_path)
@@ -1183,67 +1344,68 @@ def run_coincidence(config: CoincidenceConfig) -> None:
     scenes = get_scenes(input_path_str)
     for idx, sc in enumerate(scenes):
         logger.info(f"Processing scene: {sc}")
-        # Load image
-        img, scale = load_image(input_path_str, scene_index=idx, squeeze=True)
+        # Load image with substack slicing if specified
+        substack_slices = substack_to_slices(config.substack)
+        img, metadata = load_image(input_path_str, scene_index=idx, substack=substack_slices, squeeze=True)
+        channel_names = metadata["channel_names"]
         # img = img[:, 30:40, ]
 
-        output_dir = f"{input_path_obj.with_suffix('')}-{sc}-dog-{config.sigma_low}-{config.sigma_high}-threshold-{config.threshold}"
+        output_dir = output_base / f"{input_path_obj.stem}-{sc}-dog-{config.sigma_low}-{config.sigma_high}-threshold-{config.threshold}"
         os.makedirs(output_dir, exist_ok=True)
         logger.info(f"Output directory: {output_dir}")
     
         img_ch = np.unstack(img, axis=0)
-        logger.info(f"Image shape: {img.shape}, scale: {scale}")
+        logger.info(f"Image shape: {img.shape}, channel names: {channel_names}, metadata: {metadata}")
         for im in img_ch:
             logger.debug(f"Channel shape: {im.shape}")
 
-        masks_ch = []
         labels_ch = []
-        regions_ch = []
+        feature_dfs = {}
 
-        for i, im in enumerate(img_ch):
+        for ch_name, im in zip(channel_names, img_ch):
             # 1. DoG preprocessing
             dog = DoG(dog_config)
             preprocessed = dog.run(im)
-            output_path = f"{output_dir}/Preprocessed_Ch{i}.tif"
+            output_path = output_dir / f"Preprocessed_{ch_name}.tif"
             to_tif(output_path, preprocessed)
 
             # 2. MicroSAMSegmenter with RegionFilter
             region_filter = RegionFilter(region_filter_config)
+            region_analyzer = RegionAnalyzer(region_analyzer_config)
             # need to set up new microsam config for each channel to deal with different embeddings
             microsam_config = MicroSAMSegmenterConfig(
                 model_type=config.model_type,
+                region_analyzer=region_analyzer,
                 region_filter=region_filter,
                 do_labels=True,
                 do_regions=True
             )
 
             microsam = MicroSAMSegmenter(microsam_config)
-            masks, labels, regions = microsam.run(preprocessed)
-            output_path = f"{output_dir}/Labels_Ch{i}.tif"
+            _, labels, regions = microsam.run(preprocessed, metadata=metadata)
+            output_path = output_dir / f"Labels_{ch_name}.tif"
             to_tif(output_path, labels)
-            masks_ch.append(masks)
             labels_ch.append(labels)
-            regions_ch.append(regions)
+            feature_dfs[ch_name] = [regions]
+            logger.info (f"Feature DataFrame: {ch_name}: {regions.head()}")
 
         # 3. CoincidenceDetector
         # Create pairwise combinations of labels
         label_index_combinations = list(itertools.combinations(range(len(labels_ch)), 2))
         logger.info(f"Label index combinations: {label_index_combinations}")
-        feature_dfs = {}
         for idx_combination in label_index_combinations:
             coincidence_detector = CoincidenceDetector(coincidence_config)
             _, dfs = coincidence_detector.run(
                 labels_ch[idx_combination[0]], 
                 labels_ch[idx_combination[1]], 
-                stack_names=(f"Ch{idx_combination[0]}", f"Ch{idx_combination[1]}")
+                stack_names=(channel_names[idx_combination[0]], channel_names[idx_combination[1]])
             )
             for key, df in dfs.items():
-                if key not in feature_dfs:
-                    feature_dfs[key] = [df]
-                else:
-                    feature_dfs[key].append(df)
+                feature_dfs[key].append(df)
+        
+        # 4. Save features
         for key, dfs in feature_dfs.items():
-            output_path = f"{output_dir}/Coincidence_{key}.csv"
+            output_path = output_dir / f"Features_{key}.csv"
             logger.info(f"Saving to: {output_path}")
             dfs[0].join(dfs[1:]).to_csv(output_path, index=True)
 
@@ -1288,8 +1450,9 @@ def run_workflow(config: AppConfig, args: argparse.Namespace) -> None:
     if config.input_path:
         from .utils import load_image
         logger.info(f"Loading input from: {config.input_path}")
-        # For now, assume single image - could be extended for stacks
-        data = load_image(str(config.input_path))
+        # Convert substack string to dimension slices if specified
+        substack_slices = substack_to_slices(config.substack)
+        data = load_image(str(config.input_path), substack=substack_slices)
     else:
         logger.error("Input path required for workflow")
         raise ValueError("--input is required")
@@ -1300,13 +1463,10 @@ def run_workflow(config: AppConfig, args: argparse.Namespace) -> None:
         logger.info(f"Running component {i+1}/{len(built_components)}: {component.name()}")
         result = component.run(result)
     
-    # Save output if specified
-    if config.output_path:
-        import numpy as np
-        logger.info(f"Saving output to: {config.output_path}")
-        np.save(str(config.output_path), result)
-    else:
-        logger.warning("No output path specified, results not saved")
+    # Save output (defaults to current directory if not specified)
+    import numpy as np
+    logger.info(f"Saving output to: {config.output_path}")
+    np.save(str(config.output_path), result)
 
 
 def main() -> None:

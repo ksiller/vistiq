@@ -1,11 +1,14 @@
 import numpy as np
 import pandas as pd
-from typing import Literal, Dict, List, Tuple, Optional
+import logging
+from typing import Literal, Dict, List, Tuple, Optional, Any
 from pydantic import Field, field_validator
 from skimage.measure import regionprops
 from vistiq.core import Configuration, Configurable, StackProcessorConfig, StackProcessor, ChainProcessorConfig, ChainProcessor
 from vistiq.workflow import Workflow
 from vistiq.utils import ArrayIterator, ArrayIteratorConfig, create_unique_folder
+
+logger = logging.getLogger(__name__)
 
 class CoincidenceDetectorConfig(StackProcessorConfig):
     """Configuration for coincidence detection workflow.
@@ -100,26 +103,26 @@ class CoincidenceDetector(StackProcessor):
         
         Args:
             bbox: Bounding box. For 2D: (min_row, min_col, max_row, max_col).
-                  For 3D: (min_row, min_col, min_slice, max_row, max_col, max_slice).
+                  For 3D: (min_Z, min_Y, min_X, max_Z, max_Y, max_X) in Z-Y-X order.
             shape: Shape of the full image. For 2D: (height, width).
-                   For 3D: (depth, height, width) or (height, width) if using 2D projection.
+                   For 3D: (Z, Y, X) or (height, width) if using 2D projection.
             
         Returns:
             Binary mask with ones in the bounding box region.
         """
         # Handle both 2D (4 values) and 3D (6 values) bounding boxes
         if len(bbox) == 6:
-            # 3D: (min_row, min_col, min_slice, max_row, max_col, max_slice)
-            min_row, min_col, min_slice, max_row, max_col, max_slice = bbox
+            # 3D: (min_Z, min_Y, min_X, max_Z, max_Y, max_X)
+            min_Z, min_Y, min_X, max_Z, max_Y, max_X = bbox
             # Check if shape is 3D or 2D
             if len(shape) == 3:
-                # Full 3D mask
+                # Full 3D mask: shape is (Z, Y, X)
                 mask = np.zeros(shape, dtype=bool)
-                mask[min_slice:max_slice, min_row:max_row, min_col:max_col] = True
+                mask[min_Z:max_Z, min_Y:max_Y, min_X:max_X] = True
             else:
-                # 2D projection - use only spatial dimensions
+                # 2D projection - use only Y and X dimensions
                 mask = np.zeros(shape, dtype=bool)
-                mask[min_row:max_row, min_col:max_col] = True
+                mask[min_Y:max_Y, min_X:max_X] = True
         else:
             # 2D: (min_row, min_col, max_row, max_col)
             min_row, min_col, max_row, max_col = bbox
@@ -162,8 +165,165 @@ class CoincidenceDetector(StackProcessor):
         mask1 = self._bbox_to_mask(bbox1, shape)
         mask2 = self._bbox_to_mask(bbox2, shape)
         return self._dice(mask1, mask2)
+    
+    def _extract_region(self, labels: np.ndarray, bbox: Tuple) -> np.ndarray:
+        """Extract a sub-region from labels based on bounding box.
+        
+        Args:
+            labels: Labeled image array.
+            bbox: Bounding box. For 2D: (min_row, min_col, max_row, max_col).
+                  For 3D: (min_Z, min_Y, min_X, max_Z, max_Y, max_X).
+                  Note: regionprops returns bboxes in Z-Y-X order for 3D arrays.
+                  For array shape (Z, Y, X), the bbox directly maps to array[Z, Y, X].
+            
+        Returns:
+            Extracted sub-region from labels.
+        """
+        if len(bbox) == 6:
+            # 3D: (min_Z, min_Y, min_X, max_Z, max_Y, max_X)
+            # regionprops bbox format for 3D is in Z-Y-X order
+            # For array shape (Z, Y, X), directly map: bbox[Z, Y, X] -> array[Z, Y, X]
+            min_z, min_y, min_x, max_z, max_y, max_x = bbox
+            if labels.ndim == 3:
+                return labels[min_z:max_z, min_y:max_y, min_x:max_x]
+            else:
+                # 2D array, bbox is (min_row, min_col, max_row, max_col)
+                min_y, min_x, max_y, max_x = bbox[:4]
+                return labels[min_y:max_y, min_x:max_x]
+        else:
+            # 2D: (min_row, min_col, max_row, max_col)
+            min_y, min_x, max_y, max_x = bbox
+            return labels[min_y:max_y, min_x:max_x]
+    
+    def _bbox_to_relative(self, bbox: Tuple, union_bbox: Tuple) -> Tuple:
+        """Convert a bounding box to coordinates relative to a union bounding box.
+        
+        Args:
+            bbox: Original bounding box. For 2D: (min_row, min_col, max_row, max_col).
+                  For 3D: (min_Z, min_Y, min_X, max_Z, max_Y, max_X) in Z-Y-X order.
+            union_bbox: Union bounding box in the same format.
+            
+        Returns:
+            Relative bounding box with coordinates relative to the union bbox origin.
+        """
+        if len(bbox) == 6:
+            # 3D: (min_Z, min_Y, min_X, max_Z, max_Y, max_X)
+            min_Z, min_Y, min_X, max_Z, max_Y, max_X = bbox
+            u_min_Z, u_min_Y, u_min_X, u_max_Z, u_max_Y, u_max_X = union_bbox
+            return (
+                min_Z - u_min_Z,
+                min_Y - u_min_Y,
+                min_X - u_min_X,
+                max_Z - u_min_Z,
+                max_Y - u_min_Y,
+                max_X - u_min_X
+            )
+        else:
+            # 2D
+            min_row, min_col, max_row, max_col = bbox
+            u_min_row, u_min_col, u_max_row, u_max_col = union_bbox
+            return (
+                min_row - u_min_row,
+                min_col - u_min_col,
+                max_row - u_min_row,
+                max_col - u_min_col
+            )
+    
+    def _bboxes_overlap(self, bbox1: Tuple, bbox2: Tuple) -> bool:
+        """Check if two bounding boxes overlap.
+        
+        Args:
+            bbox1: Bounding box. For 2D: (min_row, min_col, max_row, max_col).
+                   For 3D: (min_Z, min_Y, min_X, max_Z, max_Y, max_X) in Z-Y-X order.
+            bbox2: Bounding box. Same format as bbox1.
+            
+        Returns:
+            True if bounding boxes overlap, False otherwise.
+        """
+        if len(bbox1) == 6 and len(bbox2) == 6:
+            # 3D bounding boxes: (min_Z, min_Y, min_X, max_Z, max_Y, max_X)
+            min_Z1, min_Y1, min_X1, max_Z1, max_Y1, max_X1 = bbox1
+            min_Z2, min_Y2, min_X2, max_Z2, max_Y2, max_X2 = bbox2
+            
+            # Check overlap in all three dimensions (Z, Y, X)
+            overlap_Z = not (max_Z1 <= min_Z2 or max_Z2 <= min_Z1)
+            overlap_Y = not (max_Y1 <= min_Y2 or max_Y2 <= min_Y1)
+            overlap_X = not (max_X1 <= min_X2 or max_X2 <= min_X1)
+            
+            return overlap_Z and overlap_Y and overlap_X
+        else:
+            # 2D bounding boxes: (min_row, min_col, max_row, max_col)
+            min_row1, min_col1, max_row1, max_col1 = bbox1
+            min_row2, min_col2, max_row2, max_col2 = bbox2
+            
+            # Check overlap in both dimensions
+            overlap_row = not (max_row1 <= min_row2 or max_row2 <= min_row1)
+            overlap_col = not (max_col1 <= min_col2 or max_col2 <= min_col1)
+            
+            return overlap_row and overlap_col
+    
+    def _bbox_union(self, bboxes: List[Tuple]) -> Optional[Tuple]:
+        """Compute the bounding box that encompasses a list of bounding boxes.
+        
+        Works for n-dimensional bounding boxes. Supports two input formats:
+        
+        1. Flat format: (min_0, min_1, ..., min_{n-1}, max_0, max_1, ..., max_{n-1})
+           - 2D: (min_row, min_col, max_row, max_col) = 4 values
+           - 3D: (min_row, min_col, min_slice, max_row, max_col, max_slice) = 6 values
+        
+        2. Tuple-of-tuples format: ((min_0, min_1, ..., min_{n-1}), (max_0, max_1, ..., max_{n-1}))
+           - 2D: ((min_row, min_col), (max_row, max_col))
+           - 3D: ((min_row, min_col, min_slice), (max_row, max_col, max_slice))
+        
+        Args:
+            bboxes: List of bounding boxes. All bounding boxes must have the same
+                   dimensionality and format. Can be:
+                   - List of flat tuples: [(min_0, ..., max_0, ...), ...]
+                   - List of tuple-of-tuples: [((min_0, ...), (max_0, ...)), ...]
+            
+        Returns:
+            Union bounding box in the same format as input, or None if list is empty.
+            The union bounding box contains all input bounding boxes.
+            
+        Raises:
+            ValueError: If bounding boxes have different dimensionalities or formats.
+        """
+        if not bboxes:
+            return None
+        
+        try:
+            bboxes = np.array(bboxes)
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                f"All bounding boxes must have the same dimensionality and format. "
+                f"Error converting to numpy array: {e}"
+            )
+        
+        ndim = bboxes.ndim
+        
+        # Check if input is in tuple-of-tuples format (ndim == 3) or flat format (ndim == 2)
+        if ndim == 3:
+            # Tuple-of-tuples format: ((min_coords...), (max_coords...))
+            # bboxes shape: (N, 2, M) where N is number of bboxes, M is number of dimensions
+            union_mins = np.min(bboxes[:, 0, :], axis=0)
+            union_maxs = np.max(bboxes[:, 1, :], axis=0)
+            return (tuple(union_mins), tuple(union_maxs))
+        else:
+            # Flat format: (min_0, min_1, ..., min_{M-1}, max_0, max_1, ..., max_{M-1})
+            # bboxes shape: (N, 2*M) where N is number of bboxes, M is number of dimensions
+            # Need to split each bbox into min and max parts
+            num_dims = bboxes.shape[1] // 2
+            if bboxes.shape[1] % 2 != 0:
+                raise ValueError(
+                    f"Flat format bounding boxes must have an even number of elements. "
+                    f"Got shape {bboxes.shape[1]}"
+                )
+            bbox_array = bboxes.reshape((len(bboxes), 2, num_dims))
+            union_mins = np.min(bbox_array[:, 0, :], axis=0)
+            union_maxs = np.max(bbox_array[:, 1, :], axis=0)
+            return tuple(np.concatenate([union_mins, union_maxs]))
 
-    def _process_slice(self, labels1: np.ndarray, labels2: np.ndarray, stack_names:Tuple[str, str] = ["stack_1", "stack_2"]) -> List[Dict]:
+    def _process_slice(self, labels1: np.ndarray, labels2: np.ndarray, stack_names:Tuple[str, str] = ["stack_1", "stack_2"], metadata: Optional[dict[str, Any]] = None, **kwargs) -> List[Dict]:
         """Process a single slice of the coincidence detector.
         
         Computes overlap between each region in labels1 with all regions in labels2.
@@ -192,44 +352,83 @@ class CoincidenceDetector(StackProcessor):
         
         results = []
         
-        # Get region properties for bounding boxes if needed
-        bboxes1 = None
-        bboxes2 = None
-        img_shape = None
-        if self.config.mode == "bounding_box":
-            bboxes1 = {prop.label: prop.bbox for prop in regionprops(labels1)}
-            bboxes2 = {prop.label: prop.bbox for prop in regionprops(labels2)}
-            # Get image shape for creating masks
-            # For 3D images, use full shape; for 2D, use spatial dimensions
-            if labels1.ndim == 3:
-                img_shape = labels1.shape
-            else:
-                img_shape = labels1.shape[:2]
+        # Always get bounding boxes for all regions (regardless of mode)
+        # This allows us to check overlap before expensive computations
+        props1 = regionprops(labels1)
+        props2 = regionprops(labels2)
+        bboxes1 = {prop.label: prop.bbox for prop in props1}
+        bboxes2 = {prop.label: prop.bbox for prop in props2}
+        
+        # Debug: Log bbox info for the labels we're comparing
+        logger.debug(f"labels1.shape: {labels1.shape}, labels2.shape: {labels2.shape}")
+        logger.debug(f"Unique labels1: {unique_labels1[:10]}... (showing first 10)")
+        logger.debug(f"Unique labels2: {unique_labels2[:10]}... (showing first 10)")
+        
+        # Debug: Check a sample bbox to understand the format
+        if unique_labels1.size > 0 and unique_labels1[0] in bboxes1:
+            sample_bbox = bboxes1[unique_labels1[0]]
+            logger.debug(f"Sample bbox for label {unique_labels1[0]}: {sample_bbox}, len: {len(sample_bbox)}")
         
         # Compute overlap for each region pair
         for label1 in unique_labels1:
-            # Create binary mask for region1
-            if self.config.mode == "outline":
-                mask1 = (labels1 == label1)
+            # Get bounding box for region1
+            bbox1 = bboxes1.get(label1)
+            if bbox1 is None:
+                continue
             
             for label2 in unique_labels2:
-                # Compute overlap based on mode
-                if self.config.mode == "outline":
-                    # Pixel-level overlap
-                    mask2 = (labels2 == label2)
-                    if self.config.method == "iou":
-                        overlap_score = self._iou(mask1, mask2)
-                    else:  # dice
-                        overlap_score = self._dice(mask1, mask2)
-                else:  # bounding_box mode
-                    # Bounding box overlap - create masks and use _iou/_dice
-                    if label1 in bboxes1 and label2 in bboxes2:
-                        if self.config.method == "iou":
-                            overlap_score = self._iou_box(bboxes1[label1], bboxes2[label2], img_shape)
-                        else:  # dice
-                            overlap_score = self._dice_box(bboxes1[label1], bboxes2[label2], img_shape)
-                    else:
+                # Get bounding box for region2
+                bbox2 = bboxes2.get(label2)
+                if bbox2 is None:
+                    continue
+                
+                # Check if bounding boxes overlap first (early exit optimization)
+                if not self._bboxes_overlap(bbox1, bbox2):
+                    # No overlap, score is 0 - skip expensive computation
+                    logger.debug(f"No overlap between labels {label1} and {label2}, bbox1: {bbox1}, bbox2: {bbox2}")
+                    overlap_score = 0.0
+                else:
+                    # Bounding boxes overlap, compute union bbox for optimized mask extraction
+                    union_bbox = self._bbox_union([bbox1, bbox2])
+                    if union_bbox is None:
+                        logger.debug(f"No union bbox found for labels {label1} and {label2}, bbox1: {bbox1}, bbox2: {bbox2}")
                         overlap_score = 0.0
+                    else:
+                        # Extract sub-regions from both labels using union bbox
+                        logger.debug(f"Union bbox found for labels {label1} and {label2}, union_bbox: {union_bbox}, labels1.shape: {labels1.shape}, labels2.shape: {labels2.shape}")
+                        sub_labels1 = self._extract_region(labels1, union_bbox)
+                        sub_labels2 = self._extract_region(labels2, union_bbox)
+                        logger.debug(f"Extracted sub_labels1.shape: {sub_labels1.shape}, sub_labels2.shape: {sub_labels2.shape}")
+                        logger.debug(f"Unique labels in sub_labels1: {np.unique(sub_labels1)}, looking for label {label1}")
+                        logger.debug(f"Unique labels in sub_labels2: {np.unique(sub_labels2)}, looking for label {label2}")
+                        
+                        # Create masks on the smaller sub-regions
+                        if self.config.mode == "outline":
+                            # Pixel-level overlap on sub-regions
+                            mask1 = (sub_labels1 == label1)
+                            mask2 = (sub_labels2 == label2)
+                            
+                            # Debug: Check if masks are empty
+                            logger.debug(f"mask1 sum: {np.sum(mask1)}, mask2 sum: {np.sum(mask2)}")
+                            if not np.any(mask1):
+                                logger.debug(f"Warning: mask1 for label {label1} is empty after extraction. Union bbox: {union_bbox}, bbox1: {bbox1}")
+                            if not np.any(mask2):
+                                logger.debug(f"Warning: mask2 for label {label2} is empty after extraction. Union bbox: {union_bbox}, bbox2: {bbox2}")
+                            
+                            if self.config.method == "iou":
+                                overlap_score = self._iou(mask1, mask2)
+                            else:  # dice
+                                overlap_score = self._dice(mask1, mask2)
+                        else:  # bounding_box mode
+                            # Convert bboxes to relative coordinates within the union bbox
+                            rel_bbox1 = self._bbox_to_relative(bbox1, union_bbox)
+                            rel_bbox2 = self._bbox_to_relative(bbox2, union_bbox)
+                            sub_shape = sub_labels1.shape
+                            if self.config.method == "iou":
+                                overlap_score = self._iou_box(rel_bbox1, rel_bbox2, sub_shape)
+                            else:  # dice
+                                overlap_score = self._dice_box(rel_bbox1, rel_bbox2, sub_shape)
+                        logger.debug(f"Union bbox found for labels {label1} and {label2}, union_bbox: {union_bbox}, overlap_score: {overlap_score}")
                 
                 results.append({
                     stack_names[0]: int(label1),
@@ -305,7 +504,7 @@ class CoincidenceDetector(StackProcessor):
         
         return dataframes
 
-    def run(self, labels1: np.ndarray, labels2: np.ndarray, stack_names: Optional[Tuple[str, str]] = None) -> Tuple[List[Dict], Dict[str, pd.DataFrame]]:
+    def run(self, labels1: np.ndarray, labels2: np.ndarray, stack_names: Optional[Tuple[str, str]] = None, metadata: Optional[dict[str, Any]] = None, **kwargs) -> Tuple[List[Dict], Dict[str, pd.DataFrame]]:
         """Run the coincidence detector on a labeled image.
         
         Args:
@@ -322,6 +521,6 @@ class CoincidenceDetector(StackProcessor):
         if stack_names is None or len(stack_names) != 2:
             stack_names = ("stack_1", "stack_2",)        
 
-        results = super().run(labels1, labels2, stack_names)
+        results = super().run(labels1, labels2, stack_names, metadata=metadata, **kwargs)
         consolidated_dfs = self._consolidate_results(results, stack_names)
         return results, consolidated_dfs

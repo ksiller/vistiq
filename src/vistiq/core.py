@@ -3,7 +3,8 @@ from typing import Generic, TypeVar, Literal, Any, Optional, Tuple, Union
 from pydantic import BaseModel, PositiveInt
 #from pydantic.dataclasses import dataclass
 import numpy as np
-from joblib import Parallel, delayed
+import pandas as pd
+# Lazy import joblib to avoid slow initialization at module import time
 import logging
 
 from vistiq.utils import ArrayIterator, ArrayIteratorConfig
@@ -124,7 +125,7 @@ class StackProcessorConfig(Configuration):
     iterator_config: ArrayIteratorConfig = ArrayIteratorConfig(slice_def=(-2, -1))
     batch_size: PositiveInt = 1
     tile_shape: Optional[Tuple[int, int]] = None
-    output_type: Literal["stack", "list"] = "stack"
+    output_type: Literal["stack", "list", "dataframe"] = "stack"
     squeeze: bool = True
 
 
@@ -160,8 +161,7 @@ class StackProcessor(Configurable):
         return cls(config)
 
     def run(
-        self, stack: np.ndarray, *args, workers: int = -1, verbose: int = 10
-    ) -> np.ndarray | tuple[Any,...]:
+        self, stack: np.ndarray, *args, workers: int = -1, verbose: int = 10, metadata: Optional[dict[str, Any]] = None, **kwargs) -> np.ndarray | tuple[Any,...]:
         """Run the stack processor on an image.
 
         Args:
@@ -169,6 +169,8 @@ class StackProcessor(Configurable):
             *args: Additional arguments to pass to _process_slice.
             workers: Number of parallel workers (-1 for all cores).
             verbose: Verbosity level for parallel processing.
+            metadata: Optional metadata to pass to the processor.
+            **kwargs: Additional keyword arguments to pass to the processor.
 
         Returns:
             Processed result array or tuple of lists depending on output_type.
@@ -178,12 +180,14 @@ class StackProcessor(Configurable):
         n_iterations = len(iterator)
         if n_iterations == 1:
             results = self._process_slice(
-                stack, *args
+                stack, *args, metadata=metadata, **kwargs
             )
         else:
+            # Lazy import joblib only when parallel processing is needed
+            from joblib import Parallel, delayed
             results = Parallel(n_jobs=workers, verbose=verbose)(
                 delayed(self._process_slice)(
-                    stack_slice, *args)
+                    stack_slice, *args, metadata=metadata, **kwargs)
                 for stack_slice in iterator
             )
             # reshape results
@@ -191,7 +195,7 @@ class StackProcessor(Configurable):
         return results
 
     def _process_slice(
-        self, slice: np.ndarray, *args) -> np.ndarray | tuple[Any,...]:
+        self, slice: np.ndarray, *args, metadata: Optional[dict[str, Any]] = None, **kwargs) -> np.ndarray | tuple[Any,...]:
         """Process a single slice of the image stack.
 
         This method must be implemented by subclasses to define the actual
@@ -202,7 +206,8 @@ class StackProcessor(Configurable):
             *args: Additional arguments.
             workers: Number of workers (for nested parallelism).
             verbose: Verbosity level.
-
+            metadata: Optional metadata to pass to the processor.
+            **kwargs: Additional keyword arguments to pass to the processor.
         Returns:
             Processed slice result.
 
@@ -248,6 +253,8 @@ class StackProcessor(Configurable):
             else:
                 logger.info(f"Not reshaping results, type(results)={type(results)}")
             #    results = [list(item) for item in results]
+        elif self.config.output_type == "dataframe":
+            results = pd.concat(results, ignore_index=True)
         return results
 
 class ChainProcessorConfig(Configuration):
@@ -290,8 +297,7 @@ class ChainProcessor(Configurable[ChainProcessorConfig]):
         return cls(config)
 
     def run(
-        self, stack: np.ndarray, *args, workers: int = -1, verbose: int = 10
-    ) -> np.ndarray:        
+        self, stack: np.ndarray, *args, workers: int = -1, verbose: int = 10, metadata: Optional[dict[str, Any]] = None, **kwargs ) -> np.ndarray:
         """Run the chain processor on an image stack.
 
         Args:
@@ -299,11 +305,12 @@ class ChainProcessor(Configurable[ChainProcessorConfig]):
             *args: Additional arguments to pass to each processor.
             workers: Number of parallel workers (-1 for all cores).
             verbose: Verbosity level for parallel processing.
-
+            metadata: Optional metadata to pass to the processor.
+            **kwargs: Additional keyword arguments to pass to the processor.
         Returns:
             Processed result array or tuple of lists depending on output_type.
         """
         result = stack
         for processor in self.config.processors:
-            result = processor.run(result, *args, workers=workers, verbose=verbose)
+            result = processor.run(result, *args, workers=workers, verbose=verbose, metadata=metadata, **kwargs)
         return result

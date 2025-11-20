@@ -64,4 +64,4 @@ source activate /standard/vol191/siegristlab/software/vistiq-env
 
 # Run vistiq coincidence on the selected file
 export QT_QPA_PLATFORM=offscreen # for napari headless
-vistiq coincidence --input "$input_file" --sigma-low 1.0 --sigma-high 12.0 --threshold 0.1 
+vistiq coincidence -i "$input_file" --sigma-low 1.0 --sigma-high 12.0 --threshold 0.1 --method dice --mode outline --volume-lower 25 --volume-upper 5000 --substack Z:30-40 -l DEBUG

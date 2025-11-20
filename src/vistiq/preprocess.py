@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
-from typing import Optional, Literal
+from typing import Optional, Literal, Any
 from pydantic import Field, field_validator, model_validator
 from scipy.ndimage import uniform_filter1d
 from skimage.filters import gaussian
@@ -69,15 +69,17 @@ class Preprocessor(StackProcessor):
         logger.info(f"Normalized stack with shape {stack.shape}, min:max {stack_min}:{stack_max} -> {np.min(stack)}:{np.max(stack)}")
         return stack.astype(np.float32, copy=False)
 
-    def run(self, stack: np.ndarray, *args, workers: int = -1, verbose: int = 10) -> np.ndarray:
+    def run(self, stack: np.ndarray, *args, workers: int = -1, verbose: int = 10, metadata: Optional[dict[str, Any]] = None, **kwargs) -> np.ndarray:
         """Run the preprocess chain on an image stack.
 
         Args:
             stack: Input image stack.
+            metadata: Optional metadata to pass to the processor.
+            **kwargs: Additional keyword arguments to pass to the processor.
         """
         input_dtype = stack.dtype
         logger.info(f"Running preprocessor {self.__class__.__name__}, on stack of type {input_dtype}, {np.issubdtype(input_dtype, np.integer)}")
-        preprocessed = super().run(stack, *args, workers=workers, verbose=verbose)
+        preprocessed = super().run(stack, *args, workers=workers, verbose=verbose, metadata=metadata, **kwargs)
 
         # normalize
         if self.config.normalize:
@@ -161,11 +163,13 @@ class PreprocessChain(Configurable):
         return cls(config)
 
 
-    def run(self, stack: np.ndarray, *args, workers: int = -1, verbose: int = 10) -> np.ndarray:
+    def run(self, stack: np.ndarray, *args, workers: int = -1, verbose: int = 10, metadata: Optional[dict[str, Any]] = None, **kwargs) -> np.ndarray:
         """Run the preprocess chain on an image stack.
 
         Args:
             stack: Input image stack.
+            metadata: Optional metadata to pass to the processor.
+            **kwargs: Additional keyword arguments to pass to the processor.
         """
         return super().run(stack, *args, workers=workers, verbose=verbose)
 
@@ -195,7 +199,7 @@ class DoG(Preprocessor):
         return cls(config)
 
     def _process_slice(
-        self, slice: np.ndarray
+        self, slice: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs
     ) -> np.ndarray:
         """Compute Difference of Gaussians (DoG) for a single slice.
 
@@ -354,7 +358,7 @@ class Noise2Stack(Preprocessor):
 
         return denoised
 
-    def run(self, stack: np.ndarray) -> np.ndarray:
+    def run(self, stack: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs) -> np.ndarray:
         """Denoise an image stack by averaging temporal neighbors.
 
         This implements a simple, non-learning variant inspired by the Noise2Stack idea:

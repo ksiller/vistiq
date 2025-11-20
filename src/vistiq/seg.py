@@ -1,4 +1,4 @@
-from functools import cached_property
+from functools import cached_property, partial, wraps
 import numpy as np
 from joblib import Parallel, delayed
 from pydantic import (
@@ -335,9 +335,6 @@ class RangeFilter(Configurable):
         Returns:
             True if value is within [min_value, max_value], False otherwise.
         """
-        #print(
-        #    f"self.config={self.config}, value={value}, min_value={self.min_value()}, max_value={self.max_value()}"
-        #)
         return value >= self.min_value() and value <= self.max_value()
 
 
@@ -438,26 +435,63 @@ class RegionFilter(Configurable[RegionFilterConfig]):
                 return filter
         raise ValueError(f"Filter for attribute '{attribute}' not found")
 
+    def get_attribute_names(self) -> List[str]:
+        """Get list of attribute names from all filters.
+        
+        Returns:
+            List of attribute names from all filters in the configuration.
+            Returns empty list if no filters are configured or if filters have no attributes.
+        """
+        if self.config.filters is None or len(self.config.filters) == 0:
+            return []
+        return [
+            filter.config.attribute 
+            for filter in self.config.filters 
+            if filter.config.attribute is not None
+        ]
+
     def run(
-        self, regions: List["RegionProperties"]
-    ) -> Tuple[List["RegionProperties"], List["RegionProperties"]]:
+        self, regions: Union[List["RegionProperties"], pd.DataFrame]
+    ) -> Tuple[Union[List["RegionProperties"], pd.DataFrame], Union[List["RegionProperties"], pd.DataFrame]]:
         """Filter regions based on configured criteria.
         
         Removes regions that don't pass all filter criteria. A region is
         removed if any of its property values fall outside the specified range.
         
         Args:
-            regions: List of region properties to filter.
+            regions: List of region properties or pandas DataFrame to filter.
             
         Returns:
             Tuple of (accepted_regions, removed_regions):
             - accepted_regions: Regions that passed all filters.
             - removed_regions: Regions that failed at least one filter.
+            Returns the same type as input (list or DataFrame).
         """
+        logger.info(f"Running {type(self).__name__} with config: {self.config}")
         if self.config.filters is None or len(self.config.filters) == 0:
             logger.info("RegionFilter: no filters, returning all regions")
-            return regions, []
+            return regions, ([] if isinstance(regions, list) else pd.DataFrame())
+        
+        # Handle DataFrame input
+        if isinstance(regions, pd.DataFrame):
+            removed_indices = []
+            for idx, row in regions.iterrows():
+                for filter in self.config.filters:
+                    if filter.config.attribute not in row.index:
+                        logger.warning(f"Attribute '{filter.config.attribute}' not found in DataFrame columns")
+                        continue
+                    value = row[filter.config.attribute]
+                    if not filter.in_range(value):
+                        removed_indices.append(idx)
+                        break
+            accepted_regions = regions.drop(index=removed_indices)
+            removed_regions = regions.loc[removed_indices] if removed_indices else pd.DataFrame()
+            logger.info(f"RegionFilter: len(accepted_regions)={len(accepted_regions)}, len(removed_regions)={len(removed_regions)}")
+            return accepted_regions, removed_regions
+        
+        # Handle list of RegionProperties input
         removed_regions = []
+        removed_labels = set()  # Use set for O(1) lookup by label
         for region in regions:
             for filter in self.config.filters:
                 value = getattr(region, filter.config.attribute)
@@ -466,8 +500,11 @@ class RegionFilter(Configurable[RegionFilterConfig]):
                     #    f"filter {filter.config.attribute} value={value} not in range for region {region.label}"
                     #)
                     removed_regions.append(region)
+                    removed_labels.add(region.label)
                     break
-        accepted_regions = [region for region in regions if region not in removed_regions]
+        # Compare by label instead of using 'in' to avoid triggering RegionProperties.__eq__
+        # which would compute all properties including ones not requested (like eccentricity)
+        accepted_regions = [region for region in regions if region.label not in removed_labels]
         logger.info(f"RegionFilter: len(accepted_regions)={len(accepted_regions)}, len(removed_regions)={len(removed_regions)}")
         return accepted_regions, removed_regions
 
@@ -585,11 +622,13 @@ class Relabeler(StackProcessor):
 
         return result, label_mappings
 
-    def _process_slice(self, labels: np.ndarray) -> np.ndarray:
+    def _process_slice(self, labels: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs) -> np.ndarray:
         """Process a single slice by assigning unique labels.
         
         Args:
             labels: Labeled array slice.
+            metadata: Optional metadata to pass to the processor.
+            **kwargs: Additional keyword arguments to pass to the processor.
             
         Returns:
             Relabeled array with unique labels.
@@ -600,11 +639,15 @@ class Relabeler(StackProcessor):
     def run(
         self,
         labels: np.ndarray | List[np.ndarray],
+        metadata: Optional[dict[str, Any]] = None,
+        **kwargs
     ) -> np.ndarray:
         """Run the relabeler to assign unique labels.
         
         Args:
             labels: Labeled array or list of labeled arrays to relabel.
+            metadata: Optional metadata to pass to the processor.
+            **kwargs: Additional keyword arguments to pass to the processor.
             
         Returns:
             Relabeled array with unique labels. Same shape as input (stacked if input was a list).
@@ -698,18 +741,34 @@ class LabelRemover(StackProcessor):
             # Empty or None
             return np.array([], dtype=np.int32)
     
-    def _process_slice(self, labels: np.ndarray, label_ids: np.ndarray) -> np.ndarray:
+    def _process_slice(self, labels: np.ndarray, label_ids: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs) -> np.ndarray:
         """Process a single slice by removing specified labels.
         
         Args:
             labels: Label array slice.
             label_ids: Array of label IDs to remove.
+            metadata: Optional metadata to pass to the processor.
+            **kwargs: Additional keyword arguments to pass to the processor.
             
         Returns:
             Processed label array with specified labels set to 0.
         """
-        result = labels.copy()
+        # Ensure labels is a proper array (not scalar) and convert to writable int32
+        labels = np.asarray(labels)
+        if labels.ndim == 0:
+            # Handle scalar case (shouldn't happen, but be safe)
+            return labels.astype(np.int32)
+        
+        # Ensure result is a writable array with compatible dtype for assignment
+        # Convert to int32 to avoid issues with uint32 assignment
+        # Use np.array() with copy=True to ensure we have a proper writable array
+        result = np.array(labels, dtype=np.int32, copy=True)
+        # Ensure result is writable (set write flag explicitly)
+        result.setflags(write=True)
+        
         if len(label_ids) > 0:
+            # Ensure label_ids is a proper array
+            label_ids = np.asarray(label_ids)
             # Create mask for all labels to remove
             mask = np.isin(result, label_ids)
             # Set masked pixels to background (0)
@@ -719,26 +778,30 @@ class LabelRemover(StackProcessor):
     def run(
         self, 
         labels: np.ndarray, 
-        label_ids: Union[List["RegionProperties"], List[int], np.ndarray],
+        region_properties: Union[List["RegionProperties"], List[int], np.ndarray],
         workers: int = -1, 
-        verbose: int = 10
+        verbose: int = 10,
+        metadata: Optional[dict[str, Any]] = None,
+        **kwargs
     ) -> np.ndarray:
         """Remove specified labels from the label array.
         
         Args:
             labels: Input label array.
-            label_ids: Labels to remove. Can be:
+            region_properties: Region properties to remove. Can be:
                 - List of RegionProperties (extracts .label attribute)
                 - List of ints
                 - numpy array of ints
             workers: Number of parallel workers (-1 for all cores).
+            metadata: Optional metadata to pass to the processor.
+            **kwargs: Additional keyword arguments to pass to the processor.
             verbose: Verbosity level for parallel processing.
             
         Returns:
             Processed label array with specified labels set to background (0).
         """
         # Extract label IDs from various input formats
-        label_ids_array = self._extract_label_ids(label_ids)
+        label_ids_array = self._extract_label_ids(region_properties)
         
         if len(label_ids_array) == 0:
             # No labels to remove, return original
@@ -808,7 +871,7 @@ class Labeller(StackProcessor):
     #    regions = regionprops(labels)
     #    return labels, regions
 
-    def _process_slice(self, mask: np.ndarray) -> tuple[np.ndarray, List["RegionProperties"]]:
+    def _process_slice(self, mask: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs) -> tuple[np.ndarray, List["RegionProperties"]]:
         """Process a single slice by labeling connected components.
         
         Labels connected components in the binary mask and optionally filters
@@ -816,6 +879,8 @@ class Labeller(StackProcessor):
         
         Args:
             mask: Binary mask to label.
+            metadata: Optional metadata to pass to the processor.
+            **kwargs: Additional keyword arguments to pass to the processor.
             
         Returns:
             Tuple of (labels, regions):
@@ -837,6 +902,11 @@ class Labeller(StackProcessor):
             logger.info(f"Labeller: self.config.region_filter.config={self.config.region_filter.config}")
             # Store original labels before filtering
             original_labels = labels.copy()
+            # Flatten regions if it's a list of lists (from iterator processing)
+            if isinstance(regions, list) and len(regions) > 0:
+                # Check if first element is a list (nested structure from iterator)
+                if isinstance(regions[0], list):
+                    regions = [region for sublist in regions for region in sublist]
             regions, removed_regions = self.config.region_filter.run(regions)
             labels = np.zeros_like(labels)
             for region in regions:
@@ -845,7 +915,7 @@ class Labeller(StackProcessor):
                 labels[region_mask] = region.label
         return labels, regions
 
-    def run(self, mask: np.ndarray, workers: int = -1, verbose: int = 10) -> tuple[np.ndarray, List["RegionProperties"]]:
+    def run(self, mask: np.ndarray, workers: int = -1, verbose: int = 10, metadata: Optional[dict[str, Any]] = None, **kwargs) -> tuple[np.ndarray, List["RegionProperties"]]:
         """Run the labeller on a binary mask.
         
         Labels connected components in the mask and optionally filters regions.
@@ -898,7 +968,7 @@ class RegionAnalyzer(StackProcessor):
         fake_array=np.ones((2,2))
         labels = sk_label(fake_array)
         regions = regionprops(labels)
-        return [attr for attr in dir(regions[0]) if not attr.startswith("_")]
+        return sorted([attr for attr in dir(regions[0]) if not attr.startswith("_")])
 
     @classmethod
     def extra_properties_funcs(cls) -> Dict[str, Callable]:
@@ -909,9 +979,9 @@ class RegionAnalyzer(StackProcessor):
         """
         return {
             "circularity": cls.circularity,
+            "sphericity": cls.sphericity,
             "aspect_ratio": cls.aspect_ratio,
-            "bbox_width": cls.bbox_width,
-            "bbox_height": cls.bbox_height,
+            "volume": cls.volume,
         }
 
     @staticmethod
@@ -921,7 +991,7 @@ class RegionAnalyzer(StackProcessor):
         Returns:
             Combined list of built-in and custom property names.
         """
-        return RegionAnalyzer.builtin_properties() + list(RegionAnalyzer.extra_properties_funcs().keys())
+        return sorted(RegionAnalyzer.builtin_properties() + list(RegionAnalyzer.extra_properties_funcs().keys()))
 
     def used_extra_properties(self) -> List[str]:
         """Get list of extra properties that are being used.
@@ -929,16 +999,47 @@ class RegionAnalyzer(StackProcessor):
         Returns:
             List of extra property names from config that are custom properties.
         """
-        return [prop for prop in self.config.properties if prop in RegionAnalyzer.extra_properties_funcs().keys()]
+        return sorted([prop for prop in self.config.properties if prop in RegionAnalyzer.extra_properties_funcs().keys()])
 
-    def used_extra_properties_funcs(self) -> List[Callable]:
+    def used_extra_properties_funcs(self, spacing: Optional[Tuple[float, ...]] = None) -> List[Callable]:
         """Get list of extra property functions that are being used.
+        
+        Args:
+            spacing: Optional spacing tuple to pass to extra_properties functions.
         
         Returns:
             List of callable functions for the extra properties being used.
+            Functions are wrapped to include spacing if provided.
         """
         uep = self.used_extra_properties()
-        return [func for k, func in RegionAnalyzer.extra_properties_funcs().items() if k in uep]
+        base_funcs = {k: func for k, func in RegionAnalyzer.extra_properties_funcs().items() if k in uep}
+        
+        # Wrap functions to pass spacing if provided
+        wrapped_funcs = []
+        for prop_name, func in base_funcs.items():
+            if spacing is not None:
+                # Check if function accepts spacing parameter
+                import inspect
+                sig = inspect.signature(func)
+                if 'spacing' in sig.parameters:
+                    # Create a named wrapper function that passes spacing
+                    # scikit-image calls: func(regionmask, intensity_image)
+                    # We need to call: func(regionmask, intensity_image, spacing=spacing)
+                    def make_wrapper(f, prop_n, sp):
+                        @wraps(f)
+                        def wrapper(regionmask, intensity_image=None):
+                            return f(regionmask, intensity_image, spacing=sp)
+                        # Set the function name to match the property name
+                        wrapper.__name__ = prop_n
+                        return wrapper
+                    wrapped_funcs.append(make_wrapper(func, prop_name, spacing))
+                else:
+                    # Function doesn't accept spacing, use as-is
+                    wrapped_funcs.append(func)
+            else:
+                wrapped_funcs.append(func)
+        
+        return wrapped_funcs
 
     def used_builtin_properties(self) -> List[str]:
         """Get list of built-in properties that are being used.
@@ -961,12 +1062,15 @@ class RegionAnalyzer(StackProcessor):
         return cls(config)
 
     @staticmethod
-    def circularity(regionmask, intensity_image=None):
+    def circularity(regionmask, intensity_image=None, spacing=None):
         """Compute circularity: 4π * area / perimeter² (perfect circle = 1.0).
         
+        This function is for 2D regions only. For 3D regions, use sphericity.
+        
         Args:
-            regionmask: Binary mask of the region.
+            regionmask: Binary mask of the region (2D).
             intensity_image: Optional intensity image (not used).
+            spacing: Optional spacing tuple for anisotropic voxels (not used for circularity).
             
         Returns:
             Circularity value (1.0 for perfect circle), or NaN if invalid.
@@ -980,62 +1084,81 @@ class RegionAnalyzer(StackProcessor):
         return float("nan")
 
     @staticmethod
-    def bbox_width(regionmask, intensity_image=None):
-        """Compute bounding box width from region mask.
-
-        Uses numpy operations to find column bounds more efficiently.
+    def sphericity(regionmask, intensity_image=None, spacing=None):
+        """Compute sphericity: π^(1/3) * (6*volume)^(2/3) / surface_area (perfect sphere = 1.0).
+        
+        This function is for 3D regions only. For 2D regions, use circularity.
         
         Args:
-            regionmask: Binary mask of the region.
+            regionmask: Binary mask of the region (3D).
             intensity_image: Optional intensity image (not used).
+            spacing: Optional spacing tuple for anisotropic voxels.
+                    Used to compute surface area accurately.
             
         Returns:
-            Width of the bounding box, or NaN if invalid.
+            Sphericity value (1.0 for perfect sphere), or NaN if invalid.
         """
-        if not np.any(regionmask):
+        volume = np.sum(regionmask)
+        if volume == 0:
             return float("nan")
-        # Find columns that contain any True values
-        cols = np.any(regionmask, axis=0)
-        if not np.any(cols):
-            return float("nan")
-        # bbox format: (min_row, min_col, max_row, max_col)
-        # Width = max_col - min_col + 1
-        col_indices = np.where(cols)[0]
-        return float(col_indices[-1] - col_indices[0] + 1)
-
-    @staticmethod
-    def bbox_height(regionmask, intensity_image=None):
-        """Compute bounding box height from region mask.
-
-        Uses numpy operations to find row bounds more efficiently.
         
-        Args:
-            regionmask: Binary mask of the region.
-            intensity_image: Optional intensity image (not used).
+        # Compute surface area using marching cubes
+        try:
+            # Try different possible import names for marching cubes
+            try:
+                from skimage.measure import marching_cubes
+            except ImportError:
+                try:
+                    from skimage.measure import marching_cubes_lewiner as marching_cubes
+                except ImportError:
+                    # If marching_cubes is not available, return NaN
+                    return float("nan")
             
-        Returns:
-            Height of the bounding box, or NaN if invalid.
-        """
-        if not np.any(regionmask):
+            if spacing is not None and len(spacing) == 3:
+                verts, faces, normals, values = marching_cubes(regionmask, spacing=spacing)
+            else:
+                verts, faces, normals, values = marching_cubes(regionmask)
+            
+            # Calculate surface area from mesh
+            # Surface area is sum of areas of all triangular faces
+            if len(faces) == 0:
+                return float("nan")
+            
+            # Compute area of each triangular face
+            face_areas = []
+            for face in faces:
+                v0, v1, v2 = verts[face]
+                # Area = 0.5 * ||(v1-v0) × (v2-v0)||
+                cross = np.cross(v1 - v0, v2 - v0)
+                area = 0.5 * np.linalg.norm(cross)
+                face_areas.append(area)
+            
+            surface_area = sum(face_areas)
+            
+            if surface_area > 0:
+                # Sphericity = π^(1/3) * (6*volume)^(2/3) / surface_area
+                sphericity = (np.pi**(1/3) * (6 * volume)**(2/3)) / surface_area
+                return float(sphericity)
             return float("nan")
-        # Find rows that contain any True values
-        rows = np.any(regionmask, axis=1)
-        if not np.any(rows):
+        except (ValueError, RuntimeError, ImportError):
+            # marching_cubes may fail for degenerate cases or not be available
             return float("nan")
-        # Height = max_row - min_row + 1
-        row_indices = np.where(rows)[0]
-        return float(row_indices[-1] - row_indices[0] + 1)
-
 
     @staticmethod
-    def aspect_ratio(regionmask, intensity_image=None):
+    def aspect_ratio(regionmask, intensity_image=None, spacing=None):
         """Compute aspect ratio: minor_axis_length / major_axis_length.
         
         Computes aspect ratio from the covariance matrix of region coordinates.
+        Works for both 2D and 3D regions. The aspect ratio is the ratio of the
+        smallest to largest eigenvalue of the covariance matrix.
+        
+        If spacing is provided, coordinates are scaled by spacing to account for
+        anisotropic voxels.
         
         Args:
-            regionmask: Binary mask of the region.
+            regionmask: Binary mask of the region (2D or 3D).
             intensity_image: Optional intensity image (not used).
+            spacing: Optional spacing tuple for anisotropic voxels.
             
         Returns:
             Aspect ratio (minor/major axis), or NaN if invalid.
@@ -1044,31 +1167,70 @@ class RegionAnalyzer(StackProcessor):
         if len(coords[0]) == 0:
             return float("nan")
 
-        coords_array = np.array([coords[0], coords[1]], dtype=np.float64)
+        ndim = regionmask.ndim
+        
+        # Create coordinate array for all dimensions
+        coords_array = np.array([coords[i] for i in range(ndim)], dtype=np.float64)
+        
+        # Scale coordinates by spacing if provided (broadcasting)
+        if spacing is not None and len(spacing) >= ndim:
+            spacing_array = np.array(spacing[:ndim], dtype=np.float64)
+            coords_array = coords_array * spacing_array[:, np.newaxis]
+        
         centroid = np.mean(coords_array, axis=1)
         coords_centered = coords_array - centroid[:, np.newaxis]
 
-        if coords_centered.shape[1] < 2:
+        if coords_centered.shape[1] < ndim:
             return float("nan")
 
         cov = np.cov(coords_centered)
         eigenvalues = np.linalg.eigvals(cov)
-        if len(eigenvalues) < 2 or eigenvalues[0] <= 0:
+        if len(eigenvalues) < ndim or np.any(eigenvalues <= 0):
             return float("nan")
 
         # Sort eigenvalues (largest first)
         eigenvalues = np.sort(eigenvalues)[::-1]
-        if eigenvalues[1] <= 0:
-            return float("nan")
+        # Aspect ratio: smallest / largest eigenvalue
+        return float(np.sqrt(eigenvalues[-1] / eigenvalues[0]))
 
-        return float(np.sqrt(eigenvalues[1] / eigenvalues[0]))
+    @staticmethod
+    def volume(regionmask, intensity_image=None, spacing=None):
+        """Compute volume: sum of all pixels/voxels in the region mask.
+        
+        This is equivalent to regionprops.area, which computes the number of
+        pixels (or voxels for 3D) in the region. For 3D regions, this represents
+        volume rather than area.
+        
+        If spacing is provided, the volume accounts for anisotropic voxel sizes
+        by multiplying the pixel count by the product of spacing values.
+        
+        Args:
+            regionmask: Binary mask of the region.
+            intensity_image: Optional intensity image (not used).
+            spacing: Optional spacing tuple for anisotropic voxels.
+                    If provided, volume = pixel_count * product(spacing).
+            
+        Returns:
+            Volume as a float. If spacing is provided, returns physical volume.
+            Otherwise, returns number of pixels/voxels.
+        """
+        pixel_count = float(np.sum(regionmask))
+        
+        if spacing is not None:
+            # Calculate physical volume accounting for voxel spacing
+            voxel_volume = np.abs(np.prod(spacing))
+            return pixel_count * voxel_volume
+        
+        return pixel_count
 
 
-    def _process_slice(self, labels: np.ndarray) -> List["RegionProperties"] | pd.DataFrame:
+    def _process_slice(self, labels: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs) -> List["RegionProperties"] | pd.DataFrame:
         """Process a single slice to extract region properties.
         
         Args:
             labels: Labeled array slice.
+            metadata: Optional metadata to pass to the processor.
+            **kwargs: Additional keyword arguments to pass to the processor.
             
         Returns:
             Either a list of RegionProperties or a pandas DataFrame, depending
@@ -1077,13 +1239,24 @@ class RegionAnalyzer(StackProcessor):
         Raises:
             ValueError: If output_type is invalid.
         """
+        if metadata is None or metadata.get("scale", None) is None:
+            spacing = None
+        else:
+            spacing = metadata.get("scale", None)
+        if spacing is not None:
+            spacing = spacing[-labels.ndim:]
+        print (f"spacing={spacing}")
+        
+        # Get extra_properties functions with spacing wrapped in
+        extra_props_funcs = self.used_extra_properties_funcs(spacing=spacing)
+        
         if self.config.output_type == "list":
-            results = regionprops(labels, extra_properties=self.used_extra_properties_funcs())
+            results = regionprops(labels, extra_properties=extra_props_funcs, spacing=spacing)
         elif self.config.output_type == "dataframe":
-            results = regionprops_table(labels, properties=self.used_builtin_properties(), extra_properties=self.used_extra_properties_funcs())
+            results = pd.DataFrame(regionprops_table(labels, properties=self.used_builtin_properties(), extra_properties=extra_props_funcs, spacing=spacing)).set_index("label")
         else:
             raise ValueError(f"Invalid output type: {self.config.output_type}. Allowed output types are: list, dataframe")
-        logger.info(f"Identified {len(results)} regions, return as {self.config.output_type}")
+        logger.info(f"Identified {len(results)} regions, return as {self.config.output_type}, results: {results.head()}")
         return results
 
     def _reshape_slice_results(self, results: list[Any], slice_indices: list[tuple[int,...]], input_shape: tuple[int,...]) -> List["RegionProperties"] | pd.DataFrame:
@@ -1099,7 +1272,7 @@ class RegionAnalyzer(StackProcessor):
         """
         return super()._reshape_slice_results(results, slice_indices=slice_indices, input_shape=input_shape)
     
-    def run(self, labels: np.ndarray, workers: int = -1, verbose: int = 10) -> List["RegionProperties"] | pd.DataFrame:
+    def run(self, labels: np.ndarray, workers: int = -1, verbose: int = 10, metadata: Optional[dict[str, Any]] = None, **kwargs) -> List["RegionProperties"] | pd.DataFrame:
         """Run the region analyzer on a labeled array.
         
         Args:
@@ -1110,7 +1283,7 @@ class RegionAnalyzer(StackProcessor):
         Returns:
             Region properties as list or DataFrame, depending on output_type.
         """
-        results = super().run(labels, workers=workers, verbose=verbose)
+        results = super().run(labels, workers=workers, verbose=verbose, metadata=metadata, **kwargs)
         return results
 
 class RegionAnalyzerConfig(StackProcessorConfig):
@@ -1145,6 +1318,43 @@ class RegionAnalyzerConfig(StackProcessorConfig):
             v = ["label"] + v
         return v
 
+    @model_validator(mode="after")
+    def validate_properties_iterator(self) -> "RegionAnalyzerConfig":
+        """Validate properties based on iterator configuration.
+        
+        Ensures mutually exclusive properties are handled correctly:
+        - "area" and "volume": If iterator_config.slice_def has length < 3: use "area", otherwise use "volume"
+        - "circularity" and "sphericity": If iterator_config.slice_def has length < 3: use "circularity", otherwise use "sphericity"
+        
+        Returns:
+            Validated configuration.
+        """
+        if self.properties is None or len(self.properties) == 0:
+            self.properties = RegionAnalyzer.default_properties
+        
+        # Check if both "area" and "volume" are present
+        has_area = "area" in self.properties
+        has_volume = "volume" in self.properties
+        
+        slice_def_len = len(self.iterator_config.slice_def)
+        
+        # Handle area/volume mutual exclusivity
+        if has_area and slice_def_len >= 3:
+            self.properties = [p for p in self.properties if p != "area"] + ["volume"]
+        if has_volume and slice_def_len < 3:
+            self.properties = [p for p in self.properties if p != "volume"] + ["area"]
+        
+        # Handle circularity/sphericity mutual exclusivity
+        has_circularity = "circularity" in self.properties
+        has_sphericity = "sphericity" in self.properties
+        
+        if has_circularity and slice_def_len >= 3:
+            self.properties = [p for p in self.properties if p != "circularity"] + ["sphericity"]
+        if has_sphericity and slice_def_len < 3:
+            self.properties = [p for p in self.properties if p != "sphericity"] + ["circularity"]
+        
+        return self
+
 class Thresholder(StackProcessor):
     """Base class for thresholding operations.
     
@@ -1178,11 +1388,13 @@ class RangeThreshold(Thresholder):
         """
         super().__init__(config)
 
-    def _process_slice(self, img: np.ndarray) -> np.ndarray:
+    def _process_slice(self, img: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs) -> np.ndarray:
         """Apply range thresholding to a single slice.
         
         Args:
             img: Input image slice.
+            metadata: Optional metadata to pass to the processor.
+            **kwargs: Additional keyword arguments to pass to the processor.
             
         Returns:
             Binary mask where pixels within the threshold range are True.
@@ -1209,11 +1421,13 @@ class LocalThreshold(Thresholder):
         """
         super().__init__(config)
 
-    def _process_slice(self, img: np.ndarray) -> np.ndarray:
+    def _process_slice(self, img: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs) -> np.ndarray:
         """Apply local adaptive thresholding to a single slice.
         
         Args:
             img: Input image slice.
+            metadata: Optional metadata to pass to the processor.
+            **kwargs: Additional keyword arguments to pass to the processor.
             
         Returns:
             Binary mask from local thresholding.
@@ -1243,11 +1457,13 @@ class OtsuThreshold(Thresholder):
         """
         super().__init__(config)
 
-    def _process_slice(self, img: np.ndarray) -> np.ndarray:
+    def _process_slice(self, img: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs) -> np.ndarray:
         """Apply Otsu's thresholding to a single slice.
         
         Args:
             img: Input image slice.
+            metadata: Optional metadata to pass to the processor.
+            **kwargs: Additional keyword arguments to pass to the processor.
             
         Returns:
             Binary mask from Otsu thresholding.
@@ -1283,11 +1499,13 @@ class BinaryProcessor(Configurable[BinaryProcessorConfig]):
         """
         return cls(config)
 
-    def run(self, mask: np.ndarray) -> np.ndarray:
+    def run(self, mask: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs) -> np.ndarray:
         """Run the binary processor on a mask.
         
         Args:
             mask: Binary mask to process.
+            metadata: Optional metadata to pass to the processor.
+            **kwargs: Additional keyword arguments to pass to the processor.
             
         Returns:
             Processed binary mask.
@@ -1297,11 +1515,13 @@ class BinaryProcessor(Configurable[BinaryProcessorConfig]):
 
 
 
-    def _process_slice(self, mask: np.ndarray) -> np.ndarray:
+    def _process_slice(self, mask: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs) -> np.ndarray:
         """Process a single slice of binary mask.
         
         Args:
             mask: Binary mask slice to process.
+            metadata: Optional metadata to pass to the processor.
+            **kwargs: Additional keyword arguments to pass to the processor.
             
         Returns:
             Processed binary mask.
@@ -1369,22 +1589,39 @@ class Segmenter(Workflow):
             config: Segmenter configuration.
         """
         super().__init__(config)
-        self.config.do_regions = self.config.do_regions and (self.config.region_analyzer is not None or self.config.region_filter is not None)
+        self.config.do_regions = self.config.do_regions or (self.config.region_analyzer is not None or self.config.region_filter is not None)
         self.config.do_labels = self.config.do_regions or (self.config.do_labels and self.config.labeller is not None)
         if self.config.do_labels and self.config.labeller is None:
             logger.info("Labeller not provided, using default Labeller with connectivity=1 and region_filter=None")
             self.config.labeller = Labeller(LabellerConfig(connectivity=1, region_filter=None, output_type="list"))
         if self.config.do_regions and self.config.region_analyzer is None:
-            logger.info(f"RegionAnalyzer not provided, using default RegionAnalyzer with properties: {RegionAnalyzer.default_properties}")
             iterator_config = self.config.labeller.config.iterator_config
-            properties = self.config.region_analyzer.config.properties if self.config.region_analyzer is not None else RegionAnalyzer.default_properties
+            # Set properties based on region_filter if present, otherwise use defaults
+            if self.config.region_filter is not None and self.config.region_filter.config.filters is not None:
+                # Extract filter attributes to ensure RegionAnalyzer computes them
+                filter_attributes = [
+                    filter.config.attribute 
+                    for filter in self.config.region_filter.config.filters 
+                    if filter.config.attribute is not None
+                ]
+                # Combine default properties with filter attributes (avoid duplicates)
+                properties = list(RegionAnalyzer.default_properties)
+                for attr in filter_attributes:
+                    if attr not in properties:
+                        properties.append(attr)
+            else:
+                properties = RegionAnalyzer.default_properties
+            logger.info(f"RegionAnalyzer not provided, using default RegionAnalyzer with properties: {properties}")
             self.config.region_analyzer = RegionAnalyzer(RegionAnalyzerConfig(iterator_config=iterator_config, output_type="list", properties=properties))
+        logger.info(f"Segmenter config: {self.config}")
     
     def run(
         self,
         img: np.ndarray,
         include_mask: Optional[np.ndarray] = None,
         exclude_mask: Optional[np.ndarray] = None,
+        metadata: Optional[dict[str, Any]] = None,
+        **kwargs
     ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray, List["RegionProperties"]]]:
         """Run the segment step.
 
@@ -1417,6 +1654,11 @@ class Segmenter(Workflow):
             labels = relabeler.run(labels)
             if self.config.do_regions:
                 regions = self.config.region_analyzer.run(labels)
+                # Flatten regions if it's a list of lists (from iterator processing)
+                if isinstance(regions, list) and len(regions) > 0:
+                    # Check if first element is a list (nested structure from iterator)
+                    if isinstance(regions[0], list):
+                        regions = [region for sublist in regions for region in sublist]
                 if self.config.region_filter is not None:
                     regions, removed_regions = self.config.region_filter.run(regions)
                     # remove the areas in labels corresponding to the removed regions
@@ -1482,6 +1724,8 @@ class IterativeSegmenter(Workflow):
     def run(
         self,
         img: np.ndarray,
+        metadata: Optional[dict[str, Any]] = None,
+        **kwargs
     ) -> Union[np.ndarray, Tuple[np.ndarray, List["RegionProperties"]]]:
         """Run the iterative segmentation workflow.
 
@@ -1576,7 +1820,7 @@ class SeriesSegmenter(Workflow):
         super().__init__(config)
 
     def run(
-        self, img: np.ndarray
+        self, img: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs
     ) -> Union[np.ndarray, Tuple[np.ndarray, List["RegionProperties"]]]:
         """Run the series of segmenters on an image.
         
@@ -1596,17 +1840,16 @@ class MicroSAMSegmenterConfig(SegmenterConfig):
     Attributes:
         model: MicroSAM model to use.
     """
-    #from segment_anything.predictor import SamPredictor
-    #from micro_sam.instance_segmentation import AMGBase
-    #from micro_sam.instance_segmentation import InstanceSegmentationWithDecoder
     model_type: str = "vit_l_lm"
+    thresholder: Optional[Thresholder] = None
+    labeller: Optional[Labeller] = None
     predictor: Optional[Any] = None
     segmenter: Optional[Any] = None
     checkpoint: Optional[str] = None
     embedding_path: Optional[str] = None
     device: Optional[str] = None
 
-class MicroSAMSegmenter(Workflow):
+class MicroSAMSegmenter(Segmenter):
     """Segmenter that uses MicroSAM to segment images.
     
     Args:
@@ -1620,14 +1863,16 @@ class MicroSAMSegmenter(Workflow):
         if self.config.segmenter is None:
             self.config.segmenter = segmenter
         self.config.do_labels = True
-        self.config.do_regions = self.config.region_analyzer is not None
+        #self.config.do_regions = self.config.region_analyzer is not None
 
 
-    def run(self, img: np.ndarray) -> np.ndarray:
+    def run(self, img: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs) -> np.ndarray:
         """Run the MicroSAM segmenter on an image.
         
         Args:
             img: Input image to segment.
+            metadata: Optional metadata to pass to the processor.
+            **kwargs: Additional keyword arguments to pass to the processor.
             
         Returns:
             Regions: List of regions.
@@ -1640,10 +1885,21 @@ class MicroSAMSegmenter(Workflow):
             input_path=img,   
             embedding_path=self.config.embedding_path,
         )
-        masks = np.zeros_like(labels).astype(np.bool)
-        masks[labels > 0] = True
+        binary_mask = np.zeros_like(labels).astype(np.bool)
+        binary_mask[labels > 0] = True
         if self.config.do_regions:
-            regions = self.config.region_analyzer.run(labels)
+            regions = self.config.region_analyzer.run(labels, metadata=metadata)
+            # Flatten regions if it's a list of lists (from iterator processing)
+            if isinstance(regions, list) and len(regions) > 0:
+                # Check if first element is a list (nested structure from iterator)
+                if isinstance(regions[0], list):
+                    regions = [region for sublist in regions for region in sublist]
+            if self.config.region_filter is not None:
+                regions, removed_regions = self.config.region_filter.run(regions)
+                # remove the areas in labels corresponding to the removed regions
+                label_remover = LabelRemover(LabelRemoverConfig(iterator_config=ArrayIteratorConfig(slice_def=()), output_type="stack", squeeze=False))
+                labels = label_remover.run(labels, removed_regions)
+            return binary_mask, labels, regions
         else:
-            regions = []
-        return masks, labels, regions
+            logger.info("No regions to compute, returning binary mask and labels")
+            return binary_mask, labels

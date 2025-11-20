@@ -4,7 +4,8 @@ import os
 import logging
 import numpy as np
 from pydantic import BaseModel
-from typing import Union, Optional, List
+import pandas as pd
+from typing import Union, Optional, List, NamedTuple
 
 import cv2
 import tifffile
@@ -16,16 +17,39 @@ logger = logging.getLogger(__name__)
 
 
 class Configuration(BaseModel):
+    """Base configuration class for utility components.
+    
+    Attributes:
+        classname: Optional class name identifier.
+    """
     classname: str = None
 
 
 class ArrayIteratorConfig(Configuration):
+    """Configuration for array iteration over 2D slices.
+    
+    Specifies which axes to keep (not iterate over) when processing arrays.
+    Default keeps the last 2 axes (typically spatial dimensions Y, X).
+    
+    Attributes:
+        slice_def: Tuple of axis indices to keep. Negative indices are supported.
+                   Default: (-2, -1) keeps last 2 axes, iterates over all others.
+    """
     slice_def: tuple[int, ...] = (
         -2,
         -1,
     )
 
 class VolumeStackIteratorConfig(Configuration):
+    """Configuration for array iteration over 3D volumes.
+    
+    Specifies which axes to keep (not iterate over) when processing 3D volumes.
+    Default keeps the last 3 axes (typically spatial dimensions Z, Y, X).
+    
+    Attributes:
+        slice_def: Tuple of axis indices to keep. Negative indices are supported.
+                   Default: (-3, -2, -1) keeps last 3 axes, iterates over all others.
+    """
     slice_def: tuple[int, ...] = (
         -3,
         -2,
@@ -57,6 +81,13 @@ class ArrayIterator:
         self.shape = arr.shape
         self.config = config
         self.ndim = len(arr.shape)
+
+        # Special case: empty slice_def means process entire array as single slice
+        if len(config.slice_def) == 0:
+            # Create a single index tuple with all slices (entire array)
+            self.indices = [tuple([slice(None)] * self.ndim)]
+            self.index = 0
+            return
 
         # Normalize slice_def: convert negative indices to positive
         normalized_slice_def = tuple(
@@ -106,8 +137,21 @@ class ArrayIterator:
 
 
 def create_unique_folder(base_path=".", prefix="", suffix="", exist_ok=True):
-    """
-    Creates a unique folder within the specified base_path using a UUID.
+    """Create a unique folder within the specified base path using a UUID.
+    
+    Generates a unique folder name by combining a UUID with optional prefix
+    and suffix, ensuring no naming conflicts.
+    
+    Args:
+        base_path: Base directory path where the folder will be created.
+                  Defaults to current directory.
+        prefix: Optional prefix to prepend to the UUID in the folder name.
+        suffix: Optional suffix to append to the UUID in the folder name.
+        exist_ok: If True, does not raise error if folder already exists.
+                  Defaults to True.
+    
+    Returns:
+        str: Full path to the created unique folder.
     """
     unique_id = (
         uuid.uuid4().hex
@@ -118,11 +162,53 @@ def create_unique_folder(base_path=".", prefix="", suffix="", exist_ok=True):
     os.makedirs(full_path, exist_ok=exist_ok)
     return full_path
 
+
+
+def masks_to_labels(masks: list[np.ndarray]) -> np.ndarray:
+    """Convert a list of masks to a labeled array.
+    
+    Each mask in the input list is assigned a unique label value. The output
+    array has the same shape as the input masks, with each pixel labeled
+    according to which mask(s) it belongs to.
+    
+    Args:
+        masks: List of binary masks (boolean or integer arrays). All masks
+               must have the same shape.
+    
+    Returns:
+        np.ndarray: Labeled array of integer type. Each mask gets a unique
+                   label starting from 1. Pixels that belong to multiple
+                   masks will have the sum of their label values.
+    """
+    labels = np.zeros_like(masks[0]).astype(int)
+    for i, mask in enumerate(masks, start=1):
+        labels = labels + mask.astype(bool).astype(int)*i
+    return labels
+
+def labels_to_mask(labels: np.ndarray) -> list[np.ndarray]:
+    """Convert a labeled array to a list of binary masks.
+    
+    Creates a separate binary mask for each unique label value in the input
+    array. Background (label 0) is included as the first mask.
+    
+    Args:
+        labels: Labeled array with integer label values.
+    
+    Returns:
+        list[np.ndarray]: List of boolean masks, one for each unique label
+                         value in the input array. Masks are in the order
+                         of unique label values found.
+    """
+    masks = []
+    for l_value in np.unique(labels):
+        masks.append((labels == l_value).astype(bool))
+    return masks
+
 def load_image(
     path: Union[str, os.PathLike],
     scene_index: Optional[int] = None,
     reader: Optional[type] = None,
-    options: Optional[dict[str, slice]] = None,
+    substack: Optional[dict[str, slice]] = None,
     squeeze: bool = False,
 ) -> np.ndarray:
     """Load an image file using bioio, optionally selecting a specific scene and applying dimension slicing.
@@ -131,8 +217,10 @@ def load_image(
         path: Path to the image file.
         scene_index: Optional scene index to load. If None, loads the first/default scene.
         reader: Optional reader class to use. If None, bioio will auto-detect the appropriate reader.
-        options: Optional dictionary of dimension slices. Keys should be dimension names ('T', 'Z', 'C', 'Y', 'X')
+        substack: Optional dictionary of dimension slices. Keys should be dimension names ('T', 'Z', 'C', 'Y', 'X')
                  and values should be slice objects. For example: {'T': slice(0, 10), 'Z': slice(5, 15), 'C': slice(0, 2)}.
+                 Special case: If None is used as a key, the slice will be applied to the first axis of the image
+                 (determined from image metadata). This is used internally for legacy substack format.
         squeeze: If True, remove dimensions of size 1 from the array. Default is False.
         
     Returns:
@@ -158,7 +246,7 @@ def load_image(
         logger.info("Using specified reader: %s", reader.__name__)
     else:
         reader_instance = BioImage(str(file_path))
-    
+    logger.debug(f"reader_instance.metadata: {reader_instance.metadata}")
     dim_str = ("".join([i[0] for i in reader_instance.dims.items()]))
 
     # If scene_index is provided, validate it
@@ -179,14 +267,41 @@ def load_image(
         reader_instance.set_scene(scene_index)
         logger.debug (f"set scene to {scene_index}")
     
-    # Load the image data, passing options directly to get_image_data
-    if options is not None and len(options) > 0:
+    # Load the image data, passing substack directly to get_image_data
+    if substack is not None and len(substack) > 0:
         reader_instance.set_scene(scene_index)
-        logger.debug (f"dim_str: {dim_str}, options: {options}")
-        scene_data = reader_instance.get_image_data(dim_str, **options).squeeze()
+        
+        # Handle legacy format: if None is a key, apply to first dimension
+        if None in substack:
+            # Get the first dimension name from the image metadata
+            first_dim = reader_instance.dims.order[0].upper() if reader_instance.dims.order else "T"
+            # Move the slice from None key to the actual first dimension
+            first_slice = substack.pop(None)
+            substack[first_dim] = first_slice
+            logger.debug(f"Legacy substack format: applied to first dimension '{first_dim}'")
+        
+        logger.debug(f"dim_str: {dim_str}, substack: {substack}")
+        scene_data = reader_instance.get_image_data(dim_str, **substack).squeeze()
     else:
         scene_data = reader_instance.get_image_data()
-    
+
+    metadata = {}
+    metadata["axes"] = [
+        label.upper() for label in reader_instance.dims.order
+    ]  # "t", "c", "y", "x"]
+    metadata["channel_names"] = reader_instance.channel_names
+    metadata["channel_axis"] = metadata["axes"].index("C")
+    metadata["shape"] = reader_instance.shape
+    metadata["dims"] = reader_instance.dims
+    metadata["pixel_unit"] = "um"
+    metadata["xy_pixel_res"] = (
+        reader_instance.physical_pixel_sizes.X + reader_instance.physical_pixel_sizes.Y
+    ) / 2
+    metadata["scale"] = reader_instance.scale
+    UsedScale = NamedTuple("UsedScale", [(s,type(v)) for s,v in reader_instance.scale._asdict().items() if v is not None])
+    metadata["used_scale"] = UsedScale(**{s:v for s,v in reader_instance.scale._asdict().items() if v is not None})
+    metadata["xy_pixel_res_description"] = f"{1/metadata['xy_pixel_res']} pixels per {metadata['pixel_unit']}"
+    metadata["physical_pixel_sizes"] = reader_instance.physical_pixel_sizes    
     # Validate the data
     if scene_data is None:
         raise ValueError("Image data is None")
@@ -206,7 +321,7 @@ def load_image(
         scene_data.dtype,
     )
     
-    return scene_data, reader_instance.physical_pixel_sizes
+    return scene_data, metadata
 
 
 def get_scenes(
@@ -249,7 +364,7 @@ def get_scenes(
     scenes = reader_instance.scenes
     
     if scenes is None:
-        logger.warning("File has no scenes (scenes is None)")
+        #logger.warning("File has no scenes (scenes is None)")
         return []
     
     try:

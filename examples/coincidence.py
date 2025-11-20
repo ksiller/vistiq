@@ -8,7 +8,10 @@ import pandas as pd
 import os
 import itertools
 import argparse
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def parse_arguments():
@@ -191,7 +194,7 @@ def coincidence(input_path, sigma_low, sigma_high, normalize, area_lower, area_u
         # 3. CoincidenceDetector
         # Create pairwise combinations of labels
         label_index_combinations = list(itertools.combinations(range(len(labels_ch)), 2))
-        print(label_index_combinations)
+        logger.info(f"Label index combinations: {label_index_combinations}")
         feature_dfs = {}
         for idx_combination in label_index_combinations:
             coincidence = CoincidenceDetector(coincidence_config)
