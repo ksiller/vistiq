@@ -1350,7 +1350,8 @@ def run_coincidence(config: CoincidenceConfig) -> None:
         channel_names = metadata["channel_names"]
         # img = img[:, 30:40, ]
 
-        output_dir = output_base / f"{input_path_obj.stem}-{sc}-dog-{config.sigma_low}-{config.sigma_high}-threshold-{config.threshold}"
+        output_dir = output_base / f"{input_path_obj.stem}-{sc}-{img.shape}-dog-{config.sigma_low}-{config.sigma_high}-threshold-{config.threshold}"
+        output_dir = Path(str(output_dir).replace(" ", ""))
         os.makedirs(output_dir, exist_ok=True)
         logger.info(f"Output directory: {output_dir}")
     
