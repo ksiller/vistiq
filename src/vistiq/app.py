@@ -1375,6 +1375,7 @@ def run_coincidence(config: CoincidenceConfig) -> None:
             # need to set up new microsam config for each channel to deal with different embeddings
             microsam_config = MicroSAMSegmenterConfig(
                 model_type=config.model_type,
+                embedding_path=str(output_dir / f"embeddings_{ch_name}"),
                 region_analyzer=region_analyzer,
                 region_filter=region_filter,
                 do_labels=True,
