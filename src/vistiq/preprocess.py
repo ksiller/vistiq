@@ -495,23 +495,7 @@ class Resize(Preprocessor):
             Resized slice.
         """
         original_shape = slice.shape
-        target_shape = list(original_shape)
-        
-        # Determine target shape
-        if self.config.width is not None and self.config.height is not None:
-            # Both specified: use both
-            target_shape[-2] = self.config.height  # Y dimension
-            target_shape[-1] = self.config.width   # X dimension
-        elif self.config.width is not None:
-            # Only width specified: maintain aspect ratio
-            aspect_ratio = original_shape[-1] / original_shape[-2]
-            target_shape[-1] = self.config.width
-            target_shape[-2] = int(self.config.width / aspect_ratio)
-        elif self.config.height is not None:
-            # Only height specified: maintain aspect ratio
-            aspect_ratio = original_shape[-1] / original_shape[-2]
-            target_shape[-2] = self.config.height
-            target_shape[-1] = int(self.config.height * aspect_ratio)
+        target_shape = self.config.output_shape[-len(original_shape):] #or list(original_shape)
         
         # Resize the slice
         resized = resize(
@@ -528,3 +512,39 @@ class Resize(Preprocessor):
         
         logger.debug(f"Resized slice from {original_shape} to {resized.shape}")
         return resized
+
+    def run(self, stack: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs) -> np.ndarray:
+        """Resize an image stack.
+        
+        Args:
+            stack: Input stack.
+            metadata: Optional metadata to pass to the processor.
+            **kwargs: Additional keyword arguments to pass to the processor.
+        """
+        # Determine target shape
+        original_shape = stack.shape
+        target_shape = list(original_shape)
+        if self.config.width is not None and self.config.height is not None:
+            # Both specified: use both
+            target_shape[-2] = self.config.height  # Y dimension
+            target_shape[-1] = self.config.width   # X dimension
+        elif self.config.width is not None:
+            # Only width specified: maintain aspect ratio
+            aspect_ratio = original_shape[-1] / original_shape[-2]
+            target_shape[-1] = self.config.width
+            target_shape[-2] = int(self.config.width / aspect_ratio)
+        elif self.config.height is not None:
+            # Only height specified: maintain aspect ratio
+            aspect_ratio = original_shape[-1] / original_shape[-2]
+            target_shape[-2] = self.config.height
+            target_shape[-1] = int(self.config.height * aspect_ratio)
+        
+        # Update config.output_shape using model_copy to ensure Pydantic validation
+        # This allows _reshape_slice_results to use the correct output dimensions
+        if hasattr(self.config, 'model_copy'):
+            self.config = self.config.model_copy(update={"output_shape": tuple(target_shape)})
+        else:
+            # Fallback for older Pydantic versions
+            self.config.output_shape = tuple(target_shape)
+        logger.info(f"RESIZING stack from {original_shape} to {target_shape}")
+        return super().run(stack, metadata=metadata, **kwargs)

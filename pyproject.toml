@@ -11,6 +11,7 @@ dependencies = [
     "torchvision",
     "trackastra<0.4",
     "tifffile",
+    "typer",
     "prefect>=3.0.0",
     "bioio>=3.0.0",
     "bioio-ome-tiff>=1.4.0",
@@ -26,12 +27,17 @@ classifiers = [
 
 [project.optional-dependencies]
 napari = ["vistiq-napari"]
+test = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-mock>=3.10.0",
+]
 
 [project.scripts]
-vistiq = "vistiq.app:main"
+vistiq = "vistiq.cli:main"
 
 [project.gui-scripts]
-vistiq = "vistiq.app:main"
+vistiq = "vistiq.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/ksiller/vistiq"
@@ -83,13 +89,6 @@ extend-exclude = '''
   | dist
 )/
 '''
-
-[project.optional-dependencies]
-test = [
-    "pytest>=7.0.0",
-    "pytest-cov>=4.0.0",
-    "pytest-mock>=3.10.0",
-]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

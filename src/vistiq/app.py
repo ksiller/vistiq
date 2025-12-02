@@ -17,6 +17,7 @@ except ImportError:
 from .core import ArrayIteratorConfig, cli_config
 from .io import DataLoaderConfig, FileList, ImageLoader, ImageLoaderConfig
 from .preprocess import DoG, DoGConfig, PreprocessorConfig
+from .cli import CLIAppConfig, CLISubcommandConfig, CLIPreprocessorConfig, parse_substack, run_preprocess
 from .seg import (
     MicroSAMSegmenter, MicroSAMSegmenterConfig, 
     RegionFilter, RegionFilterConfig, 
@@ -120,46 +121,6 @@ def configure_logger(level: str = "INFO", force: bool = False) -> logging.Logger
     return logger
 
 
-def parse_substack(substack: Optional[str]) -> tuple[Optional[int], Optional[int]]:
-    """Parse substack string into start/end frame indices (legacy format).
-
-    Args:
-        substack: Substack specification string like '10' or '2-40' (1-based, inclusive).
-
-    Returns:
-        Tuple of (start_frame, end_frame) as zero-based indices, or (None, None) if not specified.
-
-    Raises:
-        ValueError: If substack string is invalid.
-    """
-    if not substack:
-        return None, None
-
-    fs = str(substack).strip()
-    if "-" in fs:
-        a, b = fs.split("-", 1)
-        if not a.isdigit() or not b.isdigit():
-            raise ValueError(
-                "--substack must be positive integers like '10' or '2-40'"
-            )
-        a_i = int(a)
-        b_i = int(b)
-        if a_i < 1 or b_i < 1:
-            raise ValueError("--substack indices are 1-based and must be >= 1")
-        if b_i < a_i:
-            raise ValueError("--substack end must be >= start")
-        # Convert to zero-based inclusive indices
-        return a_i - 1, b_i - 1
-    else:
-        if not fs.isdigit():
-            raise ValueError("--substack must be a positive integer or a range 'A-B'")
-        n = int(fs)
-        if n < 1:
-            raise ValueError("--substack index is 1-based and must be >= 1")
-        start_frame = n - 1
-        return start_frame, start_frame
-
-
 def parse_dimension_range(range_str: str) -> tuple[int, int]:
     """Parse a single dimension range like '4-10' or '5' into start/end indices.
     
@@ -253,112 +214,6 @@ def substack_to_slices(substack: Optional[str]) -> Optional[dict[str, slice]]:
         # end is inclusive, so we need end+1 for slice
         # Use None as key to indicate first dimension
         return {None: slice(start, end + 1)}
-
-class CLIAppConfig(BaseModel):
-    """Base configuration for all vistiq commands.
-    
-    Provides common configuration options shared across all subcommands,
-    including input/output paths, logging, and frame selection.
-    
-    Attributes:
-        loglevel: Logging level for the application.
-        input_path: Path to input file or directory.
-        output_path: Path to output file or directory.
-        grayscale: Whether to convert loaded images/videos to grayscale.
-        substack: Substack specification string. Supports two formats:
-                 - Legacy: '10' or '2-40' (applied to first axis of image, 1-based, inclusive)
-                 - New: 'T:4-10;Z:2-20' (multiple dimensions with explicit names, semicolon-separated)
-    """
-
-    loglevel: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
-        default="INFO", description="Logging level"
-    )
-    device: Literal["cuda", "mps", "cpu", "auto"] = Field(
-        default="auto", description="Device to use for processing"
-    )
-    processes: Optional[int] = Field(
-        default=1, description="Number of processes to use for processing"
-    )
-
-@cli_config(exclude=["subcommand", "components"])
-class CLISubcommandConfig(BaseModel):
-    """Base configuration for all vistiq subcommands.
-    
-    Provides common configuration options shared across all subcommands,
-    including input/output paths, logging, and frame selection.
-    """
-    subcommand: str = Field(
-        description="Subcommand to run"
-    )
-    input_config: DataLoaderConfig = Field(
-        description="Input file or directory path"
-    )
-    output_path: Optional[Path] = Field(
-        default=None, description="Output file or directory path"
-    )
-    #substack: Optional[str] = Field(
-    #    default=None, description="Substack to process. Legacy: '10' or '2-40' (first axis). New: 'T:4-10,Z:2-20' (multiple dimensions)"
-    #)
-    components: list[PreprocessorConfig] = Field(
-        default=None, description="Configs for chain of preprocessing components to run"
-    )
-
-    @field_validator("components")
-    @classmethod
-    def validate_components(cls, v: Optional[list[PreprocessorConfig]]) -> Optional[list[PreprocessorConfig]]:
-        """Validate that components are valid.
-        
-        Args:
-            v: Components to validate.
-        """
-        return v
-
-    @property
-    def start_frame(self) -> Optional[int]:
-        """Get start frame index (0-based).
-        
-        Returns:
-            Start frame index (0-based), or None if not specified.
-        """
-        start, _ = parse_substack(self.substack)
-        return start
-
-    @property
-    def end_frame(self) -> Optional[int]:
-        """Get end frame index (0-based, inclusive).
-        
-        Returns:
-            End frame index (0-based, inclusive), or None if not specified.
-        """
-        _, end = parse_substack(self.substack)
-        return end
-
-
-class CLIPreprocessorConfig(CLISubcommandConfig):
-    """Configuration for the preprocess subcommand.
-    
-    Defines parameters for preprocessing images including denoising, resizing, and other operations.
-    
-    Attributes:
-        components: List of preprocessing component configurations.
-    """
-    subcommand: str = Field(default="preprocess", description="Subcommand to run")
-    input_config: ImageLoaderConfig = Field(
-        default=None, description="Configuration for input data loading"
-    )
-    components: list[PreprocessorConfig] = Field(
-        default=None, description="Configs for chain of preprocessing components to run"
-    )
-
-    @field_validator("components")
-    @classmethod
-    def validate_components(cls, v: Optional[list[PreprocessorConfig]]) -> Optional[list[PreprocessorConfig]]:
-        """Validate that components are valid.
-        
-        Args:
-            v: Components to validate.
-        """
-        return v
 
 class CLISegmentConfig(CLISubcommandConfig):
     """Configuration for the segment subcommand.
@@ -1682,85 +1537,6 @@ def run_analyze(config: CLIAnalyzeConfig) -> None:
     logger.info("Would analyze with stats=%s, coords=%s", config.include_stats, config.include_coords)
 
 
-def run_preprocess(config: PreprocessorConfig, args: Optional[argparse.Namespace] = None) -> None:
-    """Run the preprocess command.
-
-    Args:
-        config: Preprocess configuration.
-        args: Optional parsed command-line arguments (for component-based processing).
-    """
-    logger.info(f"Running preprocess command with config: {config}")
-    logger.info(f"Opening: {config.input_path}")
-    
-    # Check if components are specified
-    components = getattr(args, "components", []) if args else []
-    
-    # Auto-register available components
-    from .preprocess import Preprocessor
-    auto_register_configurables_by_base_class(Preprocessor)
-    
-    # Build workflow builder
-    builder = WorkflowBuilder()
-    
-    # Build each component
-    built_components = []
-    for i, component_name in enumerate(components):
-        try:
-            prefix = f"component{i}." if len(components) > 1 else ""
-            component = builder.build_component(component_name, args, prefix=prefix)
-            built_components.append(component)
-            logger.info(f"Built component {i+1}/{len(components)}: {component_name}")
-        except Exception as e:
-            logger.error(f"Failed to build component '{component_name}': {e}")
-            raise
-    
-    # Get absolute path of input and strip extension for output directory
-    input_path_obj = Path(config.input_path).resolve()
-    input_path_str = str(config.input_path)
-    
-    # Determine output directory (defaults to current directory if not specified)
-    output_base = Path(config.output_path or Path.cwd()).resolve()
-    
-    scenes = get_scenes(input_path_str)
-    for idx, sc in enumerate(scenes):
-        logger.info(f"Processing scene: {sc}")
-        # Load image with substack slicing if specified
-        substack_slices = substack_to_slices(config.substack)
-        img, metadata = load_image(input_path_str, scene_index=idx, substack=substack_slices, squeeze=True, rename_channel=config.rename_channel)
-        channel_names = metadata["channel_names"]
-        
-        ishape = str(img.shape).replace(" ", "")
-        component_names = "-".join(components)
-        output_dir = output_base / input_path_obj.stem / f"{sc}-{ishape}-{component_names}"
-        os.makedirs(output_dir, exist_ok=True)
-        logger.info(f"Output directory: {output_dir}")
-    
-        img_ch = np.unstack(img, axis=0)
-        logger.info(f"Image shape: {img.shape}, channel names: {channel_names}, metadata: {metadata}")
-        for im in img_ch:
-            logger.debug(f"Channel shape: {im.shape}")
-
-        preprocessed_ch = []
-        output_paths = []
-        for ch_name, im in zip(channel_names, img_ch):
-            logger.info(f"{''.join(metadata["used_scale"]._fields)}")
-            # Run components in sequence
-            result = im
-            for i, component in enumerate(built_components):
-                logger.info(f"Running component {i+1}/{len(built_components)}: {component.name()} on channel {ch_name}")
-                result = component.run(result, workers=config.processes)
-            
-            output_path = output_dir / f"Preprocessed_{ch_name}.tif"
-            preprocessed_ch.append(result)
-            output_paths.append(output_path)
-        
-        if config.split_channels:
-            for preprocessed, output_path, ch_name in zip(preprocessed_ch, output_paths, channel_names):
-                OmeTiffWriter.save(preprocessed, str(output_path), physical_pixel_sizes=metadata["used_scale"], channel_names=[ch_name], dim_order=_infer_dim_order(preprocessed.ndim))
-        else:
-            preprocessed = np.stack(preprocessed_ch, axis=0)
-            output_path = output_dir / f"Preprocessed-{"-".join(channel_names)}.tif"
-            OmeTiffWriter.save(preprocessed, str(output_path), physical_pixel_sizes=metadata["used_scale"], channel_names=channel_names, dim_order=_infer_dim_order(preprocessed.ndim))
 
 
 def run_train(config: CLITrainConfig, args: Optional[argparse.Namespace] = None) -> None:

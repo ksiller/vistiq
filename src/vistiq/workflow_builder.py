@@ -432,10 +432,16 @@ class ConfigArgumentBuilder:
             
             # For regular fields, try both the prefixed and non-prefixed argument names
             arg_name = f"{prefix}{field_name}" if prefix else field_name
-            arg_name = arg_name.replace("_", "-")
+            arg_name_hyphen = arg_name.replace("_", "-").replace(".", "-")
+            arg_name_underscore = arg_name.replace("-", "_").replace(".", "_")
             
             # Get value from args
-            if hasattr(args, arg_name):
+            # Argparse stores arguments with underscores, so try underscore version first
+            if hasattr(args, arg_name_underscore):
+                value = getattr(args, arg_name_underscore)
+            elif hasattr(args, arg_name_hyphen):
+                value = getattr(args, arg_name_hyphen)
+            elif hasattr(args, arg_name):
                 value = getattr(args, arg_name)
             elif hasattr(args, field_name):
                 value = getattr(args, field_name)

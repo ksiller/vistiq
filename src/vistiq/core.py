@@ -314,6 +314,7 @@ class StackProcessorConfig(Configuration):
     batch_size: PositiveInt = Field(default=10, description="Number of slices to process in parallel")
     tile_shape: Optional[Tuple[int, int]] = None
     output_type: Literal["stack", "list", "dataframe"] = "stack"
+    output_shape: Optional[Tuple[int,...]] = None
     squeeze: bool = True
     split_channels: bool = Field(
         default=True, 
@@ -395,7 +396,7 @@ class StackProcessor(Configurable):
                 for stack_slice in iterator
             )
             # reshape results
-            results = self._reshape_slice_results(results, slice_indices=iterator.indices, input_shape=stack.shape)
+            results = self._reshape_slice_results(results, slice_indices=iterator.indices, input_shape=stack.shape, output_shape=self.config.output_shape)
         return results
 
     def _process_slice(
@@ -421,7 +422,7 @@ class StackProcessor(Configurable):
         logger.info(f"Processing slice with shape {slice.shape}")
         raise NotImplementedError("Subclasses must implement this method")
 
-    def _reshape_slice_results(self, results: list[Any], slice_indices: list[tuple[int,...]], input_shape: tuple[int,...]) -> np.ndarray | tuple[Any,...]:
+    def _reshape_slice_results(self, results: list[Any], slice_indices: list[tuple[int,...]], input_shape: tuple[int,...], output_shape: Optional[tuple[int,...]] = None) -> np.ndarray | tuple[Any,...]:
         """Reshape the results of slice processing according to output configuration.
         
         Reshapes the list of slice results into the desired output format:
@@ -439,7 +440,8 @@ class StackProcessor(Configurable):
         if self.config.output_type == "stack":
             if not isinstance(results, np.ndarray):
                 results = np.stack(results, axis=0)
-            results = results.reshape(input_shape)
+            target_shape = output_shape if output_shape is not None else input_shape
+            results = results.reshape(target_shape)
             if self.config.squeeze:
                 results = results.squeeze()
             logger.info(f"Reshaped results to shape {results.shape}")

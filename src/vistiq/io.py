@@ -4,7 +4,7 @@ import fnmatch
 import logging
 from abc import abstractmethod
 from pathlib import Path
-from typing import Optional, Union, Any
+from typing import Optional, Union, Any, List
 import numpy as np
 from pydantic import Field, field_validator
 
@@ -25,7 +25,7 @@ class FileListConfig(Configuration):
         exclude: Optional list of patterns to exclude files (e.g., ['*.tmp', '*.bak']).
     """
     
-    input_paths: list[Union[str, Path]] = Field(
+    input_paths: Union[str, Path, List[Union[str, Path]]] = Field(
         description="List of paths (files or directories) to search for files"
     )
     recursive: bool = Field(
@@ -95,10 +95,23 @@ class FileList(Configurable[FileListConfig]):
             ValueError: If no valid paths are provided.
         """
         all_files = []
-        base_path = Path(self.config.input_paths[0]) if self.config.input_paths else Path.cwd()
+        
+        # Normalize input_paths to always be a list
+        if self.config.input_paths is None:
+            input_paths = []
+        elif isinstance(self.config.input_paths, (str, Path)):
+            input_paths = [self.config.input_paths]
+        else:
+            input_paths = list(self.config.input_paths)
+        
+        if not input_paths:
+            logger.warning("No input paths specified")
+            return [], {"total_files": 0, "filtered_files": 0, "search_paths": []}
+        
+        base_path = Path(input_paths[0]) if input_paths else Path.cwd()
         
         # Collect files from specified paths using glob patterns
-        for path_spec in self.config.input_paths:
+        for path_spec in input_paths:
             path_obj = Path(path_spec)
             
             # If relative, resolve relative to base_path
@@ -171,7 +184,7 @@ class FileList(Configurable[FileListConfig]):
             "total_files": len(all_files),
             "include_patterns": self.config.include,
             "exclude_patterns": self.config.exclude,
-            "search_paths": [str(p) for p in self.config.input_paths]
+            "search_paths": [str(Path(p)) for p in input_paths]
         }
         
         logger.info(f"Found {len(all_files)} files matching criteria")
