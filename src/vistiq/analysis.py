@@ -385,7 +385,6 @@ class CoincidenceDetector(StackProcessor):
                 # Check if bounding boxes overlap first (early exit optimization)
                 if not self._bboxes_overlap(bbox1, bbox2):
                     # No overlap, score is 0 - skip expensive computation
-                    logger.debug(f"No overlap between labels {label1} and {label2}, bbox1: {bbox1}, bbox2: {bbox2}")
                     overlap_score = 0.0
                 else:
                     # Bounding boxes overlap, compute union bbox for optimized mask extraction

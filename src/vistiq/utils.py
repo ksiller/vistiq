@@ -2,18 +2,122 @@ from __future__ import annotations
 
 import os
 import logging
+import fnmatch
+from pathlib import Path
+from typing import (
+    Union,
+    Optional,
+    List,
+    NamedTuple,
+    Tuple,
+    Dict,
+    Pattern,
+    Any,
+)
+from collections import defaultdict
+
 import numpy as np
 from pydantic import BaseModel
 import pandas as pd
-from typing import Union, Optional, List, NamedTuple
 
 import cv2
 import tifffile
 import uuid
 import torch
 
+try:
+    from bioio_ome_tiff.writers import OmeTiffWriter
+    OME_TIFF_AVAILABLE = True
+except ImportError:
+    OME_TIFF_AVAILABLE = False
+    OmeTiffWriter = None
+
 
 logger = logging.getLogger(__name__)
+
+
+def str_to_dict(s: Optional[Union[str, dict]], value_type: Any = None) -> Optional[dict]:
+    """Parse a string in format 'key1:value1;key2:value2' into a dictionary.
+    
+    This is a generic utility function that can be used in field validators, CLI argument parsing,
+    and other places where key-value pair strings need to be converted to dictionaries.
+    
+    Accepts either:
+    - A dictionary (already parsed) - returned as-is (optionally cast)
+    - A string in format 'key1:value1;key2:value2' (e.g., 'Red:Dpn;Blue:EDU') - parsed into dict
+    - None or empty string - returns None
+    
+    Args:
+        s: Input value (string, dict, or None).
+        value_type: Optional type to cast dictionary values to (e.g., int, float, str).
+                   If None, values remain as strings.
+        
+    Returns:
+        Dictionary mapping keys to values, or None. Values are cast to value_type if specified.
+        
+    Raises:
+        ValueError: If the string format is invalid or value casting fails.
+        TypeError: If value_type is provided but casting fails.
+        
+    Examples:
+        >>> str_to_dict("Red:Dpn;Blue:EDU")
+        {'Red': 'Dpn', 'Blue': 'EDU'}
+        >>> str_to_dict("a:1;b:2", value_type=int)
+        {'a': 1, 'b': 2}
+        >>> str_to_dict("x:1.5;y:2.7", value_type=float)
+        {'x': 1.5, 'y': 2.7}
+        >>> str_to_dict({"Red": "Dpn"})
+        {'Red': 'Dpn'}
+        >>> str_to_dict(None)
+        None
+        >>> str_to_dict("")
+        None
+    """
+    if s is None:
+        return None
+    
+    # If already a dict, optionally cast values and return
+    if isinstance(s, dict):
+        if value_type is None:
+            return s
+        # Cast all values to the specified type
+        return {k: value_type(v) for k, v in s.items()}
+    
+    # If it's a string, parse it
+    if isinstance(s, str):
+        if not s.strip():
+            return None
+        
+        result = {}
+        pairs = s.split(';')
+        for pair in pairs:
+            pair = pair.strip()
+            if not pair:
+                continue
+            if ':' not in pair:
+                raise ValueError(f"Invalid format: '{pair}'. Expected format: 'key:value'")
+            parts = pair.split(':', 1)  # Split only on first colon
+            if len(parts) != 2:
+                raise ValueError(f"Invalid format: '{pair}'. Expected format: 'key:value'")
+            key, value = parts[0].strip(), parts[1].strip()
+            if not key:
+                raise ValueError(f"Empty key in pair: '{pair}'")
+            if not value:
+                raise ValueError(f"Empty value in pair: '{pair}'")
+            
+            # Cast value if type is specified
+            if value_type is not None:
+                try:
+                    value = value_type(value)
+                except (ValueError, TypeError) as e:
+                    raise ValueError(f"Failed to cast value '{value}' to {value_type.__name__}: {e}")
+            
+            result[key] = value
+        
+        return result if result else None
+    
+    # For any other type, raise an error
+    raise ValueError(f"Input must be a string or dict, got {type(s).__name__}")
 
 
 class Configuration(BaseModel):
@@ -210,7 +314,8 @@ def load_image(
     reader: Optional[type] = None,
     substack: Optional[dict[str, slice]] = None,
     squeeze: bool = False,
-) -> np.ndarray:
+    rename_channel: Optional[dict[str, str]] = None,
+) -> tuple[np.ndarray, dict]:
     """Load an image file using bioio, optionally selecting a specific scene and applying dimension slicing.
     
     Args:
@@ -222,9 +327,13 @@ def load_image(
                  Special case: If None is used as a key, the slice will be applied to the first axis of the image
                  (determined from image metadata). This is used internally for legacy substack format.
         squeeze: If True, remove dimensions of size 1 from the array. Default is False.
+        rename_channel: Optional dictionary mapping original channel names to new names.
+                       Only channels present in this dictionary will be renamed.
+                       Example: {"Red": "Dpn", "Blue": "EDU"}.
         
     Returns:
-        np.ndarray: Image data as a numpy array, with optional slicing and squeezing applied.
+        tuple[np.ndarray, dict]: Image data as a numpy array and metadata dictionary.
+                                 The metadata includes channel_names (with renaming applied if specified).
         
     Raises:
         FileNotFoundError: If the file does not exist.
@@ -282,14 +391,25 @@ def load_image(
         
         logger.debug(f"dim_str: {dim_str}, substack: {substack}")
         scene_data = reader_instance.get_image_data(dim_str, **substack).squeeze()
+        ch_names = reader_instance.channel_names[substack["C"]]
     else:
         scene_data = reader_instance.get_image_data()
-
+        ch_names = reader_instance.channel_names
+    
+    # Apply channel renaming if specified
+    if rename_channel:
+        renamed_ch_names = [rename_channel[ch_name] if ch_name in rename_channel.keys() else ch_name for ch_name in ch_names]
+        # Preserve original type if possible (tuple -> tuple, list -> list)
+        if isinstance(ch_names, tuple):
+            ch_names = tuple(renamed_ch_names)
+        else:
+            ch_names = renamed_ch_names
+    
     metadata = {}
     metadata["axes"] = [
         label.upper() for label in reader_instance.dims.order
     ]  # "t", "c", "y", "x"]
-    metadata["channel_names"] = reader_instance.channel_names
+    metadata["channel_names"] = ch_names
     metadata["channel_axis"] = metadata["axes"].index("C")
     metadata["shape"] = reader_instance.shape
     metadata["dims"] = reader_instance.dims
@@ -299,7 +419,7 @@ def load_image(
     ) / 2
     metadata["scale"] = reader_instance.scale
     UsedScale = NamedTuple("UsedScale", [(s,type(v)) for s,v in reader_instance.scale._asdict().items() if v is not None])
-    metadata["used_scale"] = UsedScale(**{s:v for s,v in reader_instance.scale._asdict().items() if v is not None})
+    metadata["used_scale"] = UsedScale(**{s:abs(v) for s,v in reader_instance.scale._asdict().items() if v is not None})
     metadata["xy_pixel_res_description"] = f"{1/metadata['xy_pixel_res']} pixels per {metadata['pixel_unit']}"
     metadata["physical_pixel_sizes"] = reader_instance.physical_pixel_sizes    
     # Validate the data
@@ -314,11 +434,7 @@ def load_image(
         scene_data = np.squeeze(scene_data)
     
     logger.info(
-        "Loaded image: %s scene=%s -> shape=%s dtype=%s",
-        file_path,
-        scene_index if scene_index is not None else "default",
-        scene_data.shape,
-        scene_data.dtype,
+        f"Loaded image: {file_path} scene={scene_index if scene_index is not None else 'default'} -> shape={scene_data.shape} dtype={scene_data.dtype}, channel_names={ch_names}",
     )
     
     return scene_data, metadata
@@ -474,17 +590,17 @@ def check_device() -> torch.device:
             name = torch.cuda.get_device_name(0)
         except Exception:
             name = "unknown"
-        logger.info("Using CUDA device: %s", name)
+        logger.info("Found CUDA device: %s", name)
         return device
 
     # Fallback to Apple Metal Performance Shaders on macOS
     mps_ok = getattr(torch.backends, "mps", None)
     if mps_ok and torch.backends.mps.is_available() and torch.backends.mps.is_built():
-        logger.info("Using MPS device")
+        logger.info("Found MPS device")
         return torch.device("mps")
 
     # Default to CPU
-    logger.info("Using CPU device")
+    logger.info("Falling back to CPU device")
     return torch.device("cpu")
 
 
@@ -575,27 +691,266 @@ def to_mp4(path: Union[str, os.PathLike], stack: np.ndarray, fps: int = 15) -> N
     )
 
 
-def to_tif(path: Union[str, os.PathLike], stack: np.ndarray) -> None:
-    """Write an n-dimensional numpy array as a multi-page TIFF.
+def to_tif(path: Union[str, os.PathLike], stack: np.ndarray, dim_order: Optional[str] = None) -> None:
+    """Write an n-dimensional numpy array as an OME-TIFF file.
+
+    Uses OmeTiffWriter from bioio_ome_tiff.writers to write OME-TIFF format,
+    which includes proper metadata and dimension ordering.
 
     Args:
         path (Union[str, os.PathLike]): Output file path (should end with .tif/.tiff).
-        stack (np.ndarray): N-dimensional array. The first axis is interpreted as
-            the page/time dimension when writing multi-page TIFF. Higher
-            dimensions are supported by TIFF and will be stored accordingly.
+        stack (np.ndarray): N-dimensional array. The array dimensions should match
+            the dimension order specified (default: inferred from shape).
+        dim_order (Optional[str]): Dimension order string (e.g., "TCZYX", "CZYX", "ZYX").
+            If None, will be inferred from the array shape. Default: None.
 
     Returns:
         None
 
     Raises:
-        RuntimeError: If the optional dependency `tifffile` is not available.
+        RuntimeError: If the optional dependency `bioio_ome_tiff` is not available.
     """
-    file_path = os.fspath(path)
-    os.makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
-
-    # Write as-is; tifffile supports arbitrary numpy dtypes and shapes.
-    # Use a common lossless compression to reduce size.
-    tifffile.imwrite(file_path, stack, compression="deflate")
+    if not OME_TIFF_AVAILABLE:
+        raise RuntimeError(
+            "bioio_ome_tiff is not available. Please install it with: pip install bioio-ome-tiff"
+        )
+    
+    file_path = Path(path)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Infer dimension order if not provided
+    if dim_order is None:
+        ndim = stack.ndim
+        if ndim == 2:
+            dim_order = "YX"
+        elif ndim == 3:
+            # Common cases: TYX, ZYX, or CYX
+            dim_order = "ZYX"  # Default to ZYX for 3D
+        elif ndim == 4:
+            # Common cases: TZYX, CZYX, or TCYX
+            dim_order = "CZYX"  # Default to CZYX for 4D
+        elif ndim == 5:
+            dim_order = "TCZYX"  # Default to TCZYX for 5D
+        else:
+            # For other dimensions, use generic labels
+            dim_order = "".join([chr(ord('A') + i) for i in range(ndim - 2)]) + "YX"
+            logger.warning(
+                "Inferred dimension order '%s' for %dD array. Consider specifying dim_order explicitly.",
+                dim_order, ndim
+            )
+    
+    # Write using OmeTiffWriter
+    OmeTiffWriter.save(stack, str(file_path), dim_order=dim_order)
     logger.info(
-        "Wrote TIFF: %s shape=%s dtype=%s", file_path, tuple(stack.shape), stack.dtype
+        "Wrote OME-TIFF: %s shape=%s dtype=%s dim_order=%s",
+        file_path,
+        tuple(stack.shape),
+        stack.dtype,
+        dim_order,
     )
+
+
+FilePattern = Union[str, Pattern[str]]
+
+
+def _collect_tif_files(
+    root: Path,
+    pattern: Optional[FilePattern] = None,
+) -> Dict[str, Path]:
+    """Collect TIFF files under ``root`` that satisfy an optional filter."""
+    if not root.exists():
+        logger.warning("Path does not exist: %s", root)
+        return {}
+
+    resolved_root = root.resolve()
+
+    def _matches(candidate: Path) -> bool:
+        if pattern is None:
+            return True
+        if hasattr(pattern, "search"):
+            return bool(pattern.search(str(candidate)))
+        return fnmatch.fnmatch(str(candidate), pattern) or fnmatch.fnmatch(
+            candidate.name, pattern
+        )
+
+    collected: Dict[str, Path] = {}
+    for glob_pattern in ("*.tif", "*.tiff"):
+        for file_path in resolved_root.rglob(glob_pattern):
+            if not file_path.is_file():
+                continue
+            if not _matches(file_path):
+                continue
+            abs_path = file_path.resolve()
+            try:
+                rel_key = str(abs_path.relative_to(resolved_root))
+            except ValueError:
+                rel_key = abs_path.as_posix()
+            collected[rel_key] = abs_path
+    return collected
+
+
+def find_matching_file_pairs(
+    path_a: Path,
+    path_b: Path,
+    patterns: Optional[Tuple[Optional[FilePattern], Optional[FilePattern]]] = None,
+    exclude: Optional[List[str]] = None,
+) -> List[Tuple[Path, Path]]:
+    """Find matching files between two directory trees.
+
+    The function recursively searches each root for files matching the respective patterns (if provided)
+    and optionally filters the results with glob strings or compiled regular expressions.
+    
+    When patterns are provided, files are matched based on:
+    1. Same directory path (relative to their respective roots)
+    2. Matching pattern tuple (pattern_a for path_a, pattern_b for path_b)
+    3. Common suffix after the pattern prefix (e.g., "Red.tif" in "Preprocessed_Red.tif" and "Labels_Red.tif")
+    
+    When patterns are not provided, files are paired when they share the same relative path
+    (including filename), which is useful when comparing mirrored directory structures.
+
+    Args:
+        path_a: First directory tree to search.
+        path_b: Second directory tree to search.
+        patterns: Optional tuple of filters applied to each directory tree. Each filter
+            can be a glob string (e.g., ``"Preprocessed_*.tif"``) or a compiled regular
+            expression. Use ``None`` to disable filtering for a side.
+        exclude: Optional list of strings. Paths containing any of these strings will be excluded.
+
+    Returns:
+        A list of `(file_from_a, file_from_b)` tuples representing matched files.
+    """
+
+    pattern_a = patterns[0] if patterns else None
+    pattern_b = patterns[1] if patterns else None
+
+    files_a = _collect_tif_files(path_a, pattern_a)
+    files_b = _collect_tif_files(path_b, pattern_b)
+    
+    # Filter out paths that contain any exclude string
+    if exclude:
+        def _should_exclude(file_path: Path) -> bool:
+            """Check if a file path should be excluded.
+            
+            A path is excluded if any part of the path (as a string) contains
+            any of the exclude strings.
+            """
+            path_str = str(file_path)
+            # Check if any exclude string appears anywhere in the path
+            for exclude_str in exclude:
+                if exclude_str in path_str:
+                    return True
+            return False
+        
+        # Filter files_a
+        files_a = {rel_path: file_path for rel_path, file_path in files_a.items() 
+                   if not _should_exclude(file_path)}
+        # Filter files_b
+        files_b = {rel_path: file_path for rel_path, file_path in files_b.items() 
+                   if not _should_exclude(file_path)}
+        logger.debug(f"After exclude filtering: {len(files_a)} files in {path_a} and {len(files_b)} files in {path_b}")
+    logger.debug(f"Found {len(files_a)} files in {path_a} and {len(files_b)} files in {path_b}")
+
+    matches: List[Tuple[Path, Path]] = []
+    
+    if patterns:
+        # When patterns are provided, match by directory path and common suffix
+        # Group files by their directory path (relative to root)
+        dir_files_a: Dict[str, List[Tuple[str, Path]]] = defaultdict(list)
+        dir_files_b: Dict[str, List[Tuple[str, Path]]] = defaultdict(list)
+        
+        resolved_a = path_a.resolve()
+        resolved_b = path_b.resolve()
+        
+        # Group files from path_a by directory (relative to path_a)
+        for rel_path, file_path in files_a.items():
+            try:
+                # Get relative directory path within path_a
+                rel_dir = str(file_path.parent.relative_to(resolved_a))
+            except ValueError:
+                # If relative_to fails (e.g., paths on different drives on Windows),
+                # use the parent directory as-is (this is a fallback)
+                rel_dir = str(file_path.parent)
+            # Extract suffix after pattern (for matching)
+            file_name = file_path.name
+            # Try to extract common suffix by matching the pattern
+            if pattern_a and "*" in pattern_a:
+                # Pattern has wildcard - extract the suffix part after the wildcard
+                pattern_parts = pattern_a.split("*", 1)  # Split only on first *
+                pattern_prefix = pattern_parts[0]
+                pattern_suffix = pattern_parts[1] if len(pattern_parts) > 1 else ""
+                
+                # Check if filename matches the pattern structure
+                if file_name.startswith(pattern_prefix) and file_name.endswith(pattern_suffix):
+                    # Extract the suffix part (everything after the prefix, or use pattern_suffix if it exists)
+                    if pattern_suffix:
+                        # Use the pattern suffix as the common suffix
+                        suffix = pattern_suffix
+                    else:
+                        # No suffix in pattern, use everything after prefix
+                        suffix = file_name[len(pattern_prefix):]
+                else:
+                    # Pattern doesn't match, use full filename
+                    suffix = file_name
+            else:
+                suffix = file_name
+            dir_files_a[rel_dir].append((suffix, file_path))
+        
+        # Group files from path_b by directory (relative to path_b)
+        for rel_path, file_path in files_b.items():
+            try:
+                # Get relative directory path within path_b
+                rel_dir = str(file_path.parent.relative_to(resolved_b))
+            except ValueError:
+                # If relative_to fails (e.g., paths on different drives on Windows),
+                # use the parent directory as-is (this is a fallback)
+                rel_dir = str(file_path.parent)
+            # Extract suffix after pattern (for matching)
+            file_name = file_path.name
+            # Try to extract common suffix by matching the pattern
+            if pattern_b and "*" in pattern_b:
+                # Pattern has wildcard - extract the suffix part after the wildcard
+                pattern_parts = pattern_b.split("*", 1)  # Split only on first *
+                pattern_prefix = pattern_parts[0]
+                pattern_suffix = pattern_parts[1] if len(pattern_parts) > 1 else ""
+                
+                # Check if filename matches the pattern structure
+                if file_name.startswith(pattern_prefix) and file_name.endswith(pattern_suffix):
+                    # Extract the suffix part (everything after the prefix, or use pattern_suffix if it exists)
+                    if pattern_suffix:
+                        # Use the pattern suffix as the common suffix
+                        suffix = pattern_suffix
+                    else:
+                        # No suffix in pattern, use everything after prefix
+                        suffix = file_name[len(pattern_prefix):]
+                else:
+                    # Pattern doesn't match, use full filename
+                    suffix = file_name
+            else:
+                suffix = file_name
+            dir_files_b[rel_dir].append((suffix, file_path))
+        
+        logger.debug(f"Grouped {len(dir_files_a)} directories from {path_a} and {len(dir_files_b)} directories from {path_b}")
+        
+        # Match files in the same relative directory (within their respective roots) with the same suffix
+        # This works even when path_a and path_b are different, as long as they have the same directory structure
+        all_dirs = set(dir_files_a.keys()) | set(dir_files_b.keys())
+        for rel_dir in all_dirs:
+            files_in_a = {suffix: path for suffix, path in dir_files_a.get(rel_dir, [])}
+            files_in_b = {suffix: path for suffix, path in dir_files_b.get(rel_dir, [])}
+            
+            if files_in_a and files_in_b:
+                logger.debug(f"Matching files in directory '{rel_dir}': {len(files_in_a)} files in path_a, {len(files_in_b)} files in path_b")
+            
+            # Match files with the same suffix
+            common_suffixes = set(files_in_a.keys()) & set(files_in_b.keys())
+            for suffix in common_suffixes:
+                matches.append((files_in_a[suffix], files_in_b[suffix]))
+                logger.debug(f"Matched: {files_in_a[suffix].name} <-> {files_in_b[suffix].name} (suffix: {suffix})")
+    else:
+        # When no patterns, match by exact relative path (original behavior)
+        for rel_path, file_a in files_a.items():
+            partner = files_b.get(rel_path)
+            if partner is not None:
+                matches.append((file_a, partner))
+
+    return matches

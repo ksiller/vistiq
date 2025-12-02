@@ -16,6 +16,7 @@ from vistiq.seg import (
     RegionAnalyzerConfig,
     RegionAnalyzer,
     dilate_regions,
+    remap_labels,
 )
 from vistiq.utils import ArrayIteratorConfig
 
@@ -370,4 +371,73 @@ class TestRegionAnalyzer:
         result = analyzer.run(sample_labels_2d)
         assert isinstance(result, list)
         assert len(result) > 0
+
+    def test_extra_properties_includes_cross_sectional_area(self):
+        """Ensure custom property registry exposes cross_sectional_area."""
+        assert "cross_sectional_area" in RegionAnalyzer.extra_properties_funcs()
+
+    def test_cross_sectional_area_without_spacing(self):
+        """Ensure cross_sectional_area returns voxel count for the largest slice."""
+        mask = np.zeros((3, 4, 4), dtype=bool)
+        mask[0, :2, :2] = True  # area 4
+        mask[1, :3, :3] = True  # area 9
+        mask[2, :, :] = True    # area 16
+        result = RegionAnalyzer.cross_sectional_area(mask)
+        assert result == 16.0
+
+    def test_cross_sectional_area_with_spacing(self):
+        """Ensure spacing is applied to the computed cross-sectional area."""
+        mask = np.zeros((2, 4, 4), dtype=bool)
+        mask[:, :2, :2] = True  # area 4 per slice
+        spacing = (1.5, 0.8, 0.5)  # only last two entries used
+        expected_area = 4 * (0.8 * 0.5)
+        result = RegionAnalyzer.cross_sectional_area(mask, spacing=spacing)
+        assert result == expected_area
+
+
+class TestRemapLabels:
+    """Tests for remap_labels function."""
+
+    def test_remap_labels_keep_zero_false(self):
+        """Test remap_labels with keep_zero=False."""
+        # Input exactly as specified: labels[[2,4,8,5],[3,7,4,4],[0,1,5,3]]
+        labels = np.array([[2,4,8,5],[3,7,4,4],[0,1,5,3]], dtype=np.int32)
+        result = remap_labels(labels, keep_zero=False)
+        
+        print(f"\n{'='*70}")
+        print(f"Test: remap_labels with keep_zero=False")
+        print(f"{'='*70}")
+        print(f"\nInput labels:\n{labels}")
+        print(f"\nResult:\n{result}")
+        print(f"\nUnique labels in input: {sorted(np.unique(labels))}")
+        print(f"Unique labels in result: {sorted(np.unique(result))}")
+        
+        # Check that 0 remains 0
+        assert np.all(result[labels == 0] == 0)
+        # Check that non-zero labels are remapped to consecutive integers starting from 1
+        unique_nonzero = np.unique(result[result > 0])
+        if len(unique_nonzero) > 0:
+            expected = np.arange(1, len(unique_nonzero) + 1)
+            np.testing.assert_array_equal(np.sort(unique_nonzero), expected)
+        
+    def test_remap_labels_keep_zero_true(self):
+        """Test remap_labels with keep_zero=True."""
+        # Input exactly as specified: labels[[2,4,8,5],[3,7,4,4],[0,1,5,3]]
+        labels = np.array([[2,4,8,5],[3,7,4,4],[0,1,5,3]], dtype=np.int32)
+        result = remap_labels(labels, keep_zero=True)
+        
+        print(f"\n{'='*70}")
+        print(f"Test: remap_labels with keep_zero=True")
+        print(f"{'='*70}")
+        print(f"\nInput labels:\n{labels}")
+        print(f"\nResult:\n{result}")
+        print(f"\nUnique labels in input: {sorted(np.unique(labels))}")
+        print(f"Unique labels in result: {sorted(np.unique(result))}")
+        
+        # Check that 0 remains 0
+        assert np.all(result[labels == 0] == 0)
+        # Check that all labels are remapped to consecutive integers starting from 0
+        unique_all = np.unique(result)
+        expected = np.arange(len(unique_all))
+        np.testing.assert_array_equal(np.sort(unique_all), expected)
 

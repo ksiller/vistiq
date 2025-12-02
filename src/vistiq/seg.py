@@ -474,6 +474,7 @@ class RegionFilter(Configurable[RegionFilterConfig]):
         
         # Handle DataFrame input
         if isinstance(regions, pd.DataFrame):
+            logger.debug(f"Applying RegionFilter to a DataFrame: {regions.head()}")
             removed_indices = []
             for idx, row in regions.iterrows():
                 for filter in self.config.filters:
@@ -485,12 +486,17 @@ class RegionFilter(Configurable[RegionFilterConfig]):
                         removed_indices.append(idx)
                         break
             accepted_regions = regions.drop(index=removed_indices)
-            removed_regions = regions.loc[removed_indices] if removed_indices else pd.DataFrame()
-            logger.info(f"RegionFilter: len(accepted_regions)={len(accepted_regions)}, len(removed_regions)={len(removed_regions)}")
-            return accepted_regions, removed_regions
+            #removed_regions = regions.loc[removed_indices] if removed_indices else pd.DataFrame()
+            #logger.info(f"RegionFilter: len(accepted_regions)={len(accepted_regions)}, len(removed_regions)={len(removed_regions)}")
+            if "label" in regions.columns:
+                removed_labels = regions.loc[removed_indices, 'label'].values.astype(np.int32) if removed_indices else np.array([], dtype=np.int32)
+            else:
+                removed_labels = removed_indices
+            logger.info(f"RegionFilter: len(accepted_regions)={len(accepted_regions)}, len(removed_labels)={len(removed_labels)}")
+            return accepted_regions, removed_labels
         
         # Handle list of RegionProperties input
-        removed_regions = []
+        #removed_regions = []
         removed_labels = set()  # Use set for O(1) lookup by label
         for region in regions:
             for filter in self.config.filters:
@@ -499,14 +505,14 @@ class RegionFilter(Configurable[RegionFilterConfig]):
                     #logger.debug(
                     #    f"filter {filter.config.attribute} value={value} not in range for region {region.label}"
                     #)
-                    removed_regions.append(region)
+                    #removed_regions.append(region)
                     removed_labels.add(region.label)
                     break
         # Compare by label instead of using 'in' to avoid triggering RegionProperties.__eq__
         # which would compute all properties including ones not requested (like eccentricity)
         accepted_regions = [region for region in regions if region.label not in removed_labels]
-        logger.info(f"RegionFilter: len(accepted_regions)={len(accepted_regions)}, len(removed_regions)={len(removed_regions)}")
-        return accepted_regions, removed_regions
+        logger.info(f"RegionFilter: len(accepted_regions)={len(accepted_regions)}, len(removed_labels)={len(removed_labels)}")
+        return accepted_regions, sorted(removed_labels)
 
 
 class BinaryProcessorConfig(StackProcessorConfig):
@@ -675,12 +681,203 @@ class Relabeler(StackProcessor):
         return relabeled_labels
 
 
+def remap_labels(labels: np.ndarray, mapping: Optional[Union[dict[int, int], list[tuple[int, int]]]] = None, exclude: Optional[list[int]] = [0]) -> tuple[np.ndarray, list[tuple[int, int]]]:
+    """Remap labels to consecutive positive integers, keeping 0 as background.
+    
+    After removing labels, there may be gaps in the label sequence (e.g., labels 1, 3, 5).
+    This function remaps them to consecutive integers (1, 2, 3) while preserving 0 as background.
+    
+    Args:
+        labels: Label array with potentially non-consecutive label IDs.
+        mapping: Optional mapping of labels to new labels.
+        exclude: Optional list of labels to exclude from remapping.
+
+    Returns:
+        Tuple of (remapped_label_array, mapping_list) where mapping_list is a list of
+        (old_label, new_label) tuples.
+    """
+    labels = np.asarray(labels)
+    unique_labels = np.unique(labels, sorted=True)
+    do_exclude = exclude is not None and len(exclude) > 0
+    logger.debug(f"Unique labels: {unique_labels}, exclude={exclude}")
+    if len(unique_labels) == 0:
+        # No labels to remap, return as-is with empty mapping
+        return labels.astype(np.int32), []
+    if mapping is None:
+        map_from = np.array(unique_labels, dtype=np.int32)
+        map_to = np.arange(0, len(unique_labels), dtype=np.int32)
+        
+    elif isinstance(mapping, dict):
+        mapping = dict(mapping)
+        # sort mapping by keys
+        mapping = dict(sorted(mapping.items()))
+        map_from=np.array(list(mapping.keys()), dtype=np.int32)
+        map_to=np.array(list(mapping.values()), dtype=np.int32)
+    elif isinstance(mapping, list) and isinstance(mapping[0], tuple) and len(mapping[0]) == 2:
+        mapping = np.array(sorted(mapping), dtype=np.int32)
+        map_from = mapping[:, 0]
+        map_to = mapping[:, 1]
+    else:
+        raise ValueError(f"Invalid mapping type: {type(mapping)}")
+    
+    # Handle exclude
+    if do_exclude:
+        map_to=map_to[~np.isin(map_to, exclude)]
+        map_from=map_from[~np.isin(map_from, exclude)]
+
+    # Create mapping list for return
+    mapping_list = list(zip(map_from, map_to))
+    #for pair in mapping_list:
+    #    logger.debug(f"Mapping {pair[0]} -> {pair[1]}")
+
+    #vals, inv = np.unique(labels, return_inverse=True)
+    #indices_to_replace = np.searchsorted(vals, map_from)
+    #vals[indices_to_replace] = map_to
+    #results = vals[inv].reshape(labels.shape)
+
+    # Create mapping array: index is old label, value is new label
+    # Initialize with identity mapping (each index maps to itself)
+    # This ensures labels not in map_from stay unchanged
+    max_label = int(np.max(map_from)) if len(map_from) > 0 else 0
+    max_input_label = int(np.max(labels)) if len(labels) > 0 else 0
+    mapping_size = max(max_label, max_input_label) + 1
+    
+    mapping_temp = np.arange(mapping_size, dtype=np.int32)
+    mapping_temp[map_from] = map_to
+    mapping_temp[0] = 0  # Ensure label 0 maps to 0 (background) unless explicitly mapped
+    results = mapping_temp[labels]
+    return results, mapping_list
+
+
+def remap_dataframe_labels(
+    df: pd.DataFrame,
+    mapping: Optional[Union[dict[int, int], list[tuple[int, int]]]] = None,
+    exclude: Optional[list[int]] = [0],
+    key: Optional[str] = None
+) -> pd.DataFrame:
+    """Remap labels in a DataFrame using the remap_labels function.
+    
+    This function uses remap_labels to remap labels in a DataFrame column or index.
+    It's a convenience wrapper that extracts labels, applies remap_labels, and updates
+    the DataFrame.
+    
+    Args:
+        df: Input DataFrame containing labels to remap.
+        mapping: Optional mapping of labels to new labels (passed to remap_labels).
+        exclude: Optional list of labels to exclude from remapping (passed to remap_labels).
+        key: Column name to update. If None, remap the DataFrame's index.
+        
+    Returns:
+        DataFrame with remapped labels in the specified column or index.
+    """
+    df = df.copy()  # Work on a copy to avoid modifying the original
+    
+    # Determine where to get labels from and where to write them
+    if key is None or key.lower() == "index" or df.index.name.lower() == key.lower():
+        # Use index
+        labels = df.index.values
+        target_is_index = True
+    else:
+        # Use specified column
+        if key not in df.columns:
+            raise ValueError(f"Column '{key}' not found in DataFrame. Available columns: {list(df.columns)}")
+        labels = df[key].values
+        target_is_index = False
+    
+    # Use remap_labels to remap the labels
+    remapped_labels, _ = remap_labels(labels, mapping=mapping, exclude=exclude)
+    
+    # Update DataFrame
+    if target_is_index:
+        # Remap index - preserve index name if it exists
+        index_name = df.index.name
+        df.index = remapped_labels
+        if index_name is not None:
+            df.index.name = index_name
+    else:
+        # Remap column
+        df[key] = remapped_labels
+    
+    logger.debug(f"Relabeled DataFrame using remap_labels")
+    return df
+
+
+def remap_regionproperties(
+    regions: List["RegionProperties"],
+    mapping: Optional[Union[dict[int, int], list[tuple[int, int]]]] = None,
+    exclude: Optional[list[int]] = [0],
+    key: Optional[str] = None
+) -> List["RegionProperties"]:
+    """Remap labels in a list of RegionProperties to consecutive positive integers, keeping 0 as background.
+    
+    This function uses remap_labels to remap labels in RegionProperties objects.
+    It updates the `label` attribute of each RegionProperties object.
+    
+    Args:
+        regions: List of RegionProperties objects containing labels to remap.
+        mapping: Optional mapping of labels to new labels (passed to remap_labels).
+        exclude: Optional list of labels to exclude from remapping (passed to remap_labels).
+        key: Optional parameter for API consistency (not used for RegionProperties,
+                    which always update the `label` attribute).
+        
+    Returns:
+        List of RegionProperties objects with remapped labels in their `label` attribute.
+    """
+    if len(regions) == 0:
+        return regions
+    
+    # Extract labels from RegionProperties objects
+    labels = np.array([region.label for region in regions], dtype=np.int32)
+    
+    # Use remap_labels to remap the labels
+    remapped_labels, _ = remap_labels(labels, mapping=mapping, exclude=exclude)
+    
+    # Update RegionProperties objects' label attribute
+    for region, new_label in zip(regions, remapped_labels):
+        region.label = int(new_label)
+    
+    logger.debug(f"Remapped {len(regions)} RegionProperties labels using remap_labels")
+    return regions
+
+
+def remap_regions(
+    regions: Union[List["RegionProperties"], pd.DataFrame],
+    mapping: Union[dict[int, int], list[tuple[int, int]]],
+    key: Optional[str] = None
+) -> Union[List["RegionProperties"], pd.DataFrame]:
+    """Remap labels in RegionProperties or DataFrame using a provided mapping.
+    
+    This function is a convenience wrapper that handles both RegionProperties lists
+    and DataFrames. It uses remap_regionproperties for RegionProperties and
+    remap_dataframe_labels for DataFrames.
+    
+    Args:
+        regions: Either a list of RegionProperties objects or a pandas DataFrame.
+        mapping: Mapping of old labels to new labels. Can be a dict or list of tuples.
+        key: Column name to update in DataFrame. If None, remap the DataFrame's index.
+                   Ignored for RegionProperties.
+        
+    Returns:
+        Remapped regions (same type as input).
+    """
+    if isinstance(regions, pd.DataFrame):
+        # Handle DataFrame
+        return remap_dataframe_labels(regions, mapping=mapping, key=key)
+    elif isinstance(regions, list):
+        # Handle list of RegionProperties
+        # Note: remap_regionproperties doesn't use exclude when mapping is provided
+        return remap_regionproperties(regions, mapping=mapping, exclude=[0], key=key)
+    else:
+        raise TypeError(f"regions must be either List[RegionProperties] or pd.DataFrame, got {type(regions)}")
+
+
 class LabelRemoverConfig(StackProcessorConfig):
     """Configuration for label removal operations.
     
     This configuration defines how labels should be removed from label arrays.
     """
     iterator_config: ArrayIteratorConfig = ArrayIteratorConfig(slice_def=()) # no slicing, remove all labels
+    remap: bool = False # remap labels to consecutive positive integers (0 is background)
     output_type: Literal["stack"] = "stack" # force output type to stack
     squeeze: bool = False # don't squeeze the output
 
@@ -714,20 +911,36 @@ class LabelRemover(StackProcessor):
     
     def _extract_label_ids(
         self, 
-        label_ids: Union[List["RegionProperties"], List[int], np.ndarray]
+        label_ids: Union[List["RegionProperties"], pd.DataFrame, List[int], np.ndarray]
     ) -> np.ndarray:
         """Extract label IDs from various input formats.
         
         Args:
             label_ids: Can be:
                 - List of RegionProperties (extracts .label attribute)
+                - pandas DataFrame with a 'label' column or index
                 - List of ints
                 - numpy array of ints
                 
         Returns:
             numpy array of label IDs to remove.
         """
-        if isinstance(label_ids, list) and len(label_ids) > 0:
+        logger.debug(f"type(label_ids)={type(label_ids)}")
+        if isinstance(label_ids, pd.DataFrame):
+            # Handle pandas DataFrame
+            if 'label' in label_ids.columns:
+                # Extract from 'label' column
+                return label_ids['label'].values.astype(np.int32)
+            elif label_ids.index.name == 'label' or 'label' in str(label_ids.index.name):
+                # Extract from index if it's named 'label'
+                return label_ids.index.values.astype(np.int32)
+            elif hasattr(label_ids.index, 'name') and label_ids.index.name is None:
+                # Try to use index values if index appears to be label IDs
+                return label_ids.index.values.astype(np.int32)
+            else:
+                # Default: use index values
+                return label_ids.index.values.astype(np.int32)
+        elif isinstance(label_ids, list) and len(label_ids) > 0:
             # Check if first element is a RegionProperties object
             if hasattr(label_ids[0], 'label'):
                 # Extract label attribute from RegionProperties
@@ -773,23 +986,25 @@ class LabelRemover(StackProcessor):
             mask = np.isin(result, label_ids)
             # Set masked pixels to background (0)
             result[mask] = 0
+            logger.debug (f"{len(label_ids)} labels removed, {len(np.unique(labels))} unique labels before removal, {len(np.unique(result))} labels remaining, {len(np.unique(result))} unique labels after removal")
         return result
     
     def run(
         self, 
         labels: np.ndarray, 
-        region_properties: Union[List["RegionProperties"], List[int], np.ndarray],
+        region_properties: Union[List["RegionProperties"], pd.DataFrame, List[int], np.ndarray],
         workers: int = -1, 
         verbose: int = 10,
         metadata: Optional[dict[str, Any]] = None,
         **kwargs
-    ) -> np.ndarray:
+    ) -> Union[np.ndarray, tuple[np.ndarray, list[tuple[int, int]]]]:
         """Remove specified labels from the label array.
         
         Args:
             labels: Input label array.
             region_properties: Region properties to remove. Can be:
                 - List of RegionProperties (extracts .label attribute)
+                - pandas DataFrame with a 'label' column or index
                 - List of ints
                 - numpy array of ints
             workers: Number of parallel workers (-1 for all cores).
@@ -798,17 +1013,24 @@ class LabelRemover(StackProcessor):
             verbose: Verbosity level for parallel processing.
             
         Returns:
-            Processed label array with specified labels set to background (0).
+            If remap=False: Processed label array with specified labels set to background (0).
+            If remap=True: Tuple of (processed label array, mapping list) where mapping is
+                list of (old_label, new_label) tuples.
         """
         # Extract label IDs from various input formats
         label_ids_array = self._extract_label_ids(region_properties)
-        
-        if len(label_ids_array) == 0:
-            # No labels to remove, return original
-            return labels
+        logger.debug(f"label_ids_array={label_ids_array}")
         
         # Use parent's run method with label_ids as additional argument
-        return super().run(labels, label_ids_array, workers=workers, verbose=verbose)
+        results = super().run(labels, label_ids_array, workers=workers, verbose=verbose)
+        if self.config.remap:
+            results, mapping = remap_labels(results)
+            # logger.debug(f"Remapping: {[pair for pair in mapping]}")
+            # logger.debug(f"Results after removal and remapping: {results}")
+            return results, mapping
+        else:
+            logger.debug(f"Results after removal: {results}")
+            return results
 
 
 class LabellerConfig(StackProcessorConfig):
@@ -981,6 +1203,7 @@ class RegionAnalyzer(StackProcessor):
             "circularity": cls.circularity,
             "sphericity": cls.sphericity,
             "aspect_ratio": cls.aspect_ratio,
+            "cross_sectional_area": cls.cross_sectional_area,
             "volume": cls.volume,
         }
 
@@ -1192,6 +1415,27 @@ class RegionAnalyzer(StackProcessor):
         eigenvalues = np.sort(eigenvalues)[::-1]
         # Aspect ratio: smallest / largest eigenvalue
         return float(np.sqrt(eigenvalues[-1] / eigenvalues[0]))
+
+    @staticmethod
+    def cross_sectional_area(regionmask, intensity_image=None, spacing=None):
+        """Compute the maximum cross-sectional area in the xy plane of the region.
+        
+        Args:
+            regionmask: Binary mask of the region.
+            intensity_image: Optional intensity image (not used).
+            spacing: Optional spacing tuple for anisotropic voxels.            
+        Returns:
+            Maximum cross-sectional area as a float.
+        """
+        # Sum along the last two spatial dimensions (typically Y and X)
+        pixel_count = float(np.max(np.sum(regionmask, axis=(-2,-1))))
+        
+        if spacing is not None:
+            # Calculate physical area accounting for pixel spacing
+            pixel_area = np.abs(np.prod(spacing[-2]))
+            return pixel_count * pixel_area
+        
+        return pixel_count
 
     @staticmethod
     def volume(regionmask, intensity_image=None, spacing=None):
@@ -1897,8 +2141,10 @@ class MicroSAMSegmenter(Segmenter):
             if self.config.region_filter is not None:
                 regions, removed_regions = self.config.region_filter.run(regions)
                 # remove the areas in labels corresponding to the removed regions
-                label_remover = LabelRemover(LabelRemoverConfig(iterator_config=ArrayIteratorConfig(slice_def=()), output_type="stack", squeeze=False))
-                labels = label_remover.run(labels, removed_regions)
+                logger.debug(f"Starting label removal with {len(removed_regions)} removed regions")
+                label_remover = LabelRemover(LabelRemoverConfig(iterator_config=ArrayIteratorConfig(slice_def=()), remap=True, output_type="stack", squeeze=False))
+                labels, newlabels_map = label_remover.run(labels, removed_regions)
+                regions = remap_regions(regions, newlabels_map, key="label")
             return binary_mask, labels, regions
         else:
             logger.info("No regions to compute, returning binary mask and labels")

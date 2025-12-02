@@ -7,7 +7,7 @@ from vistiq.app import (
     AppConfig,
     SegmentConfig,
     AnalyzeConfig,
-    PreprocessConfig,
+    PreprocessorConfig,
     CoincidenceConfig,
     FullConfig,
 )
@@ -133,12 +133,12 @@ class TestAnalyzeConfig:
         assert config.output_path is None
 
 
-class TestPreprocessConfig:
-    """Tests for PreprocessConfig class."""
+class TestPreprocessorConfig:
+    """Tests for PreprocessorConfig class."""
 
     def test_default_config(self):
-        """Test default PreprocessConfig."""
-        config = PreprocessConfig()
+        """Test default PreprocessorConfig."""
+        config = PreprocessorConfig()
         assert config.input_path is None
         assert config.output_path is None
 

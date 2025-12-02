@@ -1,19 +1,178 @@
 from abc import ABC, abstractmethod
-from typing import Generic, TypeVar, Literal, Any, Optional, Tuple, Union
-from pydantic import BaseModel, PositiveInt
+from typing import Generic, TypeVar, Literal, Any, Optional, Tuple, Union, TYPE_CHECKING
+from pydantic import BaseModel, PositiveInt, Field, field_validator
 #from pydantic.dataclasses import dataclass
 import numpy as np
 import pandas as pd
 # Lazy import joblib to avoid slow initialization at module import time
 import logging
 
+from joblib import Parallel, delayed
 from vistiq.utils import ArrayIterator, ArrayIteratorConfig
 
 logger = logging.getLogger(__name__)
 
-ConfigType = TypeVar("ConfigType", bound=BaseModel)
+ConfigType = TypeVar("ConfigType", bound="Configuration")
+
+if TYPE_CHECKING:
+    from typing import Type
+
+
+def cli_field(
+    default: Any = ...,
+    *,
+    default_factory: Any = None,
+    alias: str | None = None,
+    alias_priority: int | None = None,
+    validation_alias: str | None = None,
+    serialization_alias: str | None = None,
+    title: str | None = None,
+    description: str | None = None,
+    examples: list[Any] | None = None,
+    exclude: bool | None = None,
+    discriminator: str | None = None,
+    json_schema_extra: dict[str, Any] | None = None,
+    frozen: bool | None = None,
+    validate_default: bool | None = None,
+    repr: bool = True,
+    init_var: bool | None = None,
+    kw_only: bool | None = None,
+    pattern: str | None = None,
+    strict: bool | None = None,
+    gt: float | None = None,
+    ge: float | None = None,
+    lt: float | None = None,
+    le: float | None = None,
+    multiple_of: float | None = None,
+    min_length: int | None = None,
+    max_length: int | None = None,
+    **extra: Any,
+) -> Any:
+    """Create a Field that is explicitly marked for CLI argument generation.
+    
+    This is a convenience wrapper around Pydantic's Field that marks the field
+    as available for CLI argument generation. By default, all Configuration fields
+    are included in CLI arguments unless marked with cli=False.
+    
+    This function is useful for explicitly marking fields that should be exposed
+    as CLI arguments, though it's not strictly necessary since fields are included
+    by default.
+    
+    To exclude a field from CLI arguments, use:
+        Field(..., json_schema_extra={'cli': False})
+    
+    Args:
+        All arguments are the same as Pydantic's Field, with the addition that
+        the field will be explicitly marked for CLI exposure.
+        
+    Returns:
+        A FieldInfo object marked for CLI exposure.
+        
+    Example:
+        class MyConfig(Configuration):
+            # This field will be available as --my-arg
+            my_arg: str = cli_field(default="value", description="My argument")
+            
+            # This field will NOT be available as CLI argument
+            internal_field: str = Field(default="internal", json_schema_extra={'cli': False})
+    """
+    # Add CLI marker to json_schema_extra
+    if json_schema_extra is None:
+        json_schema_extra = {}
+    json_schema_extra['cli'] = True
+    
+    return Field(
+        default=default,
+        default_factory=default_factory,
+        alias=alias,
+        alias_priority=alias_priority,
+        validation_alias=validation_alias,
+        serialization_alias=serialization_alias,
+        title=title,
+        description=description,
+        examples=examples,
+        exclude=exclude,
+        discriminator=discriminator,
+        json_schema_extra=json_schema_extra,
+        frozen=frozen,
+        validate_default=validate_default,
+        repr=repr,
+        init_var=init_var,
+        kw_only=kw_only,
+        pattern=pattern,
+        strict=strict,
+        gt=gt,
+        ge=ge,
+        lt=lt,
+        le=le,
+        multiple_of=multiple_of,
+        min_length=min_length,
+        max_length=max_length,
+        **extra
+    )
+
+
+def cli_config(*, exclude: list[str] | None = None, include_only: list[str] | None = None):
+    """Class decorator to mark Configuration fields for CLI argument generation.
+    
+    This decorator provides an elegant way to control which fields from a Configuration
+    class are exposed as CLI arguments. By default, all fields are included unless
+    specified otherwise.
+    
+    Args:
+        exclude: List of field names to exclude from CLI arguments.
+        include_only: List of field names to include in CLI arguments (excludes all others).
+                     Mutually exclusive with exclude.
+    
+    Returns:
+        A class decorator function.
+        
+    Example:
+        @cli_config(exclude=['internal_field', 'computed_value'])
+        class MyConfig(Configuration):
+            public_field: str = Field(default="value")
+            internal_field: str = Field(default="internal")  # Won't appear in CLI
+            computed_value: int = Field(default=0)  # Won't appear in CLI
+            
+        @cli_config(include_only=['width', 'height'])
+        class ResizeConfig(Configuration):
+            width: int = Field(default=256)  # Will appear in CLI
+            height: int = Field(default=256)  # Will appear in CLI
+            internal: str = Field(default="")  # Won't appear in CLI
+    """
+    if exclude and include_only:
+        raise ValueError("Cannot specify both 'exclude' and 'include_only'")
+    
+    def decorator(cls):
+        """Apply CLI configuration to the class."""
+        # Validate that cls is a Configuration subclass at runtime
+        # This avoids forward reference issues during class definition
+        # We check after the class is fully defined
+        import sys
+        current_module = sys.modules.get(cls.__module__)
+        if current_module:
+            # Check if this is Configuration itself or a subclass
+            ConfigBase = getattr(current_module, 'Configuration', None)
+            if ConfigBase is not None and cls is not ConfigBase:
+                # Only validate if it's not Configuration itself
+                if not issubclass(cls, ConfigBase):
+                    raise TypeError(f"@cli_config can only be applied to Configuration subclasses, got {cls}")
+        # If Configuration isn't available yet (forward reference), we'll skip validation
+        # The class will be validated when it's actually used
+        
+        # Store CLI configuration as class attribute
+        # This will be checked by ConfigArgumentBuilder when building arguments
+        cls.__cli_config__ = {
+            'exclude': exclude,
+            'include_only': include_only
+        }
+        
+        return cls
+    
+    return decorator
 
 #@dataclass(config=ConfigDict(arbitrary_types_allowed=True))
+@cli_config(exclude=['classname', 'package', 'version', 'command_group'])
 class Configuration(BaseModel):
     """Base configuration class for all vistiq components.
 
@@ -22,6 +181,9 @@ class Configuration(BaseModel):
     """
 
     classname: str | None = None
+    package: str | None = None
+    version: str | None = None
+    command_group: str | None = None
 
     class Config:
         """Pydantic configuration.
@@ -55,11 +217,34 @@ class Configurable(ABC, Generic[ConfigType]):
             config: Configuration model instance.
         """
         self.config = config
+        # Update config with class metadata using Pydantic's model_copy
+        # Get version from package if class doesn't have it
+        version = getattr(type(self), '__version__', None)
+        if version is None:
+            # Try to get version from the package
+            try:
+                from vistiq import __version__ as package_version
+                version = package_version
+            except ImportError:
+                version = None
+        
+        # Use model_copy to create updated config (Pydantic v2 way)
+        if hasattr(self.config, 'model_copy'):
+            self.config = self.config.model_copy(update={
+                "classname": type(self).__name__,
+                "package": type(self).__module__,
+                "version": version
+            })
+        else:
+            # Fallback: directly assign if model_copy not available
+            self.config.classname = type(self).__name__
+            self.config.package = type(self).__module__
+            self.config.version = version
 
     @classmethod
     @abstractmethod
     def from_config(cls, config: ConfigType) -> "Configurable[ConfigType]":
-        """Create an instance from a configuration model.
+        """Create an instance from a configuration model. Realizes an instance with concrete classname, package, and version to capture specific runtime and support reproducibility.
 
         Args:
             config: Configuration model instance.
@@ -67,7 +252,7 @@ class Configurable(ABC, Generic[ConfigType]):
         Returns:
             A new instance of the configurable object.
         """
-        raise NotImplementedError("Subclasses must implement this method")
+        return cls(config)
 
     def get_config(self) -> ConfigType:
         """Get the current configuration.
@@ -120,13 +305,34 @@ class StackProcessorConfig(Configuration):
         iterator_config: Configuration for array iteration (which axes to iterate over).
         output_type: Output format ("stack" for single array, "list" for list of results).
         squeeze: Whether to squeeze singleton dimensions from output.
+        split_channels: Whether to split channels into separate files after processing.
+        rename_channel: Dictionary mapping original channel names to new names. Can be provided as a string
+            in format 'old1:new1;old2:new2' (e.g., 'Red:Dpn;Blue:EDU') which will be automatically parsed.
     """
 
     iterator_config: ArrayIteratorConfig = ArrayIteratorConfig(slice_def=(-2, -1))
-    batch_size: PositiveInt = 1
+    batch_size: PositiveInt = Field(default=10, description="Number of slices to process in parallel")
     tile_shape: Optional[Tuple[int, int]] = None
     output_type: Literal["stack", "list", "dataframe"] = "stack"
     squeeze: bool = True
+    split_channels: bool = Field(
+        default=True, 
+        description="Split channels into separate files after processing"
+    )
+    rename_channel: Optional[dict[str, str]] = Field(
+        default=None,
+        description="Dictionary mapping original channel names to new names (format: 'old1:new1;old2:new2')"
+    )
+    
+    @field_validator('rename_channel', mode='before')
+    @classmethod
+    def parse_rename_channel(cls, v: Any) -> Optional[dict[str, str]]:
+        """Parse rename_channel from string format to dictionary.
+        
+        Uses the utility function from vistiq.utils for consistent parsing.
+        """
+        from vistiq.utils import str_to_dict
+        return str_to_dict(v, value_type=str)
 
 
 class StackProcessor(Configurable):
@@ -183,9 +389,7 @@ class StackProcessor(Configurable):
                 stack, *args, metadata=metadata, **kwargs
             )
         else:
-            # Lazy import joblib only when parallel processing is needed
-            from joblib import Parallel, delayed
-            results = Parallel(n_jobs=workers, verbose=verbose)(
+            results = Parallel(n_jobs=workers, verbose=verbose, batch_size=self.config.batch_size)(
                 delayed(self._process_slice)(
                     stack_slice, *args, metadata=metadata, **kwargs)
                 for stack_slice in iterator

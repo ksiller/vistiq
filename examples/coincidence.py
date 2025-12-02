@@ -1,8 +1,3 @@
-from vistiq.core import ArrayIteratorConfig
-from vistiq.preprocess import DoG, DoGConfig
-from vistiq.seg import MicroSAMSegmenter, MicroSAMSegmenterConfig, RegionFilter, RegionFilterConfig, RangeFilter, RangeFilterConfig
-from vistiq.analysis import CoincidenceDetector, CoincidenceDetectorConfig
-from vistiq.utils import load_image, get_scenes, to_tif
 import numpy as np
 import pandas as pd
 import os
@@ -10,6 +5,14 @@ import itertools
 import argparse
 import logging
 from pathlib import Path
+from vistiq.core import ArrayIteratorConfig
+from vistiq.preprocess import DoG, DoGConfig
+from vistiq.seg import MicroSAMSegmenter, MicroSAMSegmenterConfig, RegionFilter, RegionFilterConfig, RangeFilter, RangeFilterConfig
+from vistiq.analysis import CoincidenceDetector, CoincidenceDetectorConfig
+from vistiq.utils import load_image, get_scenes
+from bioio_ome_tiff.writers import OmeTiffWriter
+
+
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +152,7 @@ def coincidence(input_path, sigma_low, sigma_high, normalize, area_lower, area_u
     for idx, sc in enumerate(scenes):
         print (f"scene: {sc}")
         # Load image
-        img, scale = load_image(input_path, scene_index=idx, squeeze=True)
+        img, metadata = load_image(input_path, scene_index=idx, squeeze=True)
         img = img[:,30:40,]
 
         output_dir = f"{input_path_obj.with_suffix('')}-{sc}-dog-{sigma_low}-{sigma_high}-threshold-{threshold}"
@@ -157,7 +160,7 @@ def coincidence(input_path, sigma_low, sigma_high, normalize, area_lower, area_u
         print (f"output_dir: {output_dir}")
     
         img_ch = np.unstack(img, axis=0)
-        print (f"img: {img.shape}, scale: {scale}")
+        print (f"img: {img.shape}, metadata: {metadata}")
         for im in img_ch:
             print (f"im.shape: {im.shape}")
 
@@ -170,7 +173,7 @@ def coincidence(input_path, sigma_low, sigma_high, normalize, area_lower, area_u
             dog = DoG(dog_config)
             preprocessed = dog.run(im)
             output_path = f"{output_dir}/Preprocessed_Ch{i}.tif"
-            to_tif(output_path, preprocessed)
+            _save_ome_tiff(preprocessed, output_path)
 
             # 2. MicroSAMSegmenter with RegionFilter
             region_filter = RegionFilter(region_filter_config)
@@ -185,7 +188,7 @@ def coincidence(input_path, sigma_low, sigma_high, normalize, area_lower, area_u
             microsam = MicroSAMSegmenter(microsam_config)
             masks, labels, regions = microsam.run(preprocessed)
             output_path = f"{output_dir}/Labels_Ch{i}.tif"
-            to_tif(output_path, labels)
+            _save_ome_tiff(labels, output_path)
             masks_ch.append(masks)
             labels_ch.append(labels)
             regions_ch.append(regions)

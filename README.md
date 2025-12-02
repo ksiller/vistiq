@@ -5,7 +5,7 @@
 [![Python Version](https://img.shields.io/pypi/pyversions/vistiq.svg?color=green)](https://python.org)
 [![codecov](https://codecov.io/gh/ksiller/vistiq/branch/main/graph/badge.svg)](https://codecov.io/gh/ksiller/vistiq)
 
-**Vistiq**: Vistiq: Turn complex imaging data into actionable, quantitative insight with modular, multi-step analysis. Vistiq runs on Fluxon to orchestrate scalable and reproducible analysis pipelines.
+**Vistiq** turns complex imaging data into actionable, quantitative insight with modular, multi-step analysis. Vistiq runs on Fluxon to orchestrate scalable and reproducible analysis pipelines.
 
 ## Capabilities
 
@@ -13,24 +13,12 @@ Vistiq offers a comprehensive suite of image analysis tools for image processing
 
 - **Preprocessing**: Multiple methods for image denoising and feature enhancement
 - **Segmentation**: Multiple segmentation methods including local thresholding, iterative thresholding, and watershed-based techniques to identify atom positions in image stacks
-- **Object Statistics**: Quantitative analysis of detected objects including area, perimeter, circularity, solidity, aspect ratio, eccentricity, and nearest-neighbor distances
-- **Filtering**: Flexible filtering based on object properties (area, circularity, solidity, aspect ratio, etc.) to refine detections
-- **Voronoi Tessellation**: Construction of Voronoi diagrams to analyze local coordination environments
-- **Spatial Probability Maps**: Generation of 3D probability distributions for atom positions based on detected centroids
-- **Temporal Analysis**: Weighted temporal summation for analyzing time-series data with decay-based contributions
-- **Visualization**: Export animations and create napari-compatible visualization layers
+- **Object Analysis & Filtering**: Quantitative analysis of individual object properties (including area, perimeter, circularity, solidity, aspect ratio, eccentricity, sphericity)
+- **Spatio-Temporal Statistics**: Quantitative measurements of inter-object properties (object density, nearest-neighbor distances, coincidence detection, etc.) in space and time.
+- **Visualization**: Voronoi tessellation, spatial density probability maps for objects, export of animations and creation of napari-compatible visualization layers
 
-## Approach
 
-Vistiq uses a multi-stage analysis pipeline:
-
-1. **Segmentation**: Detects atom positions using adaptive thresholding and morphological operations
-2. **Filtering**: Refines detections based on statistical properties of the detected objects
-3. **Statistics**: Computes comprehensive object statistics including spatial distribution metrics
-4. **Analysis**: Performs Voronoi tessellation and coordination analysis to characterize local atomic environments
-5. **Visualization**: Generates probability maps and visualization layers for interactive exploration
-
-The toolkit leverages scikit-image for image processing, scipy for spatial operations, and joblib for parallel processing across multiple planes in image stacks. It supports both 2D images and 3D/4D image stacks with efficient parallel processing.
+The toolkit leverages scikit-image for image processing, scipy for spatial operations, MicroSAM for segmentation, and joblib for parallel processing across multiple planes in image stacks. It supports both 2D images and 3D/4D image stacks with efficient parallel processing.
 
 ## Installation 
 
@@ -111,6 +99,41 @@ vistiq analyze -i segmented_images/ -o analysis_results/ -g
   --no-coords           exclude coordinate extraction
 ```
 
+### Coincidence Detection
+
+Run a complete workflow for coincidence detection with DoG preprocessing, MicroSAM segmentation, and overlap analysis:
+
+```bash
+vistiq coincidence -i imagestack.nd2 -o output/ -g --substack T:4-10;Z:2-20
+```
+
+**Coincidence-specific arguments:**
+```
+  --sigma-low SIGMA_LOW
+                        sigma for lower Gaussian blur in DoG (default: 1.0)
+  --sigma-high SIGMA_HIGH
+                        sigma for higher Gaussian blur in DoG (default: 12.0)
+  --normalize           normalize DoG output to [0, 1] range (default: True)
+  --no-normalize        disable normalization of DoG output
+  --area-min AREA_MIN
+                        minimum area for area filter (default: 100)
+  --area-max AREA_MAX
+                        maximum area for area filter (default: 10000)
+  --volume-min VOLUME_MIN
+                        minimum volume for volume filter (default: 100)
+  --volume-max VOLUME_MAX
+                        maximum volume for volume filter (default: 10000)
+  --model-type {vit_l_lm,vit_b_lm,vit_t_lm,vit_h_lm}
+                        MicroSAM model type (default: vit_l_lm)
+  --threshold THRESHOLD
+                        threshold for coincidence detection (default: 0.1)
+  --method {iou,dice}   coincidence detection method (default: dice)
+  --mode {bounding_box,outline}
+                        coincidence detection mode (default: outline)
+```
+
+**Note:** The coincidence command does not require an output path. Results are saved to a directory based on the input file path (with extension stripped).
+
 ### Full Pipeline
 
 Run the complete pipeline (segment + analyze) in a single command:
@@ -122,40 +145,6 @@ vistiq full -i imagestack.nd2 -o results/ -g --substack 1-100 --threshold-method
 **Full pipeline arguments:**
 Includes all arguments from both `segment` and `analyze` subcommands.
 
-### Coincidence Detection
-
-Run a complete workflow for coincidence detection with DoG preprocessing, MicroSAM segmentation, and overlap analysis:
-
-```bash
-vistiq coincidence -i imagestack.nd2 -o output/ -g --substack T:4-10,Z:2-20
-```
-
-**Coincidence-specific arguments:**
-```
-  --sigma-low SIGMA_LOW
-                        sigma for lower Gaussian blur in DoG (default: 1.0)
-  --sigma-high SIGMA_HIGH
-                        sigma for higher Gaussian blur in DoG (default: 12.0)
-  --normalize           normalize DoG output to [0, 1] range (default: True)
-  --no-normalize        disable normalization of DoG output
-  --area-lower AREA_LOWER
-                        lower bound for area filter (default: 100)
-  --area-upper AREA_UPPER
-                        upper bound for area filter (default: 10000)
-  --volume-lower VOLUME_LOWER
-                        lower bound for volume filter (default: 100)
-  --volume-upper VOLUME_UPPER
-                        upper bound for volume filter (default: 10000)
-  --model-type {vit_l_lm,vit_b_lm,vit_t_lm,vit_h_lm}
-                        MicroSAM model type (default: vit_l_lm)
-  --threshold THRESHOLD
-                        threshold for coincidence detection (default: 0.1)
-  --method {iou,dice}   coincidence detection method (default: dice)
-  --mode {bounding_box,outline}
-                        coincidence detection mode (default: outline)
-```
-
-**Note:** The coincidence command does not require an output path. Results are saved to a directory based on the input file path (with extension stripped).
 
 ### Workflow
 
@@ -221,11 +210,12 @@ Selects a subset of the image data to process, allowing you to work with specifi
    - The first axis may be time (T), Z-stack, or another dimension depending on the image
 
 2. **New format** (explicit dimension names):
-   - Multiple dimensions: `'T:4-10,Z:2-20'` - processes time points 4-10 and Z-slices 2-20
-   - Single dimension: `'C:0'` - processes only channel 0
+   - Multiple dimensions: `'T:4-10;Z:2-20'` - processes time points 4-10 and Z-slices 2-20
+   - Single dimension: `'C:1'` - processes only channel 1 (first channel)
    - Dimension names: `T` (time), `Z` (depth), `C` (channel), `Y` (height), `X` (width)
-   - Ranges are 1-based and inclusive (e.g., `T:4-10` includes both frame 4 and frame 10)
-   - Multiple dimensions are comma-separated
+   - **All ranges are 1-based and inclusive** (e.g., `T:4-10` includes both frame 4 and frame 10)
+   - Multiple dimensions are semicolon-separated (`;`)
+   - Minimum value is 1 (not 0)
 
 **Default behavior**: If `--substack` is not specified, all frames/slices/channels are processed.
 
@@ -237,14 +227,14 @@ vistiq segment -i data/image.tiff -o output/ --substack 10
 # Process frame range (legacy format)
 vistiq segment -i data/image.tiff -o output/ --substack 2-40
 
-# Process specific time and Z ranges (new format)
-vistiq segment -i data/image.tiff -o output/ --substack T:4-10,Z:2-20
+# Process specific time and Z ranges (new format, semicolon-separated)
+vistiq segment -i data/image.tiff -o output/ --substack T:4-10;Z:2-20
 
-# Process specific channel and Z range
-vistiq segment -i data/image.tiff -o output/ --substack C:0,Z:5-50
+# Process specific channel and Z range (1-based indexing)
+vistiq segment -i data/image.tiff -o output/ --substack C:1;Z:5-50
 
-# Process specific time points and channels
-vistiq analyze -i data/image.tiff -o output/ --substack T:1-5,C:0-2
+# Process specific time points and channels (1-based indexing)
+vistiq analyze -i data/image.tiff -o output/ --substack T:1-5;C:1-2
 ```
 
 #### `-g, --grayscale` (optional)
@@ -273,6 +263,55 @@ Sets the verbosity level for logging output.
 **Example:**
 ```bash
 vistiq segment -i data/image.tiff -o output/ --loglevel DEBUG
+```
+
+#### `-p, --processes PROCESSES` (optional)
+Specifies the number of parallel processes to use for processing.
+
+- Use a positive integer to specify the exact number of processes (e.g., `4` for 4 processes)
+- Use `-1` to use all available CPU cores
+- **Default**: `1` (single-threaded processing)
+
+**Example:**
+```bash
+# Use 4 parallel processes
+vistiq segment -i data/image.tiff -o output/ --processes 4
+
+# Use all available cores
+vistiq preprocess -i data/image.tiff -o output/ --processes -1
+```
+
+#### `--split-channels` / `--no-split-channels` (optional)
+Controls whether multi-channel images are saved into separate files after processing.
+
+- **`--split-channels`**: Split each channel into a separate output file (default)
+- **`--no-split-channels`**: Keep all channels in a single output file
+
+**Default**: `--split-channels` (channels are split by default)
+
+**Example:**
+```bash
+# Split channels into separate files (default)
+vistiq segment -i data/multichannel.tiff -o output/ --split-channels
+
+# Keep all channels in one file
+vistiq preprocess -i data/multichannel.tiff -o output/ --no-split-channels
+```
+
+#### `--rename-channel RENAME_STRING` (optional)
+Renames channel names in the loaded image metadata.
+
+- Format: `"old1:new1;old2:new2"` - semicolon-separated pairs of old:new channel names
+- Only channels specified in the mapping will be renamed; others remain unchanged
+- Useful for standardizing channel names across different datasets or matching expected names
+
+**Example:**
+```bash
+# Rename "Red" to "Dpn" and "Blue" to "EDU"
+vistiq segment -i data/image.tiff -o output/ --rename-channel "Red:Dpn;Blue:EDU"
+
+# Rename a single channel
+vistiq preprocess -i data/image.tiff -o output/ --rename-channel "Channel_1:DAPI"
 ```
 
 #### `-h, --help`
@@ -322,9 +361,9 @@ vistiq full -i data/images.tiff -o output/results/ \
 **Coincidence detection with custom parameters:**
 ```bash
 vistiq coincidence -i data/images.tiff -g \
-  --substack T:0-10,Z:5-50 \
+  --substack T:1-10;Z:5-50 \
   --sigma-low 0.5 --sigma-high 10.0 \
-  --volume-lower 50 --volume-upper 5000 \
+  --volume-min 50 --volume-max 5000 \
   --threshold 0.2 --method iou --mode outline
 ```
 
@@ -336,11 +375,11 @@ vistiq segment -i data/images.tiff -o output/ --substack 10
 # Process frame range (legacy format, first axis)
 vistiq segment -i data/images.tiff -o output/ --substack 2-40
 
-# Process specific time and Z ranges (new format)
-vistiq segment -i data/images.tiff -o output/ --substack T:4-10,Z:2-20
+# Process specific time and Z ranges (new format, semicolon-separated, 1-based)
+vistiq segment -i data/images.tiff -o output/ --substack T:4-10;Z:2-20
 
-# Process specific channel and Z range
-vistiq segment -i data/images.tiff -o output/ --substack C:0,Z:5-50
+# Process specific channel and Z range (1-based indexing)
+vistiq segment -i data/images.tiff -o output/ --substack C:1;Z:5-50
 ```
 
 ## Using Vistiq in Python/Jupyter
@@ -349,7 +388,7 @@ Vistiq can also be used programmatically in Python scripts or Jupyter notebooks:
 
 ```python
 from vistiq.seg import Segmenter, SegmenterConfig
-from vistiq.preprocess import Preprocessor, PreprocessConfig
+from vistiq.preprocess import Preprocessor, PreprocessorConfig
 
 # Logging is automatically configured when importing vistiq modules
 # You can customize the logging level if needed:

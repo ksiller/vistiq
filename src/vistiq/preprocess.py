@@ -5,24 +5,25 @@ from typing import Optional, Literal, Any
 from pydantic import Field, field_validator, model_validator
 from scipy.ndimage import uniform_filter1d
 from skimage.filters import gaussian
+from skimage.transform import resize
 from joblib import Parallel, delayed
 import logging
 
-from vistiq.core import Configuration, Configurable, StackProcessorConfig, StackProcessor
+from vistiq.core import Configuration, Configurable, StackProcessorConfig, StackProcessor, cli_config
 
 logger = logging.getLogger(__name__)
 
-
-class PreprocessConfig(StackProcessorConfig):
+@cli_config(exclude=['output_type'])
+class PreprocessorConfig(StackProcessorConfig):
     """Configuration for image preprocessing operations.
 
     This configuration class defines parameters for preprocessing steps, e.g. normalization, denoising and Difference of Gaussians (DoG)
     filtering.
     """
-
     normalize: bool = Field(
         default=True, description="Normalize output to [0, 1] range"
     )
+    output_type: Literal["stack"] = "stack"
     dtype: Literal[int, np.uint8, np.uint32, np.uint64, float, np.float32, np.float64] | None = Field(default=None, description="dtype of processed stack. If None, same as input dtype.")
 
 
@@ -33,7 +34,7 @@ class Preprocessor(StackProcessor):
     and Difference of Gaussians (DoG) filtering for image stacks.
     """
 
-    def __init__(self, config: PreprocessConfig):
+    def __init__(self, config: PreprocessorConfig):
         """Initialize the preprocessor.
 
         Args:
@@ -42,7 +43,7 @@ class Preprocessor(StackProcessor):
         super().__init__(config)
 
     @classmethod
-    def from_config(cls, config: PreprocessConfig) -> "Preprocessor":
+    def from_config(cls, config: PreprocessorConfig) -> "Preprocessor":
         """Create a Preprocessor instance from a configuration.
 
         Args:
@@ -134,7 +135,7 @@ class PreprocessChainConfig(Configuration):
     This configuration class defines parameters for chaining multiple preprocessors.
     """
 
-    preprocessors: list[PreprocessConfig] = Field(
+    preprocessors: list[PreprocessorConfig] = Field(
         default=[], description="List of preprocessors to apply"
     )
 
@@ -195,6 +196,9 @@ class DoG(Preprocessor):
 
         Args:
             config: DoG configuration.
+
+        Returns:
+            A new DoG instance.
         """
         return cls(config)
 
@@ -225,7 +229,7 @@ class DoG(Preprocessor):
         return g_low - g_high
 
 
-class DoGConfig(PreprocessConfig):
+class DoGConfig(PreprocessorConfig):
     """Configuration for Difference of Gaussians (DoG) filtering operations.
 
     This configuration class defines parameters for applying Difference of Gaussians
@@ -245,7 +249,7 @@ class DoGConfig(PreprocessConfig):
 
 
 
-class Noise2StackConfig(PreprocessConfig):
+class Noise2StackConfig(PreprocessorConfig):
     """Configuration for Noise2Stack-inspired denoising operations.
 
     This configuration class defines parameters for temporal denoising using
@@ -406,3 +410,121 @@ class Noise2Stack(Preprocessor):
 
         return denoised
 
+
+class ResizeConfig(PreprocessorConfig):
+    """Configuration for image resizing operations.
+    
+    This configuration class defines parameters for resizing image stacks.
+    """
+    
+    width: Optional[int] = Field(
+        default=None, description="Target width in pixels (None to maintain aspect ratio)"
+    )
+    height: Optional[int] = Field(
+        default=None, description="Target height in pixels (None to maintain aspect ratio)"
+    )
+    order: int = Field(
+        default=1, description="Spline interpolation order (0=nearest, 1=bilinear, 3=cubic)"
+    )
+    preserve_range: bool = Field(
+        default=True, description="Preserve the original value range (True) or normalize to [0, 1] (False)"
+    )
+    anti_aliasing: bool = Field(
+        default=True, description="Apply anti-aliasing when downsampling"
+    )
+    
+    @field_validator("width", "height")
+    @classmethod
+    def validate_dimension(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v < 1:
+            raise ValueError("width and height must be >= 1 if specified")
+        return v
+    
+    @field_validator("order")
+    @classmethod
+    def validate_order(cls, v: int) -> int:
+        if v not in [0, 1, 3]:
+            raise ValueError("order must be 0 (nearest), 1 (bilinear), or 3 (cubic)")
+        return v
+    
+    @model_validator(mode="after")
+    def validate_dimensions(self) -> "ResizeConfig":
+        """Validate that at least one dimension is specified."""
+        if self.width is None and self.height is None:
+            raise ValueError("At least one of width or height must be specified")
+        return self
+
+
+class Resize(Preprocessor):
+    """Image resizer for image stacks.
+    
+    This class provides configurable resizing operations for image stacks,
+    supporting both upsampling and downsampling with various interpolation methods.
+    """
+    
+    def __init__(self, config: ResizeConfig):
+        """Initialize the resizer.
+        
+        Args:
+            config: Resize configuration.
+        """
+        super().__init__(config)
+    
+    @classmethod
+    def from_config(cls, config: ResizeConfig) -> "Resize":
+        """Create a Resize instance from a configuration.
+        
+        Args:
+            config: Resize configuration.
+            
+        Returns:
+            A new Resize instance.
+        """
+        return cls(config)
+    
+    def _process_slice(
+        self, slice: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs
+    ) -> np.ndarray:
+        """Resize a single slice.
+        
+        Args:
+            slice: Input slice.
+            metadata: Optional metadata (unused).
+            
+        Returns:
+            Resized slice.
+        """
+        original_shape = slice.shape
+        target_shape = list(original_shape)
+        
+        # Determine target shape
+        if self.config.width is not None and self.config.height is not None:
+            # Both specified: use both
+            target_shape[-2] = self.config.height  # Y dimension
+            target_shape[-1] = self.config.width   # X dimension
+        elif self.config.width is not None:
+            # Only width specified: maintain aspect ratio
+            aspect_ratio = original_shape[-1] / original_shape[-2]
+            target_shape[-1] = self.config.width
+            target_shape[-2] = int(self.config.width / aspect_ratio)
+        elif self.config.height is not None:
+            # Only height specified: maintain aspect ratio
+            aspect_ratio = original_shape[-1] / original_shape[-2]
+            target_shape[-2] = self.config.height
+            target_shape[-1] = int(self.config.height * aspect_ratio)
+        
+        # Resize the slice
+        resized = resize(
+            slice,
+            output_shape=tuple(target_shape),
+            order=self.config.order,
+            preserve_range=self.config.preserve_range,
+            anti_aliasing=self.config.anti_aliasing,
+        )
+        
+        # Preserve dtype if preserve_range is True
+        if self.config.preserve_range:
+            resized = resized.astype(slice.dtype, copy=False)
+        
+        logger.debug(f"Resized slice from {original_shape} to {resized.shape}")
+        return resized

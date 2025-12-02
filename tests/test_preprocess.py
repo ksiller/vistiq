@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 from vistiq.preprocess import (
-    PreprocessConfig,
+    PreprocessorConfig,
     Preprocessor,
     PreprocessChainConfig,
     PreprocessChain,
@@ -14,18 +14,18 @@ from vistiq.preprocess import (
 from vistiq.utils import ArrayIteratorConfig
 
 
-class TestPreprocessConfig:
-    """Tests for PreprocessConfig class."""
+class TestPreprocessorConfig:
+    """Tests for PreprocessorConfig class."""
 
     def test_default_config(self):
-        """Test default PreprocessConfig."""
-        config = PreprocessConfig()
+        """Test default PreprocessorConfig."""
+        config = PreprocessorConfig()
         assert config.normalize is True
         assert config.dtype is None
 
     def test_custom_config(self):
-        """Test custom PreprocessConfig."""
-        config = PreprocessConfig(normalize=False, dtype=np.uint8)
+        """Test custom PreprocessorConfig."""
+        config = PreprocessorConfig(normalize=False, dtype=np.uint8)
         assert config.normalize is False
         assert config.dtype == np.uint8
 
@@ -35,19 +35,19 @@ class TestPreprocessor:
 
     def test_initialization(self):
         """Test Preprocessor initialization."""
-        config = PreprocessConfig()
+        config = PreprocessorConfig()
         processor = Preprocessor(config)
         assert processor.config == config
 
     def test_from_config(self):
         """Test from_config class method."""
-        config = PreprocessConfig()
+        config = PreprocessorConfig()
         processor = Preprocessor.from_config(config)
         assert isinstance(processor, Preprocessor)
 
     def test_normalize_method(self, sample_2d_array):
         """Test normalize method."""
-        config = PreprocessConfig()
+        config = PreprocessorConfig()
         processor = Preprocessor(config)
         normalized = processor.normalize(sample_2d_array)
         assert normalized.dtype == np.float32
@@ -56,7 +56,7 @@ class TestPreprocessor:
 
     def test_normalize_constant_array(self):
         """Test normalize with constant array."""
-        config = PreprocessConfig()
+        config = PreprocessorConfig()
         processor = Preprocessor(config)
         constant_array = np.ones((10, 10), dtype=np.uint8) * 128
         normalized = processor.normalize(constant_array)
@@ -64,7 +64,7 @@ class TestPreprocessor:
 
     def test_run_with_normalize(self, sample_2d_array):
         """Test run with normalization enabled."""
-        config = PreprocessConfig(normalize=True)
+        config = PreprocessorConfig(normalize=True)
         processor = Preprocessor(config)
         # Since _process_slice is not implemented, this will raise NotImplementedError
         # But we can test the config
@@ -72,7 +72,7 @@ class TestPreprocessor:
 
     def test_run_without_normalize(self, sample_2d_array):
         """Test run without normalization."""
-        config = PreprocessConfig(normalize=False)
+        config = PreprocessorConfig(normalize=False)
         processor = Preprocessor(config)
         assert processor.config.normalize is False
 

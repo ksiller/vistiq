@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=analyze
-#SBATCH --output=analyze-%A-%a.log
-#SBATCH --error=analyze-%A-%a.err
+#SBATCH --job-name=preprocess
+#SBATCH --output=preprocess-%A-%a.log
+#SBATCH --error=preprocess-%A-%a.err
 #SBATCH --time=1:00:00
-#SBATCH --partition=gpu
-#SBATCH --gres=gpu:1
+#SBATCH --partition=standard
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --array=1-100%10
 
 set -e
 
@@ -42,8 +40,6 @@ fi
 # Get array task ID (support both SLURM and PBS)
 if [[ -n "$SLURM_ARRAY_TASK_ID" ]]; then
     TASK_ID=$SLURM_ARRAY_TASK_ID
-elif [[ -n "$PBS_ARRAYID" ]]; then
-    TASK_ID=$PBS_ARRAYID
 else
     echo "Warning: No array task ID found. Processing first file in list."
     TASK_ID=1
@@ -107,8 +103,7 @@ echo "Processing file: $input_file"
 
 module purge
 module load miniforge
-source activate /standard/vol191/siegristlab/software/vistiq-env
+source activate /standard/vol191/siegristlab/software/vistiq-env # replace with your own environment path
 
-# Run vistiq coincidence on the selected file
-export QT_QPA_PLATFORM=offscreen # for napari headless
-vistiq coincidence -i "$input_file" -o "$output_dir" --sigma-low 1.0 --sigma-high 12.0 --threshold 0.1 --method dice --mode outline --volume-lower 25 --volume-upper 5000 -l DEBUG
+# Run vistiq preprocess on the selected file
+vistiq preprocess -i "$input_file" -o "$output_dir" --sigma-low 1.0 --sigma-high 12.0 -l DEBUG --processes $SLURM_CPUS_PER_TASK
