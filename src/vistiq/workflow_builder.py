@@ -239,6 +239,10 @@ class ConfigArgumentBuilder:
             if field_name in base_fields:
                 continue
             
+            # Special handling for 'components' and 'step' fields - skip them, will be handled separately
+            if field_name == "components" or field_name == "step":
+                continue
+            
             # Check if field is marked for CLI exposure
             # Fields are included by default, unless explicitly excluded
             include_in_cli = True
@@ -275,14 +279,14 @@ class ConfigArgumentBuilder:
             field_type, is_optional = cls._get_field_type(field_info, field_name)
             default_value = cls._get_default_value(field_info)
             
-            # Handle nested Configuration fields - flatten them without prefix
-            # Special handling for fields like input_config that should be flattened
+            # Handle nested Configuration fields - use field name as prefix (Typer's default strategy)
             if inspect.isclass(field_type) and issubclass(field_type, Configuration):
-                # For nested configs, flatten their fields into the parent parser without prefix
-                # This makes fields like input_config.input_path available as --input-path directly
-                # Don't pass required parameter - let each nested field determine its own required status
-                # based on its own default value (handled inside add_config_arguments)
-                cls.add_config_arguments(parser, field_type, prefix="")
+                # For nested configs, use the field name as a prefix (e.g., input_config -> input-config-)
+                # This makes fields like input_config.input_path available as --input-config-input-path
+                nested_prefix = f"{prefix}{field_name}-" if prefix else f"{field_name}-"
+                # Convert underscores to hyphens for CLI argument names
+                nested_prefix = nested_prefix.replace("_", "-")
+                cls.add_config_arguments(parser, field_type, prefix=nested_prefix)
                 continue  # Skip adding the nested config itself as an argument
             
             arg_name = f"{prefix}{field_name}" if prefix else field_name
@@ -415,19 +419,61 @@ class ConfigArgumentBuilder:
         model_fields = config_class.model_fields
         
         for field_name, field_info in model_fields.items():
-            # Special handling for 'components' field - skip it here, will be handled separately
-            if field_name == "components":
+            # Special handling for 'components' and 'step' fields - skip them here, will be handled separately
+            if field_name == "components" or field_name == "step":
                 continue
             
             # Get field type to check if it's a nested Configuration
             field_type, _ = cls._get_field_type(field_info, field_name)
             
-            # Handle nested Configuration objects - reconstruct from flattened args
+            # Handle nested Configuration objects - reconstruct from prefixed args
             if inspect.isclass(field_type) and issubclass(field_type, Configuration):
-                # For nested configs, reconstruct from flattened arguments (no prefix)
-                # Fields from input_config are flattened directly, so we use empty prefix
-                nested_config = cls.build_config_from_args(args, field_type, prefix="")
-                config_dict[field_name] = nested_config
+                # For nested configs, use the field name as a prefix (e.g., loader -> loader-)
+                nested_prefix = f"{prefix}{field_name}-" if prefix else f"{field_name}-"
+                # Convert underscores to hyphens for CLI argument names
+                nested_prefix = nested_prefix.replace("_", "-")
+                
+                # Check if any arguments exist for this nested config
+                # Look for any attribute in args that starts with the nested prefix
+                has_nested_args = False
+                nested_prefix_underscore = nested_prefix.replace("-", "_")
+                for attr_name in dir(args):
+                    if not attr_name.startswith('_'):
+                        # Check if this attribute corresponds to a nested config argument
+                        if attr_name.startswith(nested_prefix_underscore):
+                            # Check if the value is not None
+                            try:
+                                value = getattr(args, attr_name, None)
+                                if value is not None:
+                                    has_nested_args = True
+                                    break
+                            except AttributeError:
+                                pass
+                
+                # Get field default and optional status
+                default_value = cls._get_default_value(field_info)
+                _, is_optional = cls._get_field_type(field_info, field_name)
+                
+                # Only build nested config if arguments are provided
+                if has_nested_args:
+                    try:
+                        nested_config = cls.build_config_from_args(args, field_type, prefix=nested_prefix)
+                        config_dict[field_name] = nested_config
+                    except Exception as e:
+                        # If building fails (e.g., required fields missing), use default or None
+                        logger.debug(f"Failed to build nested config {field_name}: {e}")
+                        if default_value is not ...:
+                            config_dict[field_name] = default_value
+                        elif is_optional:
+                            config_dict[field_name] = None
+                else:
+                    # No arguments provided for nested config
+                    # Use default if available, otherwise None (if optional) or skip (if required)
+                    if default_value is not ...:
+                        config_dict[field_name] = default_value
+                    elif is_optional:
+                        config_dict[field_name] = None
+                    # If required and no default, skip it - Pydantic will raise validation error
                 continue
             
             # For regular fields, try both the prefixed and non-prefixed argument names
@@ -520,40 +566,7 @@ class WorkflowBuilder:
         return configurable_class(config)
 
 
-def auto_register_configurables(modules: List[str]):
-    """Automatically register Configurable classes from specified modules.
-    
-    This function scans modules for classes that:
-    1. Inherit from Configurable
-    2. Have a corresponding *Config class that inherits from Configuration
-    
-    Args:
-        modules: List of module names to scan (e.g., ["vistiq.preprocess", "vistiq.seg"]).
-    """
-    import importlib
-    
-    for module_name in modules:
-        try:
-            module = importlib.import_module(module_name)
-            
-            # Find all Configurable classes
-            for name, obj in inspect.getmembers(module, inspect.isclass):
-                if (inspect.isclass(obj) and 
-                    issubclass(obj, Configurable) and 
-                    obj is not Configurable):
-                    
-                    # Look for corresponding Config class
-                    config_name = f"{name}Config"
-                    if hasattr(module, config_name):
-                        config_class = getattr(module, config_name)
-                        if inspect.isclass(config_class) and issubclass(config_class, Configuration):
-                            _registry.register(obj, config_class)
-                            logger.info(f"Registered {name} with {config_name}")
-        except ImportError as e:
-            logger.warning(f"Could not import module {module_name}: {e}")
-
-
-def auto_register_configurables_by_base_class(base_class: Type[Configurable], modules: Optional[List[str]] = None):
+def auto_register_configurables(base_class: Type[Configurable], modules: Optional[List[str]] = None):
     """Automatically register Configurable classes that inherit from a specific base class.
     
     This function scans modules for classes that:
@@ -561,7 +574,7 @@ def auto_register_configurables_by_base_class(base_class: Type[Configurable], mo
     2. Have a corresponding *Config class that inherits from Configuration
     
     Args:
-        base_class: Base class to filter by (e.g., Preprocessor, Segmenter, Trainer).
+        base_class: Base class to filter by (e.g., Preprocessor, Segmenter, Trainer, or Configurable for all).
         modules: Optional list of module names to scan. If None, will attempt to find
                 modules containing the base class.
     """

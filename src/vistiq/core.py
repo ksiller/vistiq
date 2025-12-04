@@ -316,8 +316,9 @@ class StackProcessorConfig(Configuration):
     output_type: Literal["stack", "list", "dataframe"] = "stack"
     output_shape: Optional[Tuple[int,...]] = None
     squeeze: bool = True
+    split_axis: Optional[Union[int, str]] = Field(default=None, description="Split stack along specified axis into separate files after processing")
     split_channels: bool = Field(
-        default=True, 
+        default=False, 
         description="Split channels into separate files after processing"
     )
     rename_channel: Optional[dict[str, str]] = Field(
@@ -368,7 +369,7 @@ class StackProcessor(Configurable):
         return cls(config)
 
     def run(
-        self, stack: np.ndarray, *args, workers: int = -1, verbose: int = 10, metadata: Optional[dict[str, Any]] = None, **kwargs) -> np.ndarray | tuple[Any,...]:
+        self, stack: np.ndarray, *args, workers: int = -1, verbose: int = 10, metadata: Optional[dict[str, Any]] = None, **kwargs) -> tuple[Any, Optional[dict[str, Any]]]:
         """Run the stack processor on an image.
 
         Args:
@@ -380,7 +381,7 @@ class StackProcessor(Configurable):
             **kwargs: Additional keyword arguments to pass to the processor.
 
         Returns:
-            Processed result array or tuple of lists depending on output_type.
+            Tuple of (processed result array or tuple of lists depending on output_type, updated metadata or None).
         """
         logger.info(f"Running {type(self).__name__} with config: {self.config}")
         iterator = ArrayIterator(stack, self.config.iterator_config)
@@ -397,7 +398,19 @@ class StackProcessor(Configurable):
             )
             # reshape results
             results = self._reshape_slice_results(results, slice_indices=iterator.indices, input_shape=stack.shape, output_shape=self.config.output_shape)
-        return results
+        updated_metadata = self._update_metadata(stack, results, *args, metadata=metadata, **kwargs)
+        return (results, updated_metadata)
+
+    def _update_metadata(self, stack, results, *args,metadata: Optional[dict[str, Any]] = None, **kwargs) -> Optional[dict[str, Any]]:
+        """Update the metadata with the current configuration.
+        
+        Args:
+            metadata: Optional metadata to pass to the processor.
+        """
+        if metadata is None or len(metadata) == 0:
+            return metadata
+        logger.info(f"Updating metadata {metadata}")
+        return metadata
 
     def _process_slice(
         self, slice: np.ndarray, *args, metadata: Optional[dict[str, Any]] = None, **kwargs) -> np.ndarray | tuple[Any,...]:

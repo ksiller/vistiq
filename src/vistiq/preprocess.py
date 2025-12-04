@@ -70,17 +70,20 @@ class Preprocessor(StackProcessor):
         logger.info(f"Normalized stack with shape {stack.shape}, min:max {stack_min}:{stack_max} -> {np.min(stack)}:{np.max(stack)}")
         return stack.astype(np.float32, copy=False)
 
-    def run(self, stack: np.ndarray, *args, workers: int = -1, verbose: int = 10, metadata: Optional[dict[str, Any]] = None, **kwargs) -> np.ndarray:
+    def run(self, stack: np.ndarray, *args, workers: int = -1, verbose: int = 10, metadata: Optional[dict[str, Any]] = None, **kwargs) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
         """Run the preprocess chain on an image stack.
 
         Args:
             stack: Input image stack.
             metadata: Optional metadata to pass to the processor.
             **kwargs: Additional keyword arguments to pass to the processor.
+            
+        Returns:
+            Tuple of (processed image stack, updated metadata or None).
         """
         input_dtype = stack.dtype
         logger.info(f"Running preprocessor {self.__class__.__name__}, on stack of type {input_dtype}, {np.issubdtype(input_dtype, np.integer)}")
-        preprocessed = super().run(stack, *args, workers=workers, verbose=verbose, metadata=metadata, **kwargs)
+        preprocessed, updated_metadata = super().run(stack, *args, workers=workers, verbose=verbose, metadata=metadata, **kwargs)
 
         # normalize
         if self.config.normalize:
@@ -127,7 +130,7 @@ class Preprocessor(StackProcessor):
         
         preprocessed = preprocessed.astype(dtype, copy=False)
         
-        return preprocessed
+        return (preprocessed, updated_metadata)
 
 class PreprocessChainConfig(Configuration):
     """Configuration for chain of preprocessors.
@@ -164,13 +167,16 @@ class PreprocessChain(Configurable):
         return cls(config)
 
 
-    def run(self, stack: np.ndarray, *args, workers: int = -1, verbose: int = 10, metadata: Optional[dict[str, Any]] = None, **kwargs) -> np.ndarray:
+    def run(self, stack: np.ndarray, *args, workers: int = -1, verbose: int = 10, metadata: Optional[dict[str, Any]] = None, **kwargs) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
         """Run the preprocess chain on an image stack.
 
         Args:
             stack: Input image stack.
             metadata: Optional metadata to pass to the processor.
             **kwargs: Additional keyword arguments to pass to the processor.
+            
+        Returns:
+            Tuple of (processed image stack, updated metadata or None).
         """
         return super().run(stack, *args, workers=workers, verbose=verbose)
 
@@ -362,7 +368,7 @@ class Noise2Stack(Preprocessor):
 
         return denoised
 
-    def run(self, stack: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs) -> np.ndarray:
+    def run(self, stack: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
         """Denoise an image stack by averaging temporal neighbors.
 
         This implements a simple, non-learning variant inspired by the Noise2Stack idea:
@@ -373,9 +379,11 @@ class Noise2Stack(Preprocessor):
         Args:
             stack: Input stack with time as first axis. Shapes supported:
                 (T, H, W) or (T, H, W, C).
+            metadata: Optional metadata to pass to the processor.
+            **kwargs: Additional keyword arguments to pass to the processor.
 
         Returns:
-            Denoised stack with the same shape and dtype as the input.
+            Tuple of (denoised stack with the same shape and dtype as the input, updated metadata or None).
 
         Raises:
             ValueError: If configuration parameters are invalid.
@@ -408,7 +416,7 @@ class Noise2Stack(Preprocessor):
         else:
             denoised = denoised.astype(input_dtype, copy=False)
 
-        return denoised
+        return (denoised, metadata)
 
 
 class ResizeConfig(PreprocessorConfig):
@@ -513,13 +521,16 @@ class Resize(Preprocessor):
         logger.debug(f"Resized slice from {original_shape} to {resized.shape}")
         return resized
 
-    def run(self, stack: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs) -> np.ndarray:
+    def run(self, stack: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
         """Resize an image stack.
         
         Args:
             stack: Input stack.
             metadata: Optional metadata to pass to the processor.
             **kwargs: Additional keyword arguments to pass to the processor.
+            
+        Returns:
+            Tuple of (resized stack, updated metadata or None).
         """
         # Determine target shape
         original_shape = stack.shape

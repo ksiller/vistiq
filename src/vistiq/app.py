@@ -31,9 +31,9 @@ from .workflow_builder import (
     get_registry,
     ConfigArgumentBuilder,
     WorkflowBuilder,
-    auto_register_configurables,
-    auto_register_configurables_by_base_class
+    auto_register_configurables
 )
+from .core import Configurable
 from .utils import (
     load_mp4,
     check_device,
@@ -887,7 +887,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # Auto-register components and add their arguments dynamically
-    auto_register_configurables([
+    auto_register_configurables(Configurable, [
         "vistiq.preprocess",
         "vistiq.seg",
         "vistiq.analysis",
@@ -1024,7 +1024,7 @@ def _build_subcommand_component_registry() -> dict[str, list[type]]:
     import importlib
     
     # Auto-register components to ensure registry is populated
-    auto_register_configurables([
+    auto_register_configurables(Configurable, [
         "vistiq.preprocess",
         "vistiq.seg",
         "vistiq.analysis",
@@ -1158,7 +1158,7 @@ def run_segment(config: CLISegmentConfig, args: Optional[argparse.Namespace] = N
         
         # Auto-register available components
         from .seg import Segmenter
-        auto_register_configurables_by_base_class(Segmenter)
+        auto_register_configurables(Segmenter)
         
         # Build workflow builder
         builder = WorkflowBuilder()
@@ -1380,7 +1380,7 @@ def run_segment(config: CLISegmentConfig, args: Optional[argparse.Namespace] = N
         
         # Auto-register available components
         from .seg import Segmenter
-        auto_register_configurables_by_base_class(Segmenter)
+        auto_register_configurables(Segmenter)
         
         # Build workflow builder
         builder = WorkflowBuilder()
@@ -1557,7 +1557,7 @@ def run_train(config: CLITrainConfig, args: Optional[argparse.Namespace] = None)
         
         # Auto-register available components
         from .train import Trainer
-        auto_register_configurables_by_base_class(Trainer)
+        auto_register_configurables(Trainer)
         
         # Build workflow builder
         builder = WorkflowBuilder()
@@ -1787,7 +1787,7 @@ def run_workflow(config: CLIAppConfig, args: argparse.Namespace) -> None:
         args: Parsed command-line arguments with workflow component specifications.
     """
     # Auto-register available components
-    auto_register_configurables([
+    auto_register_configurables(Configurable, [
         "vistiq.preprocess",
         "vistiq.seg",
         "vistiq.analysis",
@@ -1871,7 +1871,7 @@ def main() -> None:
         
         if base_class:
             # Auto-register components
-            auto_register_configurables_by_base_class(base_class)
+            auto_register_configurables(base_class)
             registry = get_registry()
             
             # Create a temporary parser for component arguments

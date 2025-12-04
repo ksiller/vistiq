@@ -1,8 +1,8 @@
 """CLI configuration models for vistiq command-line interface."""
 
 import sys
-import argparse
 import logging
+import json
 import numpy as np
 import os
 from pathlib import Path
@@ -18,14 +18,34 @@ except ImportError:
     OME_TIFF_AVAILABLE = False
     OmeTiffWriter = None
 
-from .core import cli_config, Configuration, Configurable
-from .io import DataLoaderConfig, ImageLoaderConfig, FileListConfig, FileList
+from .core import cli_config, Configuration, Configurable 
+from .io import DataLoaderConfig, ImageLoaderConfig, ImageLoader,ImageWriter, FileListConfig, FileList, DataWriterConfig, ImageWriterConfig
 from .preprocess import PreprocessorConfig, Preprocessor
-from .workflow_builder import ConfigArgumentBuilder, WorkflowBuilder, get_registry, auto_register_configurables_by_base_class
+from .workflow_builder import ConfigArgumentBuilder, WorkflowBuilder, get_registry, auto_register_configurables
 from .utils import load_image, get_scenes
 # from .app import configure_logger
 
 logger = logging.getLogger(__name__)
+
+
+def _register_all_configurables() -> None:
+    """Register all Configurable classes from all modules in a single place.
+    
+    This function should be called once at module import time to ensure all
+    Configurable classes and their Configuration classes are available in the registry.
+    """
+    auto_register_configurables(Configurable, [
+        "vistiq.io",          # FileList, DataLoader, ImageLoader, DataWriter, ImageWriter
+        "vistiq.preprocess",  # Preprocessor classes
+        "vistiq.seg",         # Segmenter classes
+        "vistiq.analysis",    # Analysis classes
+        "vistiq.train",       # Trainer classes
+        "vistiq.core",        # Core classes
+    ])
+
+
+# Register all configurables once at module import time
+_register_all_configurables()
 
 
 def parse_substack(substack: Optional[str]) -> tuple[Optional[int], Optional[int]]:
@@ -107,33 +127,39 @@ class CLISubcommandConfig(CLIAppConfig):
     """Base configuration for all vistiq subcommands.
     
     Extends CLIAppConfig with subcommand-specific options including input/output
-    configuration and component chains.
+    configuration and processing step chains.
     
     Attributes:
         input_config: Configuration for input data loading.
-        output_path: Path to output file or directory. Defaults to current directory.
-        component: List of processing component configurations to run in sequence.
+        output: Configuration for output data writing (DataWriterConfig). Defaults to None.
+        step: List of processing step configurations to run in sequence.
     """
-    input_config: DataLoaderConfig = Field(
-        description="Input file or directory path"
+    input: Optional[FileListConfig] = Field(
+        default=None, description="Configuration for collecting input file(s) or directories"
     )
-    output_path: Optional[Path] = Field(
-        default=None, description="Output file or directory path"
+    loader: Optional[DataLoaderConfig] = Field(
+        default_factory=DataLoaderConfig, description="Configuration to specify the data loader to use"
+    )
+    output: Optional[DataWriterConfig] = Field(
+        default=None, description="Configuration for output data writing"
     )
     #substack: Optional[str] = Field(
     #    default=None, description="Substack to process. Legacy: '10' or '2-40' (first axis). New: 'T:4-10,Z:2-20' (multiple dimensions)"
     #)
-    component: list[PreprocessorConfig] = Field(
+    step: Optional[list[Configuration]] = Field(
         default=None, description="Configs for chain of processing components to run"
     )
 
-    @field_validator("component")
+    @field_validator("step")
     @classmethod
-    def validate_component(cls, v: Optional[list[PreprocessorConfig]]) -> Optional[list[PreprocessorConfig]]:
-        """Validate that components are valid.
+    def validate_step(cls, v: Optional[list[Configuration]]) -> Optional[list[Configuration]]:
+        """Validate that processing steps are valid.
         
         Args:
-            v: Components to validate.
+            v: Step configurations to validate.
+            
+        Returns:
+            Validated list of step configurations, or None.
         """
         return v
 
@@ -147,23 +173,34 @@ class CLIPreprocessorConfig(CLISubcommandConfig):
     Attributes:
         input_config: Configuration for input image loading (ImageLoaderConfig).
         component: List of preprocessing component configurations to run in sequence.
+                  Note: This field is specific to CLIPreprocessorConfig, while the parent
+                  class CLISubcommandConfig uses 'step' for general processing steps.
     """
-    input_config: ImageLoaderConfig = Field(
-        default=None, description="Configuration for input data loading"
+    loader: Optional[ImageLoaderConfig] = Field(
+        default_factory=ImageLoaderConfig, description="Configuration for input data loading"
     )
-    component: list[PreprocessorConfig] = Field(
+    step: Optional[list[PreprocessorConfig]] = Field(
         default=None, description="Configs for chain of preprocessing components to run"
     )
+    output: Optional[ImageWriterConfig] = Field(
+        default_factory=ImageWriterConfig, description="Configuration for output data writing"
+    )
 
-    @field_validator("component")
+    @field_validator("step")
     @classmethod
-    def validate_components(cls, v: Optional[list[PreprocessorConfig]]) -> Optional[list[PreprocessorConfig]]:
-        """Validate that components are valid.
+    def validate_step(cls, v: Optional[list[PreprocessorConfig]]) -> Optional[list[PreprocessorConfig]]:
+        """Validate that steps are valid.
         
         Args:
-            v: Components to validate.
+            v: Steps to validate.
         """
         return v
+
+
+# Rebuild models to resolve forward references and Literal types
+# This is needed when using Literal types or forward references in nested configs
+CLISubcommandConfig.model_rebuild()
+CLIPreprocessorConfig.model_rebuild()
 
 
 # Create Typer app
@@ -171,93 +208,11 @@ class CLIPreprocessorConfig(CLISubcommandConfig):
 # We also need to handle component arguments specially to avoid ambiguity
 app = typer.Typer(
     name="vistiq",
-    help="Turn complex imaging data into quantitative insight with modular, multi-step analysis.",
+    help="Turn complex imaging data into quantitative insight with modular, multi-step hierarchical segmentation and spatio-temporal analysis.",
     no_args_is_help=True,
     add_completion=False,  # Disable shell completion to avoid conflicts with dynamic component arguments
     chain=True,  # Allow chaining commands (though we don't use it, it helps with argument parsing)
 )
-
-
-def _build_component_configs(component: List[str]) -> list[Configuration]:
-    """Build component configuration objects from component names and CLI arguments.
-    
-    Parses component-specific arguments from sys.argv with prefixes (e.g., --component0-sigma-low)
-    and builds corresponding Configuration objects for each component.
-    
-    Args:
-        component: List of component names to build configurations for.
-        
-    Returns:
-        List of Configuration objects, one for each component specified.
-    """
-    registry = get_registry()
-    # Use allow_abbrev=False to prevent argparse from matching --component to --component0-*
-    component_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-    for i, component_name in enumerate(component):
-        configurable_class = registry.get_configurable_class(component_name)
-        if configurable_class:
-            actual_name = configurable_class.__name__
-            config_class_name = f"{actual_name}Config"
-            config_class = registry.get_config_class(config_class_name)
-            if config_class:
-                # Always use prefix format for consistency, even with single component
-                prefix = f"component{i}-"
-                ConfigArgumentBuilder.add_config_arguments(
-                    component_parser,
-                    config_class,
-                    prefix=prefix
-                )
-    # Parse component arguments
-    # Use original argv (before Typer filtering) to get component-specific arguments
-    # This avoids Typer's ambiguity detection (we use --step instead of --component for the main option)
-    import vistiq.cli as cli_module
-    original_argv = getattr(cli_module, '_ORIGINAL_ARGV', sys.argv)
-    cmd_idx = original_argv.index("preprocess") if "preprocess" in original_argv else 1
-    # Only parse arguments that look like component arguments (--component0-*, --component1-*, etc.)
-    # or are values for component arguments
-    component_argv = []
-    i = cmd_idx + 1
-    while i < len(original_argv):
-        arg = original_argv[i]
-        # Include component-specific arguments (--component0-*, --component1-*, etc.)
-        # but exclude --step itself (which Typer handles)
-        if arg.startswith("--component") and len(arg) > 11 and arg[11].isdigit():
-            # This is a component-specific arg like --component0-sigma-low
-            component_argv.append(arg)
-            i += 1
-            # Include the next argument if it doesn't start with - (it's a value)
-            if i < len(original_argv) and not original_argv[i].startswith("-"):
-                component_argv.append(original_argv[i])
-                i += 1
-        elif arg.startswith("--component") and ("." in arg or (len(arg) > 12 and arg[12] in ["-", "."])):
-            # Handle --component0.xxx or --component0-xxx patterns
-            component_argv.append(arg)
-            i += 1
-            if i < len(original_argv) and not original_argv[i].startswith("-"):
-                component_argv.append(original_argv[i])
-                i += 1
-        else:
-            i += 1
-    
-    component_args, _ = component_parser.parse_known_args(component_argv)
-    
-    # Build component configs
-    component_configs = []
-    for i, component_name in enumerate(component):
-        configurable_class = registry.get_configurable_class(component_name)
-        if configurable_class:
-            actual_name = configurable_class.__name__
-            config_class_name = f"{actual_name}Config"
-            config_class = registry.get_config_class(config_class_name)
-            if config_class:
-                # Always use prefix format for consistency, even with single component
-                prefix = f"component{i}-"
-                component_config = ConfigArgumentBuilder.build_config_from_args(
-                    component_args, config_class, prefix=prefix
-                )
-                component_configs.append(component_config)
-
-    return component_configs
 
 
 def _infer_dim_order(ndim: int) -> str:
@@ -355,23 +310,23 @@ def substack_to_slices(substack: Optional[str]) -> Optional[dict[str, slice]]:
 def build_component_chain(
     component_configs: Optional[list[Configuration]] = None,
 ) -> tuple[list[str], list[Configurable]]:
-    """Build a chain of components from their configuration objects.
+    """Build a chain of processing steps from their configuration objects.
     
-    Takes a list of component configuration objects, looks up their corresponding
+    Takes a list of step configuration objects, looks up their corresponding
     Configurable classes from the registry, and instantiates them to create a
     processing chain.
     
     Args:
-        component_configs: Optional list of component configuration objects.
+        component_configs: Optional list of step configuration objects.
                           If None or empty, returns empty lists.
         
     Returns:
         Tuple of (component_names, built_components) where:
-        - component_names: List of component class names as strings
-        - built_components: List of instantiated Configurable component objects
+        - component_names: List of step class names as strings
+        - built_components: List of instantiated Configurable step objects
         
     Raises:
-        Exception: If a component cannot be built from its configuration.
+        Exception: If a step cannot be built from its configuration.
     """
     # Build workflow builder
     builder = WorkflowBuilder()
@@ -434,91 +389,242 @@ def common_callback(
     ctx.params["processes"] = processes
     
 
+def cli_to_config(value: str, default_value_field:str="classname", alt_classname:str=None) -> Configuration:
+    """Convert a CLI string (component name or JSON) to a Configuration.
+    
+    This function can handle two formats:
+    1. Component name string (e.g., "DoG", "Resize") - creates a default config
+    2. JSON string (e.g., '{"classname": "DoG", "sigma_low": 1.0}') - uses Pydantic's model_validate_json
+    
+    The actual configuration values can also be provided via component-specific 
+    arguments (e.g., --component0-sigma-low).
+    
+    Args:
+        value: Component name string or JSON string with classname and config values.
+        
+    Returns:
+        Configuration instance for the specified component.
+        
+    Raises:
+        ValueError: If the component name is not found in the registry or JSON is invalid.
+    """
+    logger.debug(f"cli_to_config received: {value!r}")
+    
+    if not value or not isinstance(value, str):
+        raise ValueError(f"Component name must be a non-empty string, got: {value!r}")
+    
+    registry = get_registry()
+    
+    # Try to parse as JSON first
+    config_dict = {}
+    try:
+        parsed = json.loads(value)
+        if isinstance(parsed, dict):
+            config_dict = parsed.copy()  # Use a copy to avoid modifying the original
+            logger.debug(f"Parsed JSON dict: {config_dict}")
+        else:
+            # JSON parsed but not a dict, treat as plain string
+            config_dict = {default_value_field: value}
+            logger.debug(f"JSON parsed but not a dict, treating as plain string")
+    except (json.JSONDecodeError, ValueError) as e:
+        # Not valid JSON, treat as plain component name string
+        config_dict = {default_value_field: value}
+        logger.debug(f"Not valid JSON (error: {e}), treating as plain string")
+    
+    # Set classname if alt_classname is provided (overwrites any existing classname in the dict)
+    if alt_classname is not None:
+        config_dict["classname"] = alt_classname
+        logger.debug(f"Set classname to {alt_classname}")
+    
+    config_class_name = config_dict.get("classname")
+    logger.debug(f"Final config_dict={config_dict}, config_class_name={config_class_name}")
+    
+    if config_class_name is None:
+        raise ValueError("Config dict must contain 'classname' field")
+    
+    # Get the Config class from the registry
+    config_class = registry.get_config_class(config_class_name)
+    
+    # If not found in registry, try to get it from configurable class name
+    if config_class is None:
+        # Try treating config_class_name as a configurable class name (e.g., "DoG" -> "DoGConfig")
+        configurable_class = registry.get_configurable_class(config_class_name)
+        if configurable_class is not None:
+            configurable_name = configurable_class.__name__
+            config_class_name = f"{configurable_name}Config"
+            config_class = registry.get_config_class(config_class_name)
+    
+    if config_class is None:
+        raise ValueError(f"Config class '{config_class_name}' not found in registry. Available configs: {registry.list_configs()}")
+    
+    try:
+        # Use Pydantic's model_validate to create the config instance from dict
+        logger.debug(f"Using config_class={config_class}, type={type(config_class)}")
+        config = config_class.model_validate(config_dict)
+        logger.debug(f"Created {config_class_name} instance using model_validate")
+        return config
+    except Exception as e:
+        logger.error(f"Failed to create {config_class_name} using model_validate: {e}")
+        raise ValueError(f"Failed to create configuration for '{config_class_name}': {e}") from e
+
+def cli_to_filelist_config(value: str) -> FileListConfig:
+    """Convert a CLI string (path or comma-separated paths) to a FileListConfig.
+    
+    Args:
+        value: Path string or comma-separated paths. Paths with spaces must be quoted in the shell.
+        
+    Returns:
+        FileListConfig instance with the provided paths.
+        
+    Raises:
+        ValueError: If the value cannot be parsed as a valid path.
+    """
+    return cli_to_config(value, default_value_field="paths", alt_classname="FileListConfig")
+
+
+def cli_to_imageloader_config(value: str) -> ImageLoaderConfig:
+    """Convert a CLI string (path) to an ImageLoaderConfig.
+    
+    Args:
+        value: Path string for the image loader. Paths with spaces should be quoted.
+        
+    Returns:
+        ImageLoaderConfig instance with the provided path.
+        
+    Raises:
+        ValueError: If the value cannot be parsed as a valid path.
+    """
+    #substack_str = value.get("substack", None)
+    # substack_slices = substack_to_slices(substack_str if substack_str else None)
+    return cli_to_config(value, default_value_field="classname", alt_classname="ImageLoaderConfig")
+
+
+
+def cli_to_component_config(value: str) -> Configuration:
+    """Convert a CLI string (component name or JSON) to a Configuration.
+    
+    This function can handle two formats:
+    1. Component name string (e.g., "DoG", "Resize") - creates a default config
+    2. JSON string (e.g., '{"classname": "DoG", "sigma_low": 1.0}') - uses Pydantic's model_validate_json
+    
+    The actual configuration values can also be provided via component-specific 
+    arguments (e.g., --component0-sigma-low).
+    
+    Args:
+        value: Component name string or JSON string with classname and config values.
+        
+    Returns:
+        Configuration instance for the specified component.
+        
+    Raises:
+        ValueError: If the component name is not found in the registry or JSON is invalid.
+    """
+    return cli_to_config(value)
+
+
+
+def cli_to_imagewriter_config(value: str) -> ImageWriterConfig:
+    """Convert a CLI string (output path) to an ImageWriterConfig.
+    
+    Args:
+        value: Output path string. Paths with spaces must be quoted in the shell.
+        
+    Returns:
+        ImageWriterConfig instance with the provided path.
+        
+    Raises:
+        ValueError: If the value cannot be parsed as a valid path.
+    """
+    return cli_to_config(value, default_value_field="path", alt_classname="ImageWriterConfig")
+
 @app.command("preprocess")
 def preprocess_cmd(
     ctx: Context,
-    input_path: Path = Option(..., "--input", "-i", help="Input file or directory path"),
-    output_path: Optional[Path] = Option(None, "--output", "-o", help="Output file or directory path"),
-    component: Optional[List[str]] = Option(None, "--step", "-s", help="Processing step/component to include (can be specified multiple times). Use --step NAME to add a component."),
+    input: Optional[FileListConfig] = Option(None, "--input", "-i", help="Input file or directory configuration", parser=cli_to_filelist_config),
+    loader: Optional[ImageLoaderConfig] = Option(None, "--loader", help="Configuration to specify the data loader to use", parser=cli_to_imageloader_config),
+    step: List[PreprocessorConfig] = Option(None, "--step", "-s", help="Processing step/component to include (can be specified multiple times). Use --step NAME to add a step.", parser=cli_to_component_config),
+    output: Optional[ImageWriterConfig] = Option(None, "--output", "-o", help="Output file or directory configuration", parser=cli_to_imagewriter_config),
 ) -> None:
-    """Preprocess images with a chain of preprocessing components.
+    """Preprocess images with a chain of preprocessing steps.
+    
+    Processes images through a sequence of preprocessing steps (e.g., denoising, resizing).
+    Each step can be configured with step-specific arguments using the --component{i}-* prefix.
+    
+    Input and output can be specified either directly or using nested config options:
+    - Direct: --input path/to/file (uses parser to create FileListConfig)
+    - Nested: --input-paths path/to/file (uses Typer's default prefix strategy)
+    - Direct: --output path/to/output (uses parser to create ImageWriterConfig)
+    - Nested: --output-path path/to/output (uses Typer's default prefix strategy)
     
     Examples:
-        vistiq preprocess -i input.tif -o output --step DoG --component0-sigma-low 1.0 --component0-sigma-high 12.0
-        vistiq preprocess -i input.tif --step DoG --step OtsuThreshold --component0-sigma-low 1.0 --component1-threshold 0.5
+        vistiq preprocess --input input.tif --output output --step DoG --component0-sigma-low 1.0
+        vistiq preprocess --input input.tif --step Resize --component0-width 256 --component0-height 256 --step DoG --component1-sigma-low 1.0
     """
-    # Build component configs if components are specified
-    component_configs = None
-    if component:
-        auto_register_configurables_by_base_class(Preprocessor)
-        
-        # Parse component arguments from sys.argv with prefixes
-        # We need to filter out component-specific args from sys.argv before passing to argparse
-        # to avoid Typer's ambiguity detection
-        component_configs = _build_component_configs(component)
-        
-    
-    # Build complete CLIPreprocessorConfig with all fields including CLIAppConfig fields
-    logger.info(f"Input path: {type(input_path)}")
-    fconfig = FileListConfig(input_paths=input_path)
-    flist, metadata = FileList(fconfig).run()
-    for f in flist:
-        logger.info(f"Found file: {f}")
-    if not flist:
-        raise ValueError(f"No files found for input path: {input_path}")
-    first_file = flist[0]
-    logger.info(f"Found {len(flist)} files, only using the first one: {first_file}")
-    config = CLIPreprocessorConfig(
-        loglevel=ctx.params.get("loglevel", "INFO"),
-        device=ctx.params.get("device", "auto"),
-        processes=ctx.params.get("processes", 1),
-        input_config=ImageLoaderConfig(input_path=first_file),
-        output_path=output_path,
-        component=component_configs,
-    )
-    
+    logger.info(f"CLI input: {input}")
+    logger.info(f"CLI loader: {loader}")
+    logger.info(f"CLI component: {step}")
+    logger.info(f"CLI output: {output}")
+
+    # Only pass loader/output if they're not None, otherwise use defaults from default_factory
+    config_kwargs = {"input": input, "step": step}
+    if loader is not None:
+        config_kwargs["loader"] = loader
+    if output is not None:
+        config_kwargs["output"] = output
+    config = CLIPreprocessorConfig(**config_kwargs)
+
     # Call run_preprocess with the complete CLIPreprocessorConfig
-    run_preprocess(config)
+    run_preprocess(config, ctx)
 
 
-def run_preprocess(config: CLIPreprocessorConfig) -> None:
+def run_preprocess(config: CLIPreprocessorConfig, ctx: Context) -> None:
     """Run the preprocess command.
     
-    Processes images through a chain of preprocessing components, handling multiple
+    Processes images through a chain of preprocessing steps, handling multiple
     scenes and channels. Saves preprocessed images as OME-TIFF files with metadata.
 
     Args:
-        config: Preprocess configuration containing input/output paths, component
-                configurations, and processing parameters.
+        config: Preprocess configuration containing input/output configuration,
+                step configurations, and processing parameters.
                 
     The function:
-    1. Builds component chain from configuration
+    1. Builds processing step chain from configuration
     2. Loads images from input path (supports multiple scenes)
-    3. Processes each channel through the component chain
+    3. Processes each channel through the step chain
     4. Saves preprocessed images to output directory with metadata
     """
     logger.info(f"Running preprocess command with config: {config}")
     
-    # Auto-register available components
-    auto_register_configurables_by_base_class(Preprocessor)
-    
+    # Build FileList from config and get files
+    file_list = FileList(config.input).run()
+    if not file_list:
+        raise ValueError("No files found for input path: {config.input.paths}")
+    first_file = file_list[0]
+    logger.info(f"Found {len(file_list)} files, using the first one: {first_file}")
+
     # Build component chain from config
-    component_names, built_components = build_component_chain(config.component)
+    component_names, built_components = build_component_chain(config.step)
     
     # Get absolute path of input and strip extension for output directory
-    input_path = config.input_config.input_path
+    input_path = first_file
     input_path_obj = Path(input_path).resolve()
     input_path_str = str(input_path)
     
     # Determine output directory (defaults to current directory if not specified)
-    output_base = Path(config.output_path or Path.cwd()).resolve()
+    if config.output and config.output.path:
+        output_base = Path(config.output.path).resolve()
+    else:
+        output_base = Path.cwd().resolve()
     
     scenes = get_scenes(input_path_str)
     for idx, sc in enumerate(scenes):
         logger.info(f"Processing scene: {sc}")
         # Load image with substack slicing if specified
-        substack_slices = substack_to_slices(config.input_config.substack if config.input_config else None)
-        img, metadata = load_image(input_path_str, scene_index=idx, substack=substack_slices, squeeze=True, rename_channel=config.input_config.rename_channel if config.input_config else None)
+        
+        loader_config = config.loader.copy(update={"scene_index": idx})
+        img, metadata = ImageLoader(loader_config).run(path=first_file)
+
+        #img, metadata = load_image(input_path_str, scene_index=idx, substack=substack_slices, squeeze=True, rename_channel=config.loader.rename_channel if config.loader else None)
         channel_names = metadata["channel_names"]
         
         ishape = str(img.shape).replace(" ", "")
@@ -526,78 +632,32 @@ def run_preprocess(config: CLIPreprocessorConfig) -> None:
         output_dir = output_base / input_path_obj.stem / f"{sc}-{ishape}-{component_names_str}"
         os.makedirs(output_dir, exist_ok=True)
         logger.info(f"Output directory: {output_dir}")
-    
-        img_ch = np.unstack(img, axis=0)
-        logger.info(f"Image shape: {img.shape}, channel names: {channel_names}, metadata: {metadata}")
-        for im in img_ch:
-            logger.debug(f"Channel shape: {im.shape}")
 
-        preprocessed_ch = []
-        output_paths = []
-        for ch_name, im in zip(channel_names, img_ch):
-            logger.info(f"{''.join(metadata["used_scale"]._fields)}")
-            # Run components in sequence
-            result = im
-            for i, component in enumerate(built_components):
-                logger.info(f"Running component {i+1}/{len(built_components)}: {component.name()} on channel {ch_name}")
-                result = component.run(result, workers=config.processes)
-            
-            output_path = output_dir / f"Preprocessed_{ch_name}.tif"
-            preprocessed_ch.append(result)
-            output_paths.append(output_path)
+        logger.info(f"Image shape: {img.shape}, channel names: {channel_names}, metadata: {metadata}")
+
+        result = img
+        result_metadata = metadata
+        for i, component in enumerate(built_components):
+            logger.info(f"Running component {i+1}/{len(built_components)}: {component.name()}")
+            result, result_metadata = component.run(result, workers=config.processes, metadata=result_metadata)
         
-        split_channels = config.input_config.split_channels if config.input_config else True
-        if split_channels:
-            for preprocessed, output_path, ch_name in zip(preprocessed_ch, output_paths, channel_names):
-                OmeTiffWriter.save(preprocessed, str(output_path), physical_pixel_sizes=metadata["used_scale"], channel_names=[ch_name], dim_order=_infer_dim_order(preprocessed.ndim))
-        else:
-            preprocessed = np.stack(preprocessed_ch, axis=0)
-            output_path = output_dir / f"Preprocessed-{"-".join(channel_names)}.tif"
-            OmeTiffWriter.save(preprocessed, str(output_path), physical_pixel_sizes=metadata["used_scale"], channel_names=channel_names, dim_order=_infer_dim_order(preprocessed.ndim))
+        result_metadata.update({"dim_order":_infer_dim_order(result.ndim)})
+        logger.info(f"Result shape: {result.shape}, metadata: {result_metadata}")
+        logger.info(f"Channel axis: {result_metadata.get('channel_axis', None)}")
+        logger.info(f"result metadata: {result_metadata}")
+        imgwriter = ImageWriter(config.output)
+        #preprocessed = np.stack(result, axis=0)
+        output_path = output_dir / f"Preprocessed.tif"
+        #OmeTiffWriter.save(preprocessed, str(output_path), physical_pixel_sizes=metadata["used_scale"], channel_names=channel_names, dim_order=_infer_dim_order(preprocessed.ndim))
+        imgwriter.run(result, output_path, metadata=result_metadata)
 
 def main() -> None:
     """Entry point for the vistiq CLI using Typer.
     
     This function is called when vistiq is invoked from the command line.
     It delegates to the Typer app which handles argument parsing and command routing.
-    
-    Before invoking Typer, we filter out component-specific arguments (--component0-*, etc.)
-    to prevent Typer from complaining about unknown arguments. These are parsed separately
-    by our custom argparse parser in the command functions.
     """
-    # Store original argv - we'll need it for parsing component arguments
-    _original_argv = sys.argv[:]
-    
-    # Filter out component-specific arguments before Typer sees them
-    # This prevents "No such option" errors for --component0-*, --component1-*, etc.
-    filtered_argv = [_original_argv[0]]  # Keep script name
-    
-    i = 1
-    while i < len(_original_argv):
-        arg = _original_argv[i]
-        # Keep all arguments except component-specific ones (--component0-*, --component1-*, etc.)
-        if not (arg.startswith("--component") and len(arg) > 11 and arg[11].isdigit()):
-            filtered_argv.append(arg)
-            i += 1
-        else:
-            # Skip component-specific arguments (we'll parse them ourselves in the command function)
-            i += 1
-            # Skip the value if it's not another option
-            if i < len(_original_argv) and not _original_argv[i].startswith("-"):
-                i += 1
-    
-    # Temporarily replace sys.argv for Typer's parsing
-    sys.argv = filtered_argv
-    
-    # Store original argv in a module-level variable so command functions can access it
-    import vistiq.cli as cli_module
-    cli_module._ORIGINAL_ARGV = _original_argv
-    
-    try:
-        app()
-    finally:
-        # Restore original argv
-        sys.argv = _original_argv
+    app()
 
 
 if __name__ == "__main__":
