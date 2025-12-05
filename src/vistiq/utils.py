@@ -783,168 +783,503 @@ def _collect_tif_files(
     return collected
 
 
-def find_matching_file_pairs(
-    path_a: Path,
-    path_b: Path,
-    patterns: Optional[Tuple[Optional[FilePattern], Optional[FilePattern]]] = None,
-    exclude: Optional[List[str]] = None,
-) -> List[Tuple[Path, Path]]:
-    """Find matching files between two directory trees.
+def _matches_pattern(file_path: Path, pattern: Optional[FilePattern]) -> bool:
+    """Check if a file matches the given pattern.
+    
+    Args:
+        file_path: Path to the file to check.
+        pattern: Optional pattern (glob string or compiled regex).
+        
+    Returns:
+        True if the file matches the pattern (or pattern is None).
+    """
+    if pattern is None:
+        return True
+    if hasattr(pattern, "search"):
+        return bool(pattern.search(str(file_path)))
+    return fnmatch.fnmatch(str(file_path), pattern) or fnmatch.fnmatch(file_path.name, pattern)
 
-    The function recursively searches each root for files matching the respective patterns (if provided)
-    and optionally filters the results with glob strings or compiled regular expressions.
+
+def _collect_files_from_path(path: Path, pattern: Optional[FilePattern]) -> Dict[str, Path]:
+    """Collect files from a path, handling both files and directories.
     
-    When patterns are provided, files are matched based on:
-    1. Same directory path (relative to their respective roots)
-    2. Matching pattern tuple (pattern_a for path_a, pattern_b for path_b)
-    3. Common suffix after the pattern prefix (e.g., "Red.tif" in "Preprocessed_Red.tif" and "Labels_Red.tif")
+    Args:
+        path: File or directory path.
+        pattern: Optional pattern to match files.
+        
+    Returns:
+        Dictionary mapping relative paths to absolute file paths.
+    """
+    resolved_path = path.resolve()
+    if not resolved_path.exists():
+        logger.warning(f"Path does not exist: {resolved_path}")
+        return {}
     
-    When patterns are not provided, files are paired when they share the same relative path
-    (including filename), which is useful when comparing mirrored directory structures.
+    collected: Dict[str, Path] = {}
+    
+    if resolved_path.is_file():
+        # Single file: accept if it's a .tif/.tiff file and matches pattern (if provided)
+        if resolved_path.suffix.lower() in ('.tif', '.tiff'):
+            if pattern is None or _matches_pattern(resolved_path, pattern):
+                collected[resolved_path.name] = resolved_path
+                logger.debug(f"File accepted: {resolved_path} (pattern: {pattern})")
+            else:
+                logger.debug(f"File did not match pattern: {resolved_path} (pattern: {pattern})")
+        else:
+            logger.debug(f"File is not a .tif/.tiff file: {resolved_path}")
+    elif resolved_path.is_dir():
+        # Directory: use existing collection logic
+        logger.debug(f"Collecting files from directory: {resolved_path}, pattern: {pattern}")
+        collected = _collect_tif_files(resolved_path, pattern)
+        logger.debug(f"Collected {len(collected)} files from directory: {resolved_path}")
+    else:
+        logger.warning(f"Path is neither a file nor a directory: {resolved_path}")
+    
+    return collected
+
+
+def collect_all_files(
+    paths: Union[Path, List[Path]], 
+    pattern: Optional[FilePattern]
+) -> Dict[str, Path]:
+    """Collect files from a single path or list of paths.
+    
+    Args:
+        paths: Single path or list of paths (files or directories).
+        pattern: Optional pattern to match files.
+        
+    Returns:
+        Dictionary mapping unique keys to absolute file paths.
+    """
+    if isinstance(paths, list):
+        all_files = {}
+        logger.debug(f"Processing {len(paths)} paths with pattern: {pattern}")
+        for path in paths:
+            logger.debug(f"Processing path: {path}")
+            collected = _collect_files_from_path(path, pattern)
+            logger.debug(f"Collected {len(collected)} files from: {path}")
+            # Use unique keys to avoid collisions when combining from multiple roots
+            for rel_path, file_path in collected.items():
+                key = f"{path.resolve()}/{rel_path}" if rel_path else str(file_path)
+                all_files[key] = file_path
+        logger.debug(f"Total files collected: {len(all_files)}")
+        return all_files
+    else:
+        logger.debug(f"Processing single path: {paths} with pattern: {pattern}")
+        files = _collect_files_from_path(paths, pattern)
+        logger.debug(f"Collected {len(files)} files")
+        return files
+
+
+def filter_excluded_files(
+    files: Dict[str, Path], 
+    exclude: Optional[List[str]]
+) -> Dict[str, Path]:
+    """Filter out files whose paths contain any exclude string.
+    
+    Args:
+        files: Dictionary of files to filter.
+        exclude: Optional list of strings to exclude.
+        
+    Returns:
+        Filtered dictionary of files.
+    """
+    if not exclude:
+        return files
+    
+    def should_exclude(file_path: Path) -> bool:
+        path_str = str(file_path)
+        return any(exclude_str in path_str for exclude_str in exclude)
+    
+    filtered = {key: path for key, path in files.items() if not should_exclude(path)}
+    logger.info(f"After exclude filtering: {len(filtered)}/{len(files)} files remaining")
+    return filtered
+
+
+def _extract_suffix_from_filename(file_name: str, pattern: Optional[str]) -> str:
+    """Extract the matching suffix from a filename based on a pattern.
+    
+    For patterns like "Preprocessed_*.tif", extracts the part after the prefix
+    (e.g., "Red.tif" from "Preprocessed_Red.tif").
+    
+    For patterns like "*Preprocessed_Red.tif", extracts the part before the suffix
+    (e.g., extracts the common part that should match between files).
+    
+    Args:
+        file_name: Name of the file.
+        pattern: Optional glob pattern with wildcard.
+        
+    Returns:
+        The suffix part of the filename for matching, or the full filename if no match.
+    """
+    if not pattern or "*" not in pattern:
+        return file_name
+    
+    pattern_parts = pattern.split("*", 1)
+    pattern_prefix = pattern_parts[0]
+    pattern_suffix = pattern_parts[1] if len(pattern_parts) > 1 else ""
+    
+    # Case 1: Pattern is "prefix*suffix" (e.g., "Preprocessed_*.tif")
+    if pattern_prefix and pattern_suffix:
+        if file_name.startswith(pattern_prefix) and file_name.endswith(pattern_suffix):
+            # Extract the middle part between prefix and suffix
+            start_idx = len(pattern_prefix)
+            end_idx = len(file_name) - len(pattern_suffix)
+            if start_idx < end_idx:
+                return file_name[start_idx:end_idx] + pattern_suffix
+            else:
+                return pattern_suffix
+        else:
+            return file_name
+    
+    # Case 2: Pattern is "*suffix" (e.g., "*Preprocessed_Red.tif")
+    elif not pattern_prefix and pattern_suffix:
+        if file_name.endswith(pattern_suffix):
+            # Return the suffix part (what comes after the *)
+            return pattern_suffix
+        else:
+            return file_name
+    
+    # Case 3: Pattern is "prefix*" (e.g., "Preprocessed_*")
+    elif pattern_prefix and not pattern_suffix:
+        if file_name.startswith(pattern_prefix):
+            # Return everything after the prefix
+            return file_name[len(pattern_prefix):]
+        else:
+            return file_name
+    
+    # Case 4: Pattern is just "*" (matches everything)
+    else:
+        return file_name
+
+
+def _match_by_suffix(
+    files_a: Dict[str, Path],
+    files_b: Dict[str, Path],
+    pattern_a: Optional[str],
+    pattern_b: Optional[str]
+) -> List[Tuple[Path, Path]]:
+    """Match files by extracting suffixes from filenames based on patterns.
+    
+    This is used when we have lists of paths from different directory structures.
+    
+    Args:
+        files_a: Dictionary of files from path_a.
+        files_b: Dictionary of files from path_b.
+        pattern_a: Optional pattern for files_a.
+        pattern_b: Optional pattern for files_b.
+        
+    Returns:
+        List of matched file pairs.
+    """
+    # Group files by their suffix
+    files_by_suffix_a: Dict[str, List[Path]] = defaultdict(list)
+    files_by_suffix_b: Dict[str, List[Path]] = defaultdict(list)
+    
+    for file_path in files_a.values():
+        suffix = _extract_suffix_from_filename(file_path.name, pattern_a)
+        files_by_suffix_a[suffix].append(file_path)
+    
+    for file_path in files_b.values():
+        suffix = _extract_suffix_from_filename(file_path.name, pattern_b)
+        files_by_suffix_b[suffix].append(file_path)
+    
+    # Match files with the same suffix
+    matches = []
+    common_suffixes = set(files_by_suffix_a.keys()) & set(files_by_suffix_b.keys())
+    
+    for suffix in common_suffixes:
+        for file_a in files_by_suffix_a[suffix]:
+            for file_b in files_by_suffix_b[suffix]:
+                matches.append((file_a, file_b))
+                logger.debug(f"Matched by suffix: {file_a.name} <-> {file_b.name} (suffix: {suffix})")
+    
+    return matches
+
+
+def _match_by_directory_and_suffix(
+    files_a: Dict[str, Path],
+    files_b: Dict[str, Path],
+    root_a: Path,
+    root_b: Path,
+    pattern_a: Optional[str],
+    pattern_b: Optional[str]
+) -> List[Tuple[Path, Path]]:
+    """Match files by directory structure and suffix.
+    
+    This is used when we have single directory paths with the same structure.
+    
+    Args:
+        files_a: Dictionary of files from path_a.
+        files_b: Dictionary of files from path_b.
+        root_a: Root directory for path_a.
+        root_b: Root directory for path_b.
+        pattern_a: Optional pattern for files_a.
+        pattern_b: Optional pattern for files_b.
+        
+    Returns:
+        List of matched file pairs.
+    """
+    # Group files by relative directory and suffix
+    dir_files_a: Dict[str, Dict[str, Path]] = defaultdict(dict)
+    dir_files_b: Dict[str, Dict[str, Path]] = defaultdict(dict)
+    
+    for rel_path, file_path in files_a.items():
+        try:
+            rel_dir = str(file_path.parent.relative_to(root_a))
+        except ValueError:
+            rel_dir = str(file_path.parent)
+        suffix = _extract_suffix_from_filename(file_path.name, pattern_a)
+        dir_files_a[rel_dir][suffix] = file_path
+    
+    for rel_path, file_path in files_b.items():
+        try:
+            rel_dir = str(file_path.parent.relative_to(root_b))
+        except ValueError:
+            rel_dir = str(file_path.parent)
+        suffix = _extract_suffix_from_filename(file_path.name, pattern_b)
+        dir_files_b[rel_dir][suffix] = file_path
+    
+    # Match files in the same directory with the same suffix
+    matches = []
+    all_dirs = set(dir_files_a.keys()) | set(dir_files_b.keys())
+    
+    for rel_dir in all_dirs:
+        files_in_a = dir_files_a.get(rel_dir, {})
+        files_in_b = dir_files_b.get(rel_dir, {})
+        
+        if files_in_a and files_in_b:
+            logger.debug(f"Matching in directory '{rel_dir}': {len(files_in_a)} files in a, {len(files_in_b)} files in b")
+        
+        common_suffixes = set(files_in_a.keys()) & set(files_in_b.keys())
+        for suffix in common_suffixes:
+            matches.append((files_in_a[suffix], files_in_b[suffix]))
+            logger.debug(f"Matched: {files_in_a[suffix].name} <-> {files_in_b[suffix].name} (dir: {rel_dir}, suffix: {suffix})")
+    
+    return matches
+
+
+def _path_iou(path1: Path, path2: Path) -> float:
+    """Calculate IoU (Intersection over Union) of characters between two paths.
+    
+    This metric measures how similar two paths are based on the characters they share.
+    The IoU is calculated as: |intersection| / |union| where intersection is the set of
+    characters that appear in both paths, and union is the set of all unique characters
+    that appear in either path.
+    
+    Args:
+        path1: First path.
+        path2: Second path.
+        
+    Returns:
+        IoU score between 0.0 and 1.0, where 1.0 means identical character sets.
+    """
+    str1 = str(path1)
+    str2 = str(path2)
+    
+    chars1 = set(str1)
+    chars2 = set(str2)
+    
+    intersection = chars1 & chars2
+    union = chars1 | chars2
+    
+    if len(union) == 0:
+        return 1.0  # Both empty strings
+    
+    return len(intersection) / len(union)
+
+
+def _find_best_match(
+    target: Path,
+    candidates: List[Path],
+    pattern_a: Optional[str],
+    pattern_b: Optional[str]
+) -> Optional[Path]:
+    """Find the best matching candidate for a target path based on filename suffix or path similarity.
+    
+    First tries to match by extracted suffix from patterns. If no suffix match is found,
+    falls back to matching by directory structure (same parent directory) or path IoU.
+    
+    Args:
+        target: Target path to find a match for.
+        candidates: List of candidate paths to match against.
+        pattern_a: Optional pattern for target (used for suffix extraction).
+        pattern_b: Optional pattern for candidates (used for suffix extraction).
+        
+    Returns:
+        Best matching candidate path, or None if no match found.
+    """
+    if not candidates:
+        return None
+    
+    # Try suffix-based matching first if patterns are provided
+    matching_candidates = []
+    if pattern_a and pattern_b:
+        target_suffix = _extract_suffix_from_filename(target.name, pattern_a)
+        logger.debug(f"Target: {target.name}, pattern_a: {pattern_a}, extracted suffix: {target_suffix}")
+        
+        for candidate in candidates:
+            candidate_suffix = _extract_suffix_from_filename(candidate.name, pattern_b)
+            logger.debug(f"Candidate: {candidate.name}, pattern_b: {pattern_b}, extracted suffix: {candidate_suffix}")
+            if candidate_suffix == target_suffix:
+                matching_candidates.append(candidate)
+                logger.debug(f"  -> Suffix match found: {target_suffix}")
+    
+    # If no suffix matches, try directory-based matching (same parent directory)
+    if not matching_candidates:
+        target_parent = target.parent
+        for candidate in candidates:
+            if candidate.parent == target_parent:
+                matching_candidates.append(candidate)
+                logger.debug(f"  -> Directory match found: {target_parent}")
+    
+    # If still no matches, use path IoU to find the best match
+    if not matching_candidates:
+        logger.debug(f"No suffix or directory matches for {target.name}, using path IoU")
+        # Score all candidates by path IoU and return the best one
+        scored_candidates = [(c, _path_iou(target, c)) for c in candidates]
+        scored_candidates.sort(key=lambda x: x[1], reverse=True)
+        if scored_candidates and scored_candidates[0][1] > 0.0:  # Only return if IoU > 0
+            best_candidate, best_score = scored_candidates[0]
+            logger.debug(f"  -> Best IoU match: {best_candidate.name} (IoU={best_score:.3f})")
+            return best_candidate
+        else:
+            logger.debug(f"No suitable match found for target {target.name}")
+            return None
+    
+    # If multiple matches, prefer the one with highest path IoU
+    if len(matching_candidates) == 1:
+        return matching_candidates[0]
+    
+    # Score by IoU
+    best_match = max(matching_candidates, key=lambda c: _path_iou(target, c))
+    logger.debug(f"Multiple matches found, selected best by IoU: {best_match.name}")
+    return best_match
+
+
+def find_matching_file_pairs(
+    list_a: List[Union[Path, str]],
+    list_b: List[Union[Path, str]],
+    strategy: Tuple[int, int] = (0, 0),
+    patterns: Optional[Tuple[Optional[str], Optional[str]]] = None,
+) -> List[Tuple[Path, Path]]:
+    """Create matching pairs from two file lists using specified strategy.
+
+    This function only accepts lists of paths and does not perform file searching.
+    File collection should be done before calling this function.
+    
+    The function implements four matching strategies:
+    
+    - (0, 0): Don't rematch, zip lists and trim to shorter length
+    - (1, 0): Greedy matching from list_a to list_b (for each item in list_a, find best match in list_b)
+    - (0, 1): Greedy matching from list_b to list_a (reversed approach)
+    - (1, 1): All pairwise combinations with IoU scoring, greedy selection
 
     Args:
-        path_a: First directory tree to search.
-        path_b: Second directory tree to search.
-        patterns: Optional tuple of filters applied to each directory tree. Each filter
-            can be a glob string (e.g., ``"Preprocessed_*.tif"``) or a compiled regular
-            expression. Use ``None`` to disable filtering for a side.
-        exclude: Optional list of strings. Paths containing any of these strings will be excluded.
+        list_a: First list of file paths (Path or str objects).
+        list_b: Second list of file paths (Path or str objects).
+        strategy: Tuple of (int, int) defining the matching strategy. Defaults to (0, 0).
+        patterns: Optional tuple of (pattern_a, pattern_b) for filename suffix matching.
+                 Used in strategies (1,0), (0,1), and (1,1).
 
     Returns:
-        A list of `(file_from_a, file_from_b)` tuples representing matched files.
+        A list of (file_from_a, file_from_b) tuples representing matched files.
+        
+    Raises:
+        ValueError: If strategy is not one of the four valid options.
     """
-
+    # Normalize to Path objects
+    paths_a = [Path(p) if isinstance(p, str) else p for p in list_a]
+    paths_b = [Path(p) if isinstance(p, str) else p for p in list_b]
+    
     pattern_a = patterns[0] if patterns else None
     pattern_b = patterns[1] if patterns else None
-
-    files_a = _collect_tif_files(path_a, pattern_a)
-    files_b = _collect_tif_files(path_b, pattern_b)
     
-    # Filter out paths that contain any exclude string
-    if exclude:
-        def _should_exclude(file_path: Path) -> bool:
-            """Check if a file path should be excluded.
+    if strategy == (0, 0):
+        # Don't rematch, zip and trim to shorter length
+        min_len = min(len(paths_a), len(paths_b))
+        matches = list(zip(paths_a[:min_len], paths_b[:min_len]))
+        logger.info(f"Strategy (0,0): Zipped {min_len} pairs from lists of length {len(paths_a)} and {len(paths_b)}")
+        
+    elif strategy == (1, 0):
+        # Greedy matching from list_a to list_b
+        matches = []
+        list_b_copy = paths_b.copy()  # We'll pop from this
+        
+        for path_a in paths_a:
+            if not list_b_copy:
+                break  # No more candidates in list_b
             
-            A path is excluded if any part of the path (as a string) contains
-            any of the exclude strings.
-            """
-            path_str = str(file_path)
-            # Check if any exclude string appears anywhere in the path
-            for exclude_str in exclude:
-                if exclude_str in path_str:
-                    return True
-            return False
-        
-        # Filter files_a
-        files_a = {rel_path: file_path for rel_path, file_path in files_a.items() 
-                   if not _should_exclude(file_path)}
-        # Filter files_b
-        files_b = {rel_path: file_path for rel_path, file_path in files_b.items() 
-                   if not _should_exclude(file_path)}
-        logger.debug(f"After exclude filtering: {len(files_a)} files in {path_a} and {len(files_b)} files in {path_b}")
-    logger.debug(f"Found {len(files_a)} files in {path_a} and {len(files_b)} files in {path_b}")
-
-    matches: List[Tuple[Path, Path]] = []
-    
-    if patterns:
-        # When patterns are provided, match by directory path and common suffix
-        # Group files by their directory path (relative to root)
-        dir_files_a: Dict[str, List[Tuple[str, Path]]] = defaultdict(list)
-        dir_files_b: Dict[str, List[Tuple[str, Path]]] = defaultdict(list)
-        
-        resolved_a = path_a.resolve()
-        resolved_b = path_b.resolve()
-        
-        # Group files from path_a by directory (relative to path_a)
-        for rel_path, file_path in files_a.items():
-            try:
-                # Get relative directory path within path_a
-                rel_dir = str(file_path.parent.relative_to(resolved_a))
-            except ValueError:
-                # If relative_to fails (e.g., paths on different drives on Windows),
-                # use the parent directory as-is (this is a fallback)
-                rel_dir = str(file_path.parent)
-            # Extract suffix after pattern (for matching)
-            file_name = file_path.name
-            # Try to extract common suffix by matching the pattern
-            if pattern_a and "*" in pattern_a:
-                # Pattern has wildcard - extract the suffix part after the wildcard
-                pattern_parts = pattern_a.split("*", 1)  # Split only on first *
-                pattern_prefix = pattern_parts[0]
-                pattern_suffix = pattern_parts[1] if len(pattern_parts) > 1 else ""
-                
-                # Check if filename matches the pattern structure
-                if file_name.startswith(pattern_prefix) and file_name.endswith(pattern_suffix):
-                    # Extract the suffix part (everything after the prefix, or use pattern_suffix if it exists)
-                    if pattern_suffix:
-                        # Use the pattern suffix as the common suffix
-                        suffix = pattern_suffix
-                    else:
-                        # No suffix in pattern, use everything after prefix
-                        suffix = file_name[len(pattern_prefix):]
-                else:
-                    # Pattern doesn't match, use full filename
-                    suffix = file_name
+            best_match = _find_best_match(path_a, list_b_copy, pattern_a, pattern_b)
+            if best_match is not None:
+                matches.append((path_a, best_match))
+                list_b_copy.remove(best_match)
+                logger.debug(f"Matched: {path_a.name} <-> {best_match.name}")
             else:
-                suffix = file_name
-            dir_files_a[rel_dir].append((suffix, file_path))
+                logger.debug(f"No match found for: {path_a.name}")
         
-        # Group files from path_b by directory (relative to path_b)
-        for rel_path, file_path in files_b.items():
-            try:
-                # Get relative directory path within path_b
-                rel_dir = str(file_path.parent.relative_to(resolved_b))
-            except ValueError:
-                # If relative_to fails (e.g., paths on different drives on Windows),
-                # use the parent directory as-is (this is a fallback)
-                rel_dir = str(file_path.parent)
-            # Extract suffix after pattern (for matching)
-            file_name = file_path.name
-            # Try to extract common suffix by matching the pattern
-            if pattern_b and "*" in pattern_b:
-                # Pattern has wildcard - extract the suffix part after the wildcard
-                pattern_parts = pattern_b.split("*", 1)  # Split only on first *
-                pattern_prefix = pattern_parts[0]
-                pattern_suffix = pattern_parts[1] if len(pattern_parts) > 1 else ""
-                
-                # Check if filename matches the pattern structure
-                if file_name.startswith(pattern_prefix) and file_name.endswith(pattern_suffix):
-                    # Extract the suffix part (everything after the prefix, or use pattern_suffix if it exists)
-                    if pattern_suffix:
-                        # Use the pattern suffix as the common suffix
-                        suffix = pattern_suffix
-                    else:
-                        # No suffix in pattern, use everything after prefix
-                        suffix = file_name[len(pattern_prefix):]
-                else:
-                    # Pattern doesn't match, use full filename
-                    suffix = file_name
+        logger.info(f"Strategy (1,0): Matched {len(matches)} pairs from {len(paths_a)} items in list_a")
+        
+    elif strategy == (0, 1):
+        # Greedy matching from list_b to list_a (reversed)
+        matches = []
+        list_a_copy = paths_a.copy()  # We'll pop from this
+        
+        for path_b in paths_b:
+            if not list_a_copy:
+                break  # No more candidates in list_a
+            
+            best_match = _find_best_match(path_b, list_a_copy, pattern_b, pattern_a)
+            if best_match is not None:
+                matches.append((best_match, path_b))
+                list_a_copy.remove(best_match)
+                logger.debug(f"Matched: {best_match.name} <-> {path_b.name}")
             else:
-                suffix = file_name
-            dir_files_b[rel_dir].append((suffix, file_path))
+                logger.debug(f"No match found for: {path_b.name}")
         
-        logger.debug(f"Grouped {len(dir_files_a)} directories from {path_a} and {len(dir_files_b)} directories from {path_b}")
+        logger.info(f"Strategy (0,1): Matched {len(matches)} pairs from {len(paths_b)} items in list_b")
         
-        # Match files in the same relative directory (within their respective roots) with the same suffix
-        # This works even when path_a and path_b are different, as long as they have the same directory structure
-        all_dirs = set(dir_files_a.keys()) | set(dir_files_b.keys())
-        for rel_dir in all_dirs:
-            files_in_a = {suffix: path for suffix, path in dir_files_a.get(rel_dir, [])}
-            files_in_b = {suffix: path for suffix, path in dir_files_b.get(rel_dir, [])}
-            
-            if files_in_a and files_in_b:
-                logger.debug(f"Matching files in directory '{rel_dir}': {len(files_in_a)} files in path_a, {len(files_in_b)} files in path_b")
-            
-            # Match files with the same suffix
-            common_suffixes = set(files_in_a.keys()) & set(files_in_b.keys())
-            for suffix in common_suffixes:
-                matches.append((files_in_a[suffix], files_in_b[suffix]))
-                logger.debug(f"Matched: {files_in_a[suffix].name} <-> {files_in_b[suffix].name} (suffix: {suffix})")
+    elif strategy == (1, 1):
+        # All pairwise combinations with IoU scoring
+        # First, create all possible pairs with scores
+        scored_pairs = []
+        
+        for path_a in paths_a:
+            for path_b in paths_b:
+                # Use suffix matching if patterns provided, otherwise use IoU
+                if pattern_a and pattern_b:
+                    suffix_a = _extract_suffix_from_filename(path_a.name, pattern_a)
+                    suffix_b = _extract_suffix_from_filename(path_b.name, pattern_b)
+                    if suffix_a == suffix_b:
+                        # If suffixes match, use IoU as tiebreaker
+                        score = _path_iou(path_a, path_b)
+                    else:
+                        # Suffixes don't match, skip this pair
+                        continue
+                else:
+                    # No patterns, use IoU directly
+                    score = _path_iou(path_a, path_b)
+                
+                scored_pairs.append((score, path_a, path_b))
+        
+        # Sort by score (descending)
+        scored_pairs.sort(reverse=True, key=lambda x: x[0])
+        
+        # Greedy selection: go through sorted pairs and select non-conflicting ones
+        matches = []
+        used_a = set()
+        used_b = set()
+        
+        for score, path_a, path_b in scored_pairs:
+            if path_a not in used_a and path_b not in used_b:
+                matches.append((path_a, path_b))
+                used_a.add(path_a)
+                used_b.add(path_b)
+                logger.debug(f"Matched (IoU={score:.3f}): {path_a.name} <-> {path_b.name}")
+        
+        logger.info(f"Strategy (1,1): Matched {len(matches)} pairs from {len(paths_a)}x{len(paths_b)} combinations")
+        
     else:
-        # When no patterns, match by exact relative path (original behavior)
-        for rel_path, file_a in files_a.items():
-            partner = files_b.get(rel_path)
-            if partner is not None:
-                matches.append((file_a, partner))
-
+        raise ValueError(f"Invalid strategy: {strategy}. Must be one of (0,0), (1,0), (0,1), or (1,1)")
+    
     return matches

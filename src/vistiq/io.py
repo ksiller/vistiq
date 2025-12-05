@@ -203,6 +203,14 @@ class FileListConfig(Configuration):
     paths: Union[str, Path, List[Union[str, Path]]] = Field(
         description="List of paths (files or directories) to search for files"
     )
+    directories: bool = Field(
+        default=False,
+        description="Whether to search for directories"
+    )
+    files: bool = Field(
+        default=True,
+        description="Whether to search for files"
+    )
     recursive: bool = Field(
         default=True,
         description="Whether to recursively search for files"
@@ -309,16 +317,17 @@ class FileList(Configurable[FileListConfig]):
     
     @task(name="FileList.run")
     def run(self) -> list[Path]:
-        """Generate a list of files according to the configuration.
+        """Generate a list of files and/or directories according to the configuration.
         
         Returns:
-            List of file paths.
+            List of file and/or directory paths based on the 'files' and 'directories' config flags.
             
         Raises:
             FileNotFoundError: If any specified path does not exist.
             ValueError: If no valid paths are provided.
         """
-        all_files = []
+        all_paths = []
+        all_directories = []
         
         # paths is already normalized to a list by the validator
         input_paths = self.config.paths
@@ -331,7 +340,7 @@ class FileList(Configurable[FileListConfig]):
         # Expand ~/ at runtime (not in validator) to preserve portability across users
         base_path = input_paths[0].expanduser().resolve() if input_paths else Path.cwd()
         
-        # Collect files from specified paths using glob patterns
+        # Collect files and/or directories from specified paths using glob patterns
         # paths are already normalized to Path objects by the validator
         for path_obj in input_paths:
             # Expand ~/ at runtime (not in validator) to preserve portability across users
@@ -362,28 +371,56 @@ class FileList(Configurable[FileListConfig]):
                     logger.error(f"Path does not exist: {path_obj}. Stopping file list generation.")
                     raise FileNotFoundError(f"Path does not exist: {path_obj}")
             
-            # If it's a file, add it directly (ignore include/exclude patterns)
-            # Explicitly specified files should always be included
+            # If it's a file, add it if files=True
             if path_obj.is_file():
-                all_files.append(path_obj)
+                if self.config.files:
+                    all_paths.append(path_obj)
             
-            # If it's a directory, use glob patterns for efficient search
+            # If it's a directory
             elif path_obj.is_dir():
-                # Check if follow_symlinks parameter is supported (Python 3.13+)
-                import sys
-                supports_follow_symlinks = sys.version_info >= (3, 13)
+                # Add the directory itself if directories=True
+                if self.config.directories:
+                    all_directories.append(path_obj)
                 
-                if self.config.include:
-                    # Use glob patterns directly for search
-                    for pattern in self.config.include:
+                # Search for files within the directory if files=True
+                if self.config.files:
+                    # Check if follow_symlinks parameter is supported (Python 3.13+)
+                    import sys
+                    supports_follow_symlinks = sys.version_info >= (3, 13)
+                    
+                    if self.config.include:
+                        # Use glob patterns directly for search
+                        for pattern in self.config.include:
+                            if self.config.recursive:
+                                # Recursive search: use **/ pattern
+                                glob_pattern = f"**/{pattern}"
+                                search_method = path_obj.rglob
+                            else:
+                                # Non-recursive search: use pattern directly
+                                glob_pattern = pattern
+                                search_method = path_obj.glob
+                            
+                            # Conditionally pass follow_symlinks based on Python version
+                            if supports_follow_symlinks:
+                                file_iter = search_method(glob_pattern, follow_symlinks=self.config.follow_symlinks)
+                            else:
+                                file_iter = search_method(glob_pattern)
+                                # If follow_symlinks=False and not supported, we can't filter symlinks
+                                # In older Python versions, symlinks are always followed
+                                if not self.config.follow_symlinks:
+                                    logger.warning("follow_symlinks=False is not supported in Python < 3.13. Symlinks will be followed.")
+                            
+                            for file_path in file_iter:
+                                if file_path.is_file():
+                                    all_paths.append(file_path)
+                    else:
+                        # No include patterns - collect all files
                         if self.config.recursive:
-                            # Recursive search: use **/ pattern
-                            glob_pattern = f"**/{pattern}"
                             search_method = path_obj.rglob
+                            glob_pattern = "*"
                         else:
-                            # Non-recursive search: use pattern directly
-                            glob_pattern = pattern
                             search_method = path_obj.glob
+                            glob_pattern = "*"
                         
                         # Conditionally pass follow_symlinks based on Python version
                         if supports_follow_symlinks:
@@ -397,52 +434,52 @@ class FileList(Configurable[FileListConfig]):
                         
                         for file_path in file_iter:
                             if file_path.is_file():
-                                all_files.append(file_path)
-                else:
-                    # No include patterns - collect all files
-                    if self.config.recursive:
-                        search_method = path_obj.rglob
-                        glob_pattern = "*"
-                    else:
-                        search_method = path_obj.glob
-                        glob_pattern = "*"
+                                all_paths.append(file_path)
+                
+                # If directories=True and recursive=True, also search for subdirectories
+                if self.config.directories and self.config.recursive:
+                    import sys
+                    supports_follow_symlinks = sys.version_info >= (3, 13)
                     
-                    # Conditionally pass follow_symlinks based on Python version
+                    # Search for directories recursively
                     if supports_follow_symlinks:
-                        file_iter = search_method(glob_pattern, follow_symlinks=self.config.follow_symlinks)
+                        dir_iter = path_obj.rglob("*", follow_symlinks=self.config.follow_symlinks)
                     else:
-                        file_iter = search_method(glob_pattern)
-                        # If follow_symlinks=False and not supported, we can't filter symlinks
-                        # In older Python versions, symlinks are always followed
-                        if not self.config.follow_symlinks:
-                            logger.warning("follow_symlinks=False is not supported in Python < 3.13. Symlinks will be followed.")
+                        dir_iter = path_obj.rglob("*")
                     
-                    for file_path in file_iter:
-                        if file_path.is_file():
-                            all_files.append(file_path)
+                    for dir_path in dir_iter:
+                        if dir_path.is_dir() and dir_path != path_obj:  # Exclude the root directory itself
+                            all_directories.append(dir_path)
         
-        if not all_files:
-            logger.warning("No files found in specified paths")
-            return [], {"total_files": 0, "filtered_files": 0}
+        # Combine files and directories
+        all_results = all_paths + all_directories
         
-        # Remove duplicates (in case multiple patterns match the same file)
-        all_files = list(dict.fromkeys(all_files))  # Preserves order while removing duplicates
+        if not all_results:
+            logger.warning("No files or directories found in specified paths")
+            return []
+        
+        # Remove duplicates (in case multiple patterns match the same path)
+        all_results = list(dict.fromkeys(all_results))  # Preserves order while removing duplicates
         
         # Apply exclude patterns
         if self.config.exclude:
-            all_files = [
-                file_path for file_path in all_files
-                if not any(fnmatch.fnmatch(file_path.name, pattern) for pattern in self.config.exclude)
+            all_results = [
+                path for path in all_results
+                if not any(
+                    fnmatch.fnmatch(path.name, pattern) or 
+                    fnmatch.fnmatch(str(path), pattern)
+                    for pattern in self.config.exclude
+                )
             ]
         
-        # Sort files for consistent ordering
-        all_files.sort()
+        # Sort paths for consistent ordering
+        all_results.sort()
         
-        for f in all_files:
-            logger.debug(f"Found file: {f}")
-        logger.info(f"Found {len(all_files)} files matching criteria")
+        for p in all_results:
+            logger.info(f"Found {'directory' if p.is_dir() else 'file'}: {p}")
+        logger.info(f"Found {len(all_results)} paths matching criteria ({len([p for p in all_results if p.is_file()])} files, {len([p for p in all_results if p.is_dir()])} directories)")
         
-        return all_files
+        return all_results
 
 class DataWriterConfig(Configuration):
     """Configuration for data writing operations.

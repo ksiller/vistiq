@@ -12,7 +12,7 @@ from micro_sam.util import export_custom_sam_model
 from bioio import BioImage
 from vistiq.core import Configuration, Configurable
 from prefect import task
-from vistiq.utils import find_matching_file_pairs
+from vistiq.utils import find_matching_file_pairs, collect_all_files
 from pydantic import Field, PositiveInt
 from bioio_ome_tiff.writers import OmeTiffWriter
 
@@ -24,9 +24,10 @@ class DatasetCreatorConfig(Configuration):
     Attributes:
         patch_shape: Shape of patches for training (default: (1, 256, 256)).
     """
-    exclude: Optional[List[str]] = ["checkpoints", "training_data"]
     out_path: Path = Field(description="Path to save the dataset files", default="./training_data")
     patterns: Tuple[str,str] = Field(description="Tuple of image and label patterns", default=("*_img.tif", "*_label.tif"))
+    rematch: bool = False
+    strategy: Tuple[int,int] = (0,1)
     remove_empty_labels: bool = True
     random_samples: Optional[PositiveInt] = None
 
@@ -48,19 +49,55 @@ class DatasetCreator(Configurable[DatasetCreatorConfig]):
         return cls(config)
 
     @task(name="DatasetCreator.run")
-    def run(self, image_path: Path, label_path: Path) -> List[Tuple[Path, Path]]:
+    def run(self, image_path: List[Union[Path, str]], label_path: List[Union[Path, str]]) -> List[Tuple[Path, Path]]:
         """Run the dataset creation.
         
         Args:
-            image_path: Image file or directory path.
-            label_path: Label file or directory path.
+            image_path: List of image file or directory paths.
+            label_path: List of label file or directory paths.
             
         Returns:
             List of (image_path, label_path) tuples for training.
         """
         logger.info(f"Running dataset creation with config: {self.config}")
-        matches = find_matching_file_pairs(image_path, label_path, self.config.patterns, exclude=self.config.exclude)
-        logger.debug(f"Found {len(matches)} matches for {image_path} and {label_path}")
+        # Normalize to Path objects
+        image_paths = [Path(p) if isinstance(p, str) else p for p in image_path]
+        label_paths = [Path(p) if isinstance(p, str) else p for p in label_path]
+        
+        logger.info(f"Image paths ({len(image_paths)}): {[str(p.resolve()) for p in image_paths]}")
+        logger.info(f"Label paths ({len(label_paths)}): {[str(p.resolve()) for p in label_paths]}")
+        logger.info(f"Patterns: {self.config.patterns}")
+        logger.info(f"Strategy: {self.config.strategy}")
+        
+        # If both lists are the same length and all are files, assume they're already matched
+        if (not self.config.rematch and len(image_paths) == len(label_paths) and 
+            all(p.is_file() for p in image_paths) and 
+            all(p.is_file() for p in label_paths)):
+            matches = list(zip(image_paths, label_paths))
+            logger.info(f"Using pre-matched pairs: {len(matches)} pairs")
+        else:
+            # Collect files from paths
+            pattern_a = self.config.patterns[0] if self.config.patterns else None
+            pattern_b = self.config.patterns[1] if self.config.patterns else None
+            
+            files_a_dict = collect_all_files(image_paths, pattern_a)
+            files_b_dict = collect_all_files(label_paths, pattern_b)
+            
+            # Convert to lists for matching
+            files_a_list = list(files_a_dict.values())
+            files_b_list = list(files_b_dict.values())
+            
+            logger.info(f"Collected {len(files_a_list)} image files and {len(files_b_list)} label files")
+            
+            # Match files using the specified strategy
+            matches = find_matching_file_pairs(
+                files_a_list, 
+                files_b_list, 
+                strategy=self.config.strategy,
+                patterns=self.config.patterns
+            )
+        
+        logger.info(f"Found {len(matches)} matching pairs")
         # check if self.config.out_path is relative path; if so use image_path dir and label_path dir as root and append out_path to it
         training_pairs = []
         for image_path, label_path in matches:

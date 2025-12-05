@@ -85,5 +85,8 @@ src/vistiq/_version.py
 # microsam embeddings
 embeddings/
 
+# prefect logs
+/logs/
+
 # dask performance reports
 *report.html

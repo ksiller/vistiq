@@ -1628,8 +1628,11 @@ def run_train(config: CLITrainConfig, args: Optional[argparse.Namespace] = None)
     else:
         logger.debug("No patterns provided, will match all files")
     
-    dc = DatasetCreator(DatasetCreatorConfig(out_path="./training_data", patterns=patterns_tuple, remove_empty_labels=True, random_samples=5, exclude=["checkpoints", "training_data"]))
-    img_label_pairs = dc.run(config.image_path, config.label_path)
+    dc = DatasetCreator(DatasetCreatorConfig(out_path="./training_data", patterns=patterns_tuple, remove_empty_labels=True, random_samples=5))
+    # Normalize to lists for DatasetCreator.run
+    image_path_list = config.image_path if isinstance(config.image_path, list) else [config.image_path]
+    label_path_list = config.label_path if isinstance(config.label_path, list) else [config.label_path]
+    img_label_pairs = dc.run(image_path_list, label_path_list)
 
     if len(img_label_pairs) == 0:
         logger.warning("No matching pairs found, exiting")

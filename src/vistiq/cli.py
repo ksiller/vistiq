@@ -6,7 +6,7 @@ import json
 import numpy as np
 import os
 from pathlib import Path
-from typing import Optional, Literal, List
+from typing import Optional, Literal, List, Union, Any
 from pydantic import BaseModel, Field, field_validator
 import typer
 from typer import Option, Argument, Context
@@ -19,9 +19,11 @@ except ImportError:
     OME_TIFF_AVAILABLE = False
     OmeTiffWriter = None
 
-from .core import cli_config, Configuration, Configurable 
+from .core import StackProcessorConfig, cli_config, Configuration, Configurable 
 from .io import DataLoaderConfig, ImageLoaderConfig, ImageLoader,ImageWriter, FileListConfig, FileList, DataWriterConfig, ImageWriterConfig
-from .preprocess import PreprocessorConfig, Preprocessor
+from .preprocess import PreprocessorConfig
+from .seg import ThresholderConfig, SegmenterConfig, LabellerConfig
+from .train import TrainerConfig, DatasetCreatorConfig, DatasetCreator, MicroSAMTrainerConfig, MicroSAMTrainer
 from .workflow_builder import ConfigArgumentBuilder, WorkflowBuilder, get_registry, auto_register_configurables
 from .utils import load_image, get_scenes
 # from .app import configure_logger
@@ -131,7 +133,8 @@ class CLISubcommandConfig(CLIAppConfig):
     configuration and processing step chains.
     
     Attributes:
-        input_config: Configuration for input data loading.
+        input: Configuration for collecting input file(s) or directories (FileListConfig).
+        loader: Configuration for data loading (DataLoaderConfig). Defaults to DataLoaderConfig.
         output: Configuration for output data writing (DataWriterConfig). Defaults to None.
         step: List of processing step configurations to run in sequence.
     """
@@ -162,6 +165,12 @@ class CLISubcommandConfig(CLIAppConfig):
         Returns:
             Validated list of step configurations, or None.
         """
+        if v is None:
+            return None
+        # Validate that each item is a Configuration instance
+        for item in v:
+            if not isinstance(item, Configuration):
+                raise ValueError(f"Each item in 'step' must be a Configuration instance, got {type(item)}")
         return v
 
 
@@ -169,13 +178,13 @@ class CLIPreprocessorConfig(CLISubcommandConfig):
     """Configuration for the preprocess subcommand.
     
     Defines parameters for preprocessing images including denoising, resizing, and other operations.
-    Extends CLISubcommandConfig with preprocessing-specific input configuration.
+    Extends CLISubcommandConfig with preprocessing-specific configuration.
     
     Attributes:
-        input_config: Configuration for input image loading (ImageLoaderConfig).
-        component: List of preprocessing component configurations to run in sequence.
-                  Note: This field is specific to CLIPreprocessorConfig, while the parent
-                  class CLISubcommandConfig uses 'step' for general processing steps.
+        input: Configuration for collecting input file(s) or directories (FileListConfig).
+        loader: Configuration for image loading (ImageLoaderConfig). Defaults to ImageLoaderConfig.
+        step: List of preprocessing component configurations to run in sequence (PreprocessorConfig).
+        output: Configuration for output image writing (ImageWriterConfig). Defaults to ImageWriterConfig.
     """
     loader: Optional[ImageLoaderConfig] = Field(
         default_factory=ImageLoaderConfig, description="Configuration for input data loading"
@@ -194,9 +203,111 @@ class CLIPreprocessorConfig(CLISubcommandConfig):
         
         Args:
             v: Steps to validate.
+            
+        Returns:
+            Validated list of preprocessing step configurations, or None.
         """
+        if v is None:
+            return None
+        # Validate that each item is a PreprocessorConfig instance
+        for item in v:
+            if not isinstance(item, PreprocessorConfig):
+                raise ValueError(f"Each item in 'step' must be a PreprocessorConfig instance, got {type(item)}")
         return v
 
+class CLISegmenterConfig(CLISubcommandConfig):
+    """Configuration for the segment subcommand.
+    
+    Defines parameters for segmenting images including thresholding, segmentation, labelling, and other operations.
+    Extends CLISubcommandConfig with segmenting-specific input configuration.
+    
+    Attributes:
+        input: Configuration for collecting input file(s) or directories.
+        step: List of thresholding/segmenting/labelling component configurations to run in sequence.
+        output: Configuration for output data writing.
+    """
+    loader: Optional[ImageLoaderConfig] = Field(
+        default_factory=ImageLoaderConfig, description="Configuration for input data loading"
+    )
+    step: Optional[list[StackProcessorConfig]] = Field(
+        default=None, description="Configs for chain of thresholding/segmenting/labelling components to run"
+    )
+    output: Optional[ImageWriterConfig] = Field(
+        default_factory=ImageWriterConfig, description="Configuration for output data writing"
+    )
+
+    @field_validator("step")
+    @classmethod
+    def validate_step(cls, v: Optional[List[StackProcessorConfig]]) -> Optional[List[StackProcessorConfig]]:
+        """Validate that steps are valid.
+        
+        Args:
+            v: Steps to validate.
+            
+        Returns:
+            Validated list of segmenting step configurations, or None.
+        """
+        if v is None:
+            return None
+        # Validate that each item is one of the allowed config types
+        allowed_types = (ThresholderConfig, SegmenterConfig, LabellerConfig)
+        for item in v:
+            if not isinstance(item, allowed_types):
+                raise ValueError(f"Each item in 'step' must be a ThresholderConfig, SegmenterConfig, or LabellerConfig instance, got {type(item)}")
+        return v
+
+class CLITrainerConfig(CLISubcommandConfig):
+    """Configuration for the train subcommand.
+    
+    Defines parameters for training a model including dataset creation, data loading, and training.
+    Extends CLISubcommandConfig with training-specific configuration.
+    
+    Attributes:
+        input: Configuration for collecting input image file(s) or directories (FileListConfig).
+        labels: Configuration for collecting labelled image file(s) or directories (FileListConfig).
+        loader: Configuration for image loading (ImageLoaderConfig). Defaults to ImageLoaderConfig.
+        dataset: Configuration for dataset creation (DatasetCreatorConfig). Defaults to DatasetCreatorConfig.
+        step: List of training component configurations to run in sequence (TrainerConfig).
+        output: Configuration for output data writing (ImageWriterConfig). Defaults to ImageWriterConfig.
+    """
+    input: Optional[FileListConfig] = Field(
+        default=None, description="Configuration for input images"
+    )
+    labels: Optional[FileListConfig] = Field(
+        default=None, description="Configuration for labelled images"
+    )
+    loader: Optional[ImageLoaderConfig] = Field(
+        default_factory=ImageLoaderConfig, description="Configuration for input data loading"
+    )
+    dataset: Optional[DatasetCreatorConfig] = Field(
+        default_factory=DatasetCreatorConfig, description="Configuration to specify the dataset creator to split the data into training and validation sets"
+    )
+    step: Optional[list[Configuration]] = Field(
+        default=None, description="Configs for chain of training components to run"
+    )
+    output: Optional[ImageWriterConfig] = Field(
+        default_factory=ImageWriterConfig, description="Configuration for output data writing"
+    )
+
+    @field_validator("step")
+    @classmethod
+    def validate_step(cls, v: Optional[List[TrainerConfig]]) -> Optional[List[TrainerConfig]]:
+        """Validate that steps are valid.
+        
+        Args:
+            v: Steps to validate.
+            
+        Returns:
+            Validated list of segmenting step configurations, or None.
+        """
+        if v is None:
+            return None
+        # Validate that each item is one of the allowed config types
+        allowed_types = (TrainerConfig)
+        for item in v:
+            if not isinstance(item, allowed_types):
+                raise ValueError(f"Each item in 'step' must be a ThresholderConfig, SegmenterConfig, or LabellerConfig instance, got {type(item)}")
+        return v
 
 # Rebuild models to resolve forward references and Literal types
 # This is needed when using Literal types or forward references in nested configs
@@ -367,7 +478,7 @@ def build_component_chain(
 def common_callback(
     ctx: Context,
     loglevel: str = Option("INFO", help="Logging level"),
-    device: str = Option("auto", help="Device to use for processing"),
+    device: Literal["cuda", "mps", "cpu", "auto"] = Option("auto", help="Device to use for processing"),
     processes: Optional[int] = Option(1, help="Number of processes to use"),
 ) -> None:
     """Common options for all vistiq commands.
@@ -493,31 +604,39 @@ def cli_to_config(value: str, default_value_field:str="classname", alt_classname
         raise ValueError(f"Failed to create configuration for '{config_class_name}': {e}") from e
 
 def cli_to_filelist_config(value: str) -> FileListConfig:
-    """Convert a CLI string (path or comma-separated paths) to a FileListConfig.
+    """Convert a CLI string (path or JSON config) to a FileListConfig.
+    
+    This function can handle:
+    1. Simple path string (e.g., "path/to/file" or "~/test/")
+    2. JSON configuration string (e.g., '{"paths": "path/to/dir", "include": "*.tif"}')
     
     Args:
-        value: Path string or comma-separated paths. Paths with spaces must be quoted in the shell.
+        value: Path string or JSON configuration. Paths with spaces must be quoted in the shell.
         
     Returns:
         FileListConfig instance with the provided paths.
         
     Raises:
-        ValueError: If the value cannot be parsed as a valid path.
+        ValueError: If the value cannot be parsed as a valid path or JSON config.
     """
     return cli_to_config(value, default_value_field="paths", alt_classname="FileListConfig")
 
 
 def cli_to_imageloader_config(value: str) -> ImageLoaderConfig:
-    """Convert a CLI string (path) to an ImageLoaderConfig.
+    """Convert a CLI string (component name or JSON config) to an ImageLoaderConfig.
+    
+    This function can handle:
+    1. Component name string (e.g., "ImageLoader") - creates a default config
+    2. JSON configuration string (e.g., '{"classname": "ImageLoader", "path": "path/to/file"}')
     
     Args:
-        value: Path string for the image loader. Paths with spaces should be quoted.
+        value: Component name string or JSON configuration. Paths with spaces should be quoted.
         
     Returns:
-        ImageLoaderConfig instance with the provided path.
+        ImageLoaderConfig instance.
         
     Raises:
-        ValueError: If the value cannot be parsed as a valid path.
+        ValueError: If the value cannot be parsed as a valid config.
     """
     #substack_str = value.get("substack", None)
     # substack_slices = substack_to_slices(substack_str if substack_str else None)
@@ -529,11 +648,8 @@ def cli_to_component_config(value: str) -> Configuration:
     """Convert a CLI string (component name or JSON) to a Configuration.
     
     This function can handle two formats:
-    1. Component name string (e.g., "DoG", "Resize") - creates a default config
+    1. Component name string (e.g., "DoG", "Resize", "OtsuThreshold") - creates a default config
     2. JSON string (e.g., '{"classname": "DoG", "sigma_low": 1.0}') - uses Pydantic's model_validate_json
-    
-    The actual configuration values can also be provided via component-specific 
-    arguments (e.g., --component0-sigma-low).
     
     Args:
         value: Component name string or JSON string with classname and config values.
@@ -547,45 +663,54 @@ def cli_to_component_config(value: str) -> Configuration:
     return cli_to_config(value)
 
 
-
 def cli_to_imagewriter_config(value: str) -> ImageWriterConfig:
-    """Convert a CLI string (output path) to an ImageWriterConfig.
+    """Convert a CLI string (output path or JSON config) to an ImageWriterConfig.
+    
+    This function can handle:
+    1. Simple path string (e.g., "path/to/output" or "~/results/")
+    2. JSON configuration string (e.g., '{"path": "path/to/output", "format": "tif", "overwrite": false}')
     
     Args:
-        value: Output path string. Paths with spaces must be quoted in the shell.
+        value: Output path string or JSON configuration. Paths with spaces must be quoted in the shell.
         
     Returns:
         ImageWriterConfig instance with the provided path.
         
     Raises:
-        ValueError: If the value cannot be parsed as a valid path.
+        ValueError: If the value cannot be parsed as a valid path or JSON config.
     """
     return cli_to_config(value, default_value_field="path", alt_classname="ImageWriterConfig")
 
-@app.command("preprocess")
-def preprocess_cmd(
+
+def cli_command_config(
     ctx: Context,
-    input: Optional[FileListConfig] = Option(None, "--input", "-i", help="Input file or directory configuration", parser=cli_to_filelist_config),
-    loader: Optional[ImageLoaderConfig] = Option(None, "--loader", help="Configuration to specify the data loader to use", parser=cli_to_imageloader_config),
-    step: List[PreprocessorConfig] = Option(None, "--step", "-s", help="Processing step/component to include (can be specified multiple times). Use --step NAME to add a step.", parser=cli_to_component_config),
-    output: Optional[ImageWriterConfig] = Option(None, "--output", "-o", help="Output file or directory configuration", parser=cli_to_imagewriter_config),
-) -> None:
-    """Preprocess images with a chain of preprocessing steps.
+    input: Optional[FileListConfig] = None,
+    labels: Optional[FileListConfig] = None,
+    dataset: Optional[DatasetCreatorConfig] = None,
+    loader: Optional[DataLoaderConfig] = None,
+    step: Optional[List[Configuration]] = None,
+    output: Optional[DataWriterConfig] = None,
+) -> dict:
+    """Build configuration dictionary from CLI arguments.
     
-    Processes images through a sequence of preprocessing steps (e.g., denoising, resizing).
-    Each step can be configured with step-specific arguments using the --component{i}-* prefix.
+    Helper function that extracts common options from Typer context and combines them
+    with command-specific arguments to create a configuration dictionary for Pydantic models.
     
-    Input and output can be specified either directly or using nested config options:
-    - Direct: --input path/to/file (uses parser to create FileListConfig)
-    - Nested: --input-paths path/to/file (uses Typer's default prefix strategy)
-    - Direct: --output path/to/output (uses parser to create ImageWriterConfig)
-    - Nested: --output-path path/to/output (uses Typer's default prefix strategy)
-    
-    Examples:
-        vistiq preprocess --input input.tif --output output --step DoG --component0-sigma-low 1.0
-        vistiq preprocess --input input.tif --step Resize --component0-width 256 --component0-height 256 --step DoG --component1-sigma-low 1.0
+    Args:
+        ctx: Typer context containing global options (loglevel, device, processes).
+        input: Optional input file list configuration.
+        labels: Optional labels file list configuration (for train command).
+        dataset: Optional dataset creator configuration (for train command).
+        loader: Optional data loader configuration.
+        step: Optional list of processing step configurations.
+        output: Optional output writer configuration.
+        
+    Returns:
+        Dictionary containing configuration values ready for Pydantic model instantiation.
     """
     logger.info(f"CLI input: {input}")
+    logger.info(f"CLI label: {labels}")
+    logger.info(f"CLI dataset: {dataset}")
     logger.info(f"CLI loader: {loader}")
     logger.info(f"CLI component: {step}")
     logger.info(f"CLI output: {output}")
@@ -607,6 +732,12 @@ def preprocess_cmd(
         loglevel = "INFO"
         device = "auto"
         processes = 1
+    
+    # Validate device value matches Literal type
+    valid_devices = ("cuda", "mps", "cpu", "auto")
+    if device not in valid_devices:
+        logger.warning(f"Invalid device value '{device}', defaulting to 'auto'")
+        device = "auto"
 
     # Only pass loader/output if they're not None, otherwise use defaults from default_factory
     config_kwargs = {
@@ -616,16 +747,139 @@ def preprocess_cmd(
         "device": device,
         "processes": processes,
     }
+    if labels is not None:
+        config_kwargs["labels"] = labels
+    if dataset is not None:
+        config_kwargs["dataset"] = dataset
     if loader is not None:
         config_kwargs["loader"] = loader
     if output is not None:
         config_kwargs["output"] = output
-    config = CLIPreprocessorConfig(**config_kwargs)
+    return config_kwargs
 
+
+@app.command("preprocess")
+def preprocess_cmd(
+    ctx: Context,
+    input: Optional[FileListConfig] = Option(None, "--input", "-i", help="Input file or directory configuration", parser=cli_to_filelist_config),
+    loader: Optional[ImageLoaderConfig] = Option(None, "--loader", help="Configuration to specify the data loader to use", parser=cli_to_imageloader_config),
+    step: List[PreprocessorConfig] = Option(None, "--step", "-s", help="Processing step/component to include (can be specified multiple times). Use --step NAME to add a step.", parser=cli_to_component_config),
+    output: Optional[ImageWriterConfig] = Option(None, "--output", "-o", help="Output file or directory configuration", parser=cli_to_imagewriter_config),
+) -> None:
+    """Preprocess images with a chain of preprocessing steps.
+
+    Processes images through a sequence of preprocessing steps (e.g., denoising, resizing).
+    Each step can be specified multiple times using --step/-s and configured with step-specific 
+    arguments using the --step{i}-* prefix pattern (e.g., --step0-sigma-low, --step1-width).
+    
+    Input and output can be specified as:
+    - Simple path: --input path/to/file or --input '{"paths": "path/to/file"}'
+    - JSON config: --input '{"paths": "path/to/dir", "include": "*.tif", "exclude": ["*.tmp"]}'
+    - Simple path: --output path/to/output or --output '{"path": "path/to/output"}'
+    
+    Examples:
+        # Simple usage with default DoG configuration
+        vistiq preprocess -i input.tif -o output -s DoG
+        
+        # Multiple steps with JSON configuration
+        vistiq preprocess -i input.tif -o output -s '{"classname":"Resize", "width":256, "height":256}' -s '{"classname": "DoG", "sigma_low": 10, "sigma_high": 20}'
+        
+        # Step name with default config
+        vistiq preprocess -i input.tif -o output -s Resize -s DoG
+    
+    """
+    # Create config from CLI arguments (labels and dataset are not used in preprocess)
+    config_kwargs = cli_command_config(ctx, input=input, labels=None, dataset=None, loader=loader, step=step, output=output)
+    config = CLIPreprocessorConfig(**config_kwargs)
     # Call run_preprocess with the complete CLIPreprocessorConfig
     run_preprocess(config)
 
-@flow
+
+@app.command("segment")
+def segment_cmd(
+    ctx: Context,
+    input: Optional[FileListConfig] = Option(None, "--input", "-i", help="Input file or directory configuration", parser=cli_to_filelist_config),
+    loader: Optional[ImageLoaderConfig] = Option(None, "--loader", help="Configuration to specify the data loader to use", parser=cli_to_imageloader_config),
+    step: List[StackProcessorConfig] = Option(None, "--step", "-s", help="Processing step/component to include (can be specified multiple times). Use --step NAME to add a step.", parser=cli_to_component_config),
+    output: Optional[ImageWriterConfig] = Option(None, "--output", "-o", help="Output file or directory configuration", parser=cli_to_imagewriter_config),
+) -> None:
+    """Segment and label images with a chain of processing steps.
+
+    Processes images through a sequence of thresholding, segmentation, and labelling steps.
+    Each step can be specified multiple times using --step/-s and configured with step-specific 
+    arguments using the --step{i}-* prefix pattern (e.g., --step0-threshold, --step1-method).
+    
+    Input and output can be specified as:
+    - Simple path: --input path/to/file or --input '{"paths": "path/to/file"}'
+    - JSON config: --input '{"paths": "path/to/dir", "include": "*.tif", "exclude": ["*.tmp"]}'
+    - Simple path: --output path/to/output or --output '{"path": "path/to/output"}'
+    
+    Examples:
+        # Simple usage with default Otsu thresholding
+        vistiq segment -i input.tif -o output -s OtsuThreshold
+        
+        # Multiple steps with JSON configuration
+        vistiq segment -i '{"paths": "~/test/", "include": "*.tif"}' -o ~/output -s OtsuThreshold -s Watershed
+        
+        # Step with custom configuration via JSON
+        vistiq segment -i input.tif -o output -s '{"classname": "OtsuThreshold", "threshold": 0.5}'
+    
+    """
+    # Create config from CLI arguments (labels and dataset are not used in segment, loader is optional)
+    config_kwargs = cli_command_config(ctx, input=input, labels=None, dataset=None, loader=loader, step=step, output=output)
+    config = CLISegmenterConfig(**config_kwargs)
+    # Call run_segment with the complete CLISegmenterConfig
+    run_segment(config)
+
+@app.command("train")
+def train_cmd(
+    ctx: Context,
+    input: Optional[FileListConfig] = Option(None, "--input", "-i", help="Input file or directory configuration", parser=cli_to_filelist_config),
+    labels: Optional[FileListConfig] = Option(None, "--labels", "-l", help="Input file or directory configuration", parser=cli_to_filelist_config),
+    dataset: Optional[DatasetCreatorConfig] = Option(None, "--dataset-creator", "-d", help="Configuration to specify the dataset creator to use", parser=cli_to_component_config),
+    loader: Optional[ImageLoaderConfig] = Option(None, "--loader", help="Configuration to specify the data loader to use", parser=cli_to_imageloader_config),
+    step: List[TrainerConfig] = Option(None, "--step", "-s", help="Processing step/component to include (can be specified multiple times). Use --step NAME to add a step.", parser=cli_to_component_config),
+    output: Optional[ImageWriterConfig] = Option(None, "--output", "-o", help="Output file or directory configuration", parser=cli_to_imagewriter_config),
+) -> None:
+    """Train a model with a chain of processing steps.
+
+    Trains models (e.g., MicroSAM) using paired image and label datasets. The command handles
+    dataset creation, splitting into training/validation sets, and model training.
+    Each step can be specified multiple times using --step/-s and configured with step-specific 
+    arguments using the --step{i}-* prefix pattern.
+    
+    Input and output can be specified as:
+    - Simple path: --input path/to/file or --input '{"paths": "path/to/file"}'
+    - JSON config: --input '{"paths": "path/to/dir", "include": "*.tif", "exclude": ["*.tmp"]}'
+    - Same for --labels (required for training)
+    - Simple path: --output path/to/output or --output '{"path": "path/to/output"}'
+    
+    Examples:
+        # Train MicroSAM with image and label pairs
+        vistiq train --input '{"paths":"~/test/", "include":"*Preprocessed_Red.tif", "exclude": "*training*"}' --labels '{"paths":"~/test/", "include":"*Labelled_Red.tif", "exclude": "*training*"}' --output ~/trained --step '{"classname": "MicroSAMTrainer"}'
+        
+        # With custom dataset creator configuration
+        vistiq train -i '{"paths": "~/images/"}' -l '{"paths": "~/labels/"}' -o ~/trained -d '{"classname": "DatasetCreator", "random_samples": 10}' -s MicroSAMTrainer
+    
+    """
+    # Create config from CLI arguments
+    config_kwargs = cli_command_config(ctx, input=input, labels=labels, dataset=dataset, loader=loader, step=step, output=output)
+    config = CLITrainerConfig(**config_kwargs)
+
+    # properly connect components to dataset creator
+    patterns = (config.input.include[0] if config.input.include is not None else None, config.labels.include[0] if config.labels.include is not None else None) 
+    dc = config.dataset.copy(update={
+        "patterns": patterns, 
+        "out_path": config.output.path,
+        "random_samples": 5,
+        "remove_empty_labels": True})
+    config = config.copy(update={"dataset": dc})
+
+    # Call run_training with the complete CLITrainerConfig
+    run_training(config)
+
+
+@flow(name="vistiq.preprocess")
 def run_preprocess(config: CLIPreprocessorConfig) -> None:
     """Run the preprocess command.
     
@@ -730,6 +984,165 @@ def run_preprocess(config: CLIPreprocessorConfig) -> None:
             description=f"Processed file {first_file.name}: number {f_idx + 1} of {len(file_list)}",
         )
 
+@flow(name="vistiq.segment")
+def run_segment(config: CLISegmenterConfig) -> None:
+    """Run the segment command.
+    
+    Processes images through a chain of segmentation steps (thresholding, segmentation, labelling),
+    handling multiple scenes and channels. Saves segmented images as OME-TIFF files with metadata.
+
+    Args:
+        config: Segment configuration containing input/output configuration,
+                step configurations, and processing parameters. The config includes
+                loglevel, device, and processes from CLIAppConfig (inherited from
+                CLIAppConfig via CLISubcommandConfig).
+                
+    The function:
+    1. Builds processing step chain from configuration
+    2. Loads images from input path (supports multiple scenes)
+    3. Processes each channel through the step chain
+    4. Saves segmented images to output directory with metadata
+    """
+    logger.info(f"Running preprocess command with config: {config}")
+    
+    # Build FileList from config and get files
+    file_list_result = FileList(config.input).run()
+    # Prefect tasks return the actual value, but ensure we have a list
+    if isinstance(file_list_result, list):
+        file_list = file_list_result
+    else:
+        # If Prefect wrapped it somehow, try to unwrap
+        file_list = list(file_list_result) if hasattr(file_list_result, '__iter__') else [file_list_result]
+    
+    if not file_list:
+        raise ValueError(f"No files found for input path: {config.input.paths}")
+    
+    first_file = file_list[0]
+    logger.info(f"Found {len(file_list)} files, using the first one: {first_file}")
+
+    # Build component chain from config
+    component_names, built_components = build_component_chain(config.step)
+    
+    # Get absolute path of input and strip extension for output directory
+    # first_file should already be a Path object from the validator
+    if isinstance(first_file, Path):
+        input_path_obj = first_file.resolve()
+        input_path_str = str(first_file)
+    else:
+        # Fallback: convert to Path if somehow it's not
+        input_path_obj = Path(first_file).resolve()
+        input_path_str = str(first_file)
+    
+    # Determine output directory (defaults to current directory if not specified)
+    if config.output and config.output.path:
+        # config.output.path is already a Path object from the validator, but ~/ hasn't been expanded yet
+        output_base = config.output.path.expanduser().resolve()
+    else:
+        output_base = Path.cwd().resolve()
+    
+    scenes = get_scenes(input_path_str)
+    progress_id = create_progress_artifact(
+        progress=0.0,
+        description="Indicates the progress of processing image scenes.",
+    )
+    for f_idx, first_file in enumerate(file_list):
+        for idx, sc in enumerate(scenes):
+            logger.info(f"Processing scene: {sc}")
+            # Load image with substack slicing if specified
+            
+            loader_config = config.loader.copy(update={"scene_index": idx})
+            img, metadata = ImageLoader(loader_config).run(path=first_file)
+
+            #img, metadata = load_image(input_path_str, scene_index=idx, substack=substack_slices, squeeze=True, rename_channel=config.loader.rename_channel if config.loader else None)
+            channel_names = metadata["channel_names"]
+            
+            ishape = str(img.shape).replace(" ", "")
+            component_names_str = "-".join(component_names) if component_names else "none"
+            output_dir = output_base / input_path_obj.stem / f"{sc}-{ishape}-{component_names_str}"
+            os.makedirs(output_dir, exist_ok=True)
+            logger.info(f"Output directory: {output_dir}")
+
+            logger.info(f"Image shape: {img.shape}, channel names: {channel_names}, metadata: {metadata}")
+
+            result = img
+            result_metadata = metadata
+            # Use config.processes if available, otherwise default to 1 (single process)
+            # Ensure workers is a positive integer, not -1 (which means "use all cores")
+            workers = config.processes if config.processes is not None and config.processes > 0 else 1
+            logger.info(f"Using workers={workers} (from config.processes={config.processes}) for component processing")
+            for i, component in enumerate(built_components):
+                logger.info(f"Running component {i+1}/{len(built_components)}: {component.name()} with workers={workers}")
+                result, result_metadata = component.run(result, workers=workers, metadata=result_metadata)
+            
+            result_metadata.update({"dim_order":_infer_dim_order(result.ndim)})
+            logger.info(f"Result shape: {result.shape}, metadata: {result_metadata}")
+            logger.info(f"Channel axis: {result_metadata.get('channel_axis', None)}")
+            logger.info(f"result metadata: {result_metadata}")
+            imgwriter = ImageWriter(config.output)
+            #preprocessed = np.stack(result, axis=0)
+            output_path = output_dir / f"Preprocessed.tif"
+            #OmeTiffWriter.save(preprocessed, str(output_path), physical_pixel_sizes=metadata["used_scale"], channel_names=channel_names, dim_order=_infer_dim_order(preprocessed.ndim))
+            imgwriter.run(result, output_path, metadata=result_metadata)
+        update_progress_artifact(
+            artifact_id=progress_id,
+            progress=float(f_idx + 1) / len(file_list),
+            description=f"Processed file {first_file.name}: number {f_idx + 1} of {len(file_list)}",
+        )
+
+@flow(name="vistiq.train")
+def run_training(config: CLITrainerConfig) -> None:
+    """Run the train command.
+    
+    Trains a model using the input images and labelled images.
+    """
+    logger.info(f"Running train command with config: {config}")
+
+    # Build FileList from config and get image files
+    input_list_result = FileList(config.input).run()
+    # Prefect tasks return the actual value, but ensure we have a list
+    if isinstance(input_list_result, list):
+        input_list = input_list_result
+    else:
+        # If Prefect wrapped it somehow, try to unwrap
+        input_list = list(input_list_result) if hasattr(input_list_result, '__iter__') else [input_list_result]
+    if not input_list:
+        raise ValueError(f"No files found for input path: {config.input.paths}")
+
+    # Build FileList from config and get labelled image files
+    labels_list_result = FileList(config.labels).run()
+    if isinstance(labels_list_result, list):
+        labels_list = labels_list_result
+    else:
+        labels_list = list(labels_list_result) if hasattr(labels_list_result, '__iter__') else [labels_list_result]
+    if not labels_list:
+        raise ValueError(f"No files found for labels path: {config.labels.paths}")
+
+    logger.info(input_list)
+    logger.info(labels_list)
+    dataset_creator = DatasetCreator(config.dataset)
+    img_label_pairs = dataset_creator.run(input_list, labels_list)
+
+    if len(img_label_pairs) == 0:
+        logger.warning("No matching pairs found, exiting")
+        return
+
+    # Reformat pairs into separate lists for MicroSAMTrainer.run
+    image_paths: List[str] = [str(img_path) for img_path, _ in img_label_pairs]
+    label_paths: List[str] = [str(lbl_path) for _, lbl_path in img_label_pairs]
+
+    # Create trainer and run
+    # Create MicroSAMTrainerConfig from TrainConfig
+    # MicroSAMTrainerConfig inherits from TrainerConfig, so we pass all fields
+    # Note: device is already resolved in main() function (auto -> actual device)
+    microsam_trainer_config = None
+    for c in config.step:
+        if isinstance(c, MicroSAMTrainerConfig):
+            microsam_trainer_config = c.copy(update={"device": config.device})
+            break
+    if microsam_trainer_config is None:
+        raise ValueError("No MicroSAMTrainerConfig found in 'step'")
+    trainer = MicroSAMTrainer(microsam_trainer_config)
+    trainer.run(image_paths, label_paths)
 
 def main() -> None:
     """Entry point for the vistiq CLI using Typer.

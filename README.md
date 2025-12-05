@@ -37,219 +37,149 @@ Vistiq is reading image files using the [Bioio](https://github.com/bioio-devs/bi
 
 ## Running the Vistiq application
 
-Vistiq provides several subcommands for image analysis:
+Vistiq provides several subcommands for image analysis. The following commands are available in the new Typer-based CLI:
+
+- **preprocess** - Preprocess images with a chain of preprocessing steps
+- **segment** - Segment and label images with a chain of processing steps  
+- **train** - Train models using paired image and label datasets
+
+**Note:** The `analyze`, `coincidence`, `full`, and `workflow` subcommands are currently available through the legacy argparse-based CLI. They will be migrated to the new Typer-based CLI in a future release.
+
+All commands use a flexible, JSON-based configuration system that allows you to specify paths, patterns, and component configurations.
 
 ### Preprocess
 
-Preprocess images with denoising and filtering operations:
+Preprocess images with a chain of preprocessing steps (e.g., denoising, resizing):
 
 ```bash
-vistiq preprocess -i imagestack.nd2 -o my_outputdir -g --substack 1-100
+# Simple usage with default DoG configuration
+vistiq preprocess -i input.tif -o output -s DoG
+
+# Multiple steps with JSON configuration
+vistiq preprocess -i input.tif -o output -s '{"classname":"Resize", "width":256, "height":256}' -s '{"classname": "DoG", "sigma_low": 10, "sigma_high": 20}'
+
+# Step name with default config
+vistiq preprocess -i input.tif -o output -s Resize -s DoG
+
+# With file list configuration
+vistiq preprocess -i '{"paths": "~/test/", "include": "*.tif", "exclude": ["*.tmp"]}' -o ~/output -s DoG
 ```
 
-**Preprocess-specific arguments:**
-```
-  --preprocess-method {dog,noise2stack,none}
-                        preprocessing method to use (default: dog)
-  --sigma-low SIGMA_LOW
-                        sigma for lower Gaussian blur in DoG (default: 1.0)
-  --sigma-high SIGMA_HIGH
-                        sigma for higher Gaussian blur in DoG (default: 5.0)
-  --mode {reflect,constant,nearest,mirror,wrap}
-                        border handling mode for Gaussian filtering (default: reflect)
-  --window WINDOW       temporal window size for Noise2Stack denoising (odd recommended, default: 5)
-  --exclude-center      exclude center frame from Noise2Stack average (default: True)
-  --no-exclude-center   include center frame in Noise2Stack average
-  --normalize           normalize output to [0, 1] range (default: True)
-  --no-normalize        do not normalize output
-```
+**Available preprocessing steps:**
+- `DoG` - Difference of Gaussians filtering
+- `Resize` - Image resizing
+- `Noise2Stack` - Temporal denoising
+
+**Preprocess options:**
+- `-i, --input`: Input file or directory configuration (can be a path string or JSON config)
+- `-o, --output`: Output file or directory configuration (can be a path string or JSON config)
+- `-s, --step`: Processing step/component (can be specified multiple times). Use step name or JSON config
+- `--loader`: Optional image loader configuration (defaults to ImageLoaderConfig)
 
 ### Segment
 
-Segment images to identify objects using thresholding and labeling:
+Segment and label images with a chain of processing steps (thresholding, segmentation, labelling):
 
 ```bash
-vistiq segment -i imagestack.nd2 -o my_outputdir -g --substack 1-100
+# Simple usage with default Otsu thresholding
+vistiq segment -i input.tif -o output -s OtsuThreshold
+
+# Multiple steps
+vistiq segment -i '{"paths": "~/test/", "include": "*.tif"}' -o ~/output -s OtsuThreshold -s Watershed
+
+# Step with custom configuration via JSON
+vistiq segment -i input.tif -o output -s '{"classname": "OtsuThreshold", "threshold": 0.5}'
+
+# Using MicroSAMSegmenter for instance segmentation
+vistiq segment -i input.tif -o output -s '{"classname": "MicroSAMSegmenter", "model_type": "vit_l_lm"}'
+
+# MicroSAMSegmenter with custom model type
+vistiq segment -i input.tif -o output -s '{"classname": "MicroSAMSegmenter", "model_type": "vit_b_lm"}'
 ```
 
-**Segment-specific arguments:**
-```
-  --threshold-method {otsu,local,niblack,sauvola}
-                        thresholding method to use (default: otsu)
-  --block-size BLOCK_SIZE
-                        block size for local thresholding (must be odd, default: 51)
-  --connectivity {1,2}  connectivity for labeling (1 or 2, default: 1)
-  --min-area MIN_AREA   minimum object area for filtering
-  --max-area MAX_AREA   maximum object area for filtering
-```
+**Available segmentation steps:**
+- `OtsuThreshold` - Otsu thresholding
+- `LocalThreshold` - Local thresholding
+- `Watershed` - Watershed segmentation
+- `Labeller` - Connected components labelling
+- `MicroSAMSegmenter` - MicroSAM-based instance segmentation
 
-### Analyze
+**Segment options:**
+- `-i, --input`: Input file or directory configuration (can be a path string or JSON config)
+- `-o, --output`: Output file or directory configuration (can be a path string or JSON config)
+- `-s, --step`: Processing step/component (can be specified multiple times). Use step name or JSON config
+- `--loader`: Optional image loader configuration (defaults to ImageLoaderConfig)
 
-Analyze segmented images to extract object properties and statistics:
-
-```bash
-vistiq analyze -i segmented_images/ -o analysis_results/ -g
-```
-
-**Analyze-specific arguments:**
-```
-  --include-stats       include object statistics in analysis (default: True)
-  --no-stats            exclude object statistics from analysis
-  --include-coords      include coordinate extraction (default: True)
-  --no-coords           exclude coordinate extraction
-```
-
-### Coincidence Detection
-
-Run a complete workflow for coincidence detection with DoG preprocessing, MicroSAM segmentation, and overlap analysis:
-
-```bash
-vistiq coincidence -i imagestack.nd2 -o output/ -g --substack T:4-10;Z:2-20
-```
-
-**Coincidence-specific arguments:**
-```
-  --sigma-low SIGMA_LOW
-                        sigma for lower Gaussian blur in DoG (default: 1.0)
-  --sigma-high SIGMA_HIGH
-                        sigma for higher Gaussian blur in DoG (default: 12.0)
-  --normalize           normalize DoG output to [0, 1] range (default: True)
-  --no-normalize        disable normalization of DoG output
-  --area-min AREA_MIN
-                        minimum area for area filter (default: 100)
-  --area-max AREA_MAX
-                        maximum area for area filter (default: 10000)
-  --volume-min VOLUME_MIN
-                        minimum volume for volume filter (default: 100)
-  --volume-max VOLUME_MAX
-                        maximum volume for volume filter (default: 10000)
-  --model-type {vit_l_lm,vit_b_lm,vit_t_lm,vit_h_lm}
-                        MicroSAM model type (default: vit_l_lm)
-  --threshold THRESHOLD
-                        threshold for coincidence detection (default: 0.1)
-  --method {iou,dice}   coincidence detection method (default: dice)
-  --mode {bounding_box,outline}
-                        coincidence detection mode (default: outline)
-```
-
-**Note:** The coincidence command does not require an output path. Results are saved to a directory based on the input file path (with extension stripped).
-
-### Full Pipeline
-
-Run the complete pipeline (segment + analyze) in a single command:
-
-```bash
-vistiq full -i imagestack.nd2 -o results/ -g --substack 1-100 --threshold-method otsu
-```
-
-**Full pipeline arguments:**
-Includes all arguments from both `segment` and `analyze` subcommands.
-
-
-### Workflow
-
-Build and run modular workflows from CLI-specified components:
-
-```bash
-vistiq workflow -i imagestack.nd2 -o output/ --component DoG --component OtsuThreshold
-```
-
-**Workflow-specific arguments:**
-```
-  --component COMPONENT  Component to include in workflow (can be specified multiple times)
-                        Available components are auto-discovered from registered modules
-```
-
-The workflow subcommand allows you to dynamically build analysis pipelines by specifying components and their configurations via command-line arguments. All registered `Configurable` classes from `vistiq.preprocess`, `vistiq.seg`, `vistiq.analysis`, and `vistiq.core` modules are available.
+**Note:** The `analyze`, `coincidence`, `full`, and `workflow` subcommands are currently available through the legacy argparse-based CLI in `vistiq.app`. They will be migrated to the new Typer-based CLI in a future release.
 
 ### Common Arguments
 
 All subcommands support these common arguments:
 
-#### `-i, --input INPUT_PATH` (required)
-Specifies the input image file or directory containing image files to be processed. 
+#### `-i, --input INPUT` (required for most commands)
+Specifies the input file or directory configuration. Can be provided as:
 
-- **Single file**: Provide the path to a single image file (e.g., `data/image.nd2`, `data/stack.tiff`)
-- **Directory**: Provide the path to a directory containing multiple image files (e.g., `data/images/`)
-- The input path can be absolute or relative to the current working directory
-- Supported formats depend on installed bioio plugins (common formats: `.tiff`, `.ome-tiff`, `.nd2`, `.czi`, `.lif`, `.zarr`, etc.)
+- **Simple path string**: `--input path/to/file.tif` or `--input ~/images/`
+- **JSON configuration**: `--input '{"paths": "path/to/dir", "include": "*.tif", "exclude": ["*.tmp"]}'`
 
-**Example:**
-```bash
-vistiq segment -i /path/to/images.nd2 -o output/
-vistiq analyze -i ./segmented_images/ -o results/
-```
-
-#### `-o, --output OUTPUT_PATH` (optional)
-Specifies where processed results should be saved.
-
-- **File**: For single-file outputs, provide the full path including filename (e.g., `output/result.tiff`)
-- **Directory**: For multi-file outputs, provide a directory path (e.g., `output/segmented/`)
-- The output directory will be created if it doesn't exist
-- **Default**: If not specified, results are saved to the current working directory
-
-**Example:**
-```bash
-# Specify output directory
-vistiq preprocess -i data/image.tiff -o output/preprocessed/
-vistiq segment -i data/image.tiff -o output/segmented/
-
-# Use default (current directory)
-vistiq preprocess -i data/image.tiff
-vistiq coincidence -i data/image.tiff
-```
-
-#### `-f, --substack SUBSTACK` (optional)
-Selects a subset of the image data to process, allowing you to work with specific frames, slices, or channels without processing the entire dataset.
-
-**Two formats are supported:**
-
-1. **Legacy format** (applied to first axis):
-   - Single frame: `'10'` - processes only frame 10 (1-based indexing)
-   - Frame range: `'2-40'` - processes frames 2 through 40, inclusive (1-based indexing)
-   - The first axis may be time (T), Z-stack, or another dimension depending on the image
-
-2. **New format** (explicit dimension names):
-   - Multiple dimensions: `'T:4-10;Z:2-20'` - processes time points 4-10 and Z-slices 2-20
-   - Single dimension: `'C:1'` - processes only channel 1 (first channel)
-   - Dimension names: `T` (time), `Z` (depth), `C` (channel), `Y` (height), `X` (width)
-   - **All ranges are 1-based and inclusive** (e.g., `T:4-10` includes both frame 4 and frame 10)
-   - Multiple dimensions are semicolon-separated (`;`)
-   - Minimum value is 1 (not 0)
-
-**Default behavior**: If `--substack` is not specified, all frames/slices/channels are processed.
+**JSON configuration options:**
+- `paths`: String, Path, or list of paths (files or directories) to search
+- `include`: String or list of file patterns to include (e.g., `"*.tif"` or `["*.tif", "*.tiff"]`)
+- `exclude`: String or list of file patterns to exclude (e.g., `"*training*"` or `["*.tmp", "*.bak"]`)
+- `files`: Boolean - whether to search for files (default: `true`)
+- `directories`: Boolean - whether to search for directories (default: `false`)
+- `recursive`: Boolean - whether to search recursively (default: `true`)
 
 **Examples:**
 ```bash
-# Process single frame (legacy format)
-vistiq segment -i data/image.tiff -o output/ --substack 10
+# Simple path
+vistiq segment -i input.tif -o output/
 
-# Process frame range (legacy format)
-vistiq segment -i data/image.tiff -o output/ --substack 2-40
+# Directory with pattern matching
+vistiq preprocess -i '{"paths": "~/test/", "include": "*.tif", "exclude": "*training*"}' -o output/
 
-# Process specific time and Z ranges (new format, semicolon-separated)
-vistiq segment -i data/image.tiff -o output/ --substack T:4-10;Z:2-20
-
-# Process specific channel and Z range (1-based indexing)
-vistiq segment -i data/image.tiff -o output/ --substack C:1;Z:5-50
-
-# Process specific time points and channels (1-based indexing)
-vistiq analyze -i data/image.tiff -o output/ --substack T:1-5;C:1-2
+# Multiple paths
+vistiq segment -i '{"paths": ["path1/", "path2/"], "include": "*.tif"}' -o output/
 ```
 
-#### `-g, --grayscale` (optional)
-Converts loaded images to grayscale before processing.
+#### `-o, --output OUTPUT` (optional)
+Specifies the output file or directory configuration. Can be provided as:
 
-- Useful when working with color/multi-channel images but only intensity information is needed
-- Reduces memory usage and processing time for color images
-- If not specified, images are processed in their original format
+- **Simple path string**: `--output path/to/output` or `--output ~/results/`
+- **JSON configuration**: `--output '{"path": "path/to/output", "format": "tif", "overwrite": false}'`
 
-**Example:**
+**Default**: Current working directory (`.`)
+
+**Examples:**
 ```bash
-vistiq segment -i data/color_image.tiff -o output/ -g
+# Simple path
+vistiq segment -i input.tif -o ~/output/
+
+# JSON configuration
+vistiq preprocess -i input.tif -o '{"path": "~/output/", "format": "tif", "overwrite": true}'
 ```
 
-#### `-l, --loglevel {DEBUG,INFO,WARNING,ERROR,CRITICAL}` (optional)
+#### `-s, --step STEP` (optional, can be specified multiple times)
+Specifies a processing step/component to include in the pipeline. Can be provided as:
+
+- **Component name**: `--step DoG` or `--step OtsuThreshold` (uses default configuration)
+- **JSON configuration**: `--step '{"classname": "DoG", "sigma_low": 1.0, "sigma_high": 5.0}'`
+
+Steps are executed in the order they are specified. Each step can be configured with step-specific arguments using the `--step{i}-*` prefix pattern (e.g., `--step0-sigma-low`, `--step1-threshold`).
+
+**Examples:**
+```bash
+# Single step with default config
+vistiq preprocess -i input.tif -o output -s DoG
+
+# Multiple steps
+vistiq segment -i input.tif -o output -s OtsuThreshold -s Watershed
+
+# Step with JSON configuration
+vistiq preprocess -i input.tif -o output -s '{"classname": "Resize", "width": 256, "height": 256}'
+```
+
+#### `--loglevel {DEBUG,INFO,WARNING,ERROR,CRITICAL}` (optional)
 Sets the verbosity level for logging output.
 
 - **DEBUG**: Most verbose, shows detailed diagnostic information
@@ -265,53 +195,31 @@ Sets the verbosity level for logging output.
 vistiq segment -i data/image.tiff -o output/ --loglevel DEBUG
 ```
 
-#### `-p, --processes PROCESSES` (optional)
+#### `--device {auto,cuda,mps,cpu}` (optional)
+Specifies the device to use for processing.
+
+- **auto**: Automatically select the best available device (default)
+- **cuda**: Use CUDA GPU if available
+- **mps**: Use Apple Metal Performance Shaders (MPS) if available
+- **cpu**: Use CPU only
+
+**Default**: `auto`
+
+**Example:**
+```bash
+vistiq segment -i data/image.tiff -o output/ --device cuda
+```
+
+#### `--processes PROCESSES` (optional)
 Specifies the number of parallel processes to use for processing.
 
 - Use a positive integer to specify the exact number of processes (e.g., `4` for 4 processes)
-- Use `-1` to use all available CPU cores
 - **Default**: `1` (single-threaded processing)
 
 **Example:**
 ```bash
 # Use 4 parallel processes
 vistiq segment -i data/image.tiff -o output/ --processes 4
-
-# Use all available cores
-vistiq preprocess -i data/image.tiff -o output/ --processes -1
-```
-
-#### `--split-channels` / `--no-split-channels` (optional)
-Controls whether multi-channel images are saved into separate files after processing.
-
-- **`--split-channels`**: Split each channel into a separate output file (default)
-- **`--no-split-channels`**: Keep all channels in a single output file
-
-**Default**: `--split-channels` (channels are split by default)
-
-**Example:**
-```bash
-# Split channels into separate files (default)
-vistiq segment -i data/multichannel.tiff -o output/ --split-channels
-
-# Keep all channels in one file
-vistiq preprocess -i data/multichannel.tiff -o output/ --no-split-channels
-```
-
-#### `--rename-channel RENAME_STRING` (optional)
-Renames channel names in the loaded image metadata.
-
-- Format: `"old1:new1;old2:new2"` - semicolon-separated pairs of old:new channel names
-- Only channels specified in the mapping will be renamed; others remain unchanged
-- Useful for standardizing channel names across different datasets or matching expected names
-
-**Example:**
-```bash
-# Rename "Red" to "Dpn" and "Blue" to "EDU"
-vistiq segment -i data/image.tiff -o output/ --rename-channel "Red:Dpn;Blue:EDU"
-
-# Rename a single channel
-vistiq preprocess -i data/image.tiff -o output/ --rename-channel "Channel_1:DAPI"
 ```
 
 #### `-h, --help`
@@ -321,65 +229,58 @@ Displays help information for the command or subcommand.
 
 **Basic preprocessing with DoG:**
 ```bash
-vistiq preprocess -i data/images.tiff -o output/preprocessed/
+vistiq preprocess -i data/images.tiff -o output/preprocessed/ -s DoG
 ```
 
-**Preprocessing with Noise2Stack denoising:**
+**Preprocessing with multiple steps:**
 ```bash
 vistiq preprocess -i data/images.tiff -o output/preprocessed/ \
-  --preprocess-method noise2stack --window 7 --exclude-center
+  -s '{"classname": "Resize", "width": 512, "height": 512}' \
+  -s '{"classname": "DoG", "sigma_low": 1.0, "sigma_high": 5.0}'
 ```
 
-**Custom DoG filtering:**
+**Preprocessing with file list configuration:**
 ```bash
-vistiq preprocess -i data/images.tiff -o output/preprocessed/ \
-  --preprocess-method dog --sigma-low 0.5 --sigma-high 3.0 --mode reflect
+vistiq preprocess -i '{"paths": "~/data/", "include": "*.tif", "exclude": ["*.tmp", "*training*"]}' \
+  -o ~/output/ -s DoG
 ```
 
 **Basic segmentation:**
 ```bash
-vistiq segment -i data/images.tiff -o output/segmented/
+vistiq segment -i data/images.tiff -o output/segmented/ -s OtsuThreshold
 ```
 
-**Segmentation with custom thresholding:**
+**Segmentation with multiple steps:**
 ```bash
 vistiq segment -i data/images.tiff -o output/segmented/ \
-  --threshold-method local --block-size 51 --min-area 10 --max-area 1000
+  -s OtsuThreshold \
+  -s Watershed \
+  -s Labeller
 ```
 
-**Analysis of segmented images:**
+**Segmentation with custom configuration:**
 ```bash
-vistiq analyze -i output/segmented/ -o output/analysis/ --include-stats --include-coords
+vistiq segment -i data/images.tiff -o output/segmented/ \
+  -s '{"classname": "OtsuThreshold", "threshold": 0.5}'
 ```
 
-**Complete pipeline:**
+**Segmentation with MicroSAM:**
 ```bash
-vistiq full -i data/images.tiff -o output/results/ \
-  --threshold-method otsu --connectivity 2 --min-area 5
+# Use MicroSAMSegmenter with default model (vit_l_lm)
+vistiq segment -i data/images.tiff -o output/segmented/ -s MicroSAMSegmenter
+
+# Use MicroSAMSegmenter with custom model type
+vistiq segment -i data/images.tiff -o output/segmented/ \
+  -s '{"classname": "MicroSAMSegmenter", "model_type": "vit_b_lm"}'
 ```
 
-**Coincidence detection with custom parameters:**
+**Training with image and label pairs:**
 ```bash
-vistiq coincidence -i data/images.tiff -g \
-  --substack T:1-10;Z:5-50 \
-  --sigma-low 0.5 --sigma-high 10.0 \
-  --volume-min 50 --volume-max 5000 \
-  --threshold 0.2 --method iou --mode outline
-```
-
-**Substack examples:**
-```bash
-# Process single frame (legacy format, first axis)
-vistiq segment -i data/images.tiff -o output/ --substack 10
-
-# Process frame range (legacy format, first axis)
-vistiq segment -i data/images.tiff -o output/ --substack 2-40
-
-# Process specific time and Z ranges (new format, semicolon-separated, 1-based)
-vistiq segment -i data/images.tiff -o output/ --substack T:4-10;Z:2-20
-
-# Process specific channel and Z range (1-based indexing)
-vistiq segment -i data/images.tiff -o output/ --substack C:1;Z:5-50
+vistiq train \
+  --input '{"paths": "~/images/", "include": "*Preprocessed_Red.tif", "exclude": "*training*"}' \
+  --labels '{"paths": "~/labels/", "include": "*Labelled_Red.tif", "exclude": "*training*"}' \
+  --output ~/trained \
+  --step '{"classname": "MicroSAMTrainer"}'
 ```
 
 ## Using Vistiq in Python/Jupyter
