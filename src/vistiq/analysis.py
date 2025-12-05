@@ -5,6 +5,7 @@ from typing import Literal, Dict, List, Tuple, Optional, Any
 from pydantic import Field, field_validator
 from skimage.measure import regionprops
 from vistiq.core import Configuration, Configurable, StackProcessorConfig, StackProcessor, ChainProcessorConfig, ChainProcessor
+from prefect import task
 from vistiq.workflow import Workflow
 from vistiq.utils import ArrayIterator, ArrayIteratorConfig, create_unique_folder
 
@@ -503,6 +504,7 @@ class CoincidenceDetector(StackProcessor):
         
         return dataframes
 
+    @task(name="CoincidenceDetector.run")
     def run(self, labels1: np.ndarray, labels2: np.ndarray, stack_names: Optional[Tuple[str, str]] = None, metadata: Optional[dict[str, Any]] = None, **kwargs) -> Tuple[List[Dict], Dict[str, pd.DataFrame]]:
         """Run the coincidence detector on a labeled image.
         

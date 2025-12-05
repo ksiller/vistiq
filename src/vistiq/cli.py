@@ -10,7 +10,8 @@ from typing import Optional, Literal, List
 from pydantic import BaseModel, Field, field_validator
 import typer
 from typer import Option, Argument, Context
-
+from prefect import flow
+from prefect.artifacts import create_progress_artifact, update_progress_artifact
 try:
     from bioio_ome_tiff.writers import OmeTiffWriter
     OME_TIFF_AVAILABLE = True
@@ -362,7 +363,7 @@ def build_component_chain(
 
 
 
-@app.callback()
+@app.callback(invoke_without_command=True)
 def common_callback(
     ctx: Context,
     loglevel: str = Option("INFO", help="Logging level"),
@@ -384,9 +385,25 @@ def common_callback(
     #configure_logger(loglevel.upper())
     
     # Store common config in context for subcommands to access
+    # Use ctx.obj (recommended) and ctx.params (for compatibility)
+    if ctx.obj is None:
+        ctx.obj = {}
+    ctx.obj["loglevel"] = loglevel.upper()
+    ctx.obj["device"] = device
+    ctx.obj["processes"] = processes
+    
+    # Also store in ctx.params for backward compatibility
+    if not hasattr(ctx, 'params') or ctx.params is None:
+        ctx.params = {}
     ctx.params["loglevel"] = loglevel.upper()
     ctx.params["device"] = device
     ctx.params["processes"] = processes
+    
+    logger.debug(f"common_callback: Set context - loglevel={loglevel.upper()}, device={device}, processes={processes}")
+    
+    # If no command was provided, just return (don't execute anything)
+    if ctx.invoked_subcommand is None:
+        return
     
 
 def cli_to_config(value: str, default_value_field:str="classname", alt_classname:str=None) -> Configuration:
@@ -418,7 +435,15 @@ def cli_to_config(value: str, default_value_field:str="classname", alt_classname
     # Try to parse as JSON first
     config_dict = {}
     try:
-        parsed = json.loads(value)
+        # Preprocess: fix invalid escape sequences like \ (backslash space) which are common
+        # when users escape spaces in shell commands. In JSON, spaces don't need escaping.
+        # Replace \ followed by space or other non-escape chars with just the char itself
+        # This handles cases where shell escaping gets into JSON strings
+        # Valid JSON escape sequences: \" \\ \/ \b \f \n \r \t \uXXXX
+        import re
+        fixed_value = re.sub(r'\\([^"\\/bfnrtu])', r'\1', value)
+        
+        parsed = json.loads(fixed_value)
         if isinstance(parsed, dict):
             config_dict = parsed.copy()  # Use a copy to avoid modifying the original
             logger.debug(f"Parsed JSON dict: {config_dict}")
@@ -565,8 +590,32 @@ def preprocess_cmd(
     logger.info(f"CLI component: {step}")
     logger.info(f"CLI output: {output}")
 
+    # Get common options from context (set by common_callback)
+    # Try ctx.obj first (recommended), then ctx.params (for compatibility)
+    if ctx.obj is not None and isinstance(ctx.obj, dict):
+        loglevel = ctx.obj.get("loglevel", "INFO")
+        device = ctx.obj.get("device", "auto")
+        processes = ctx.obj.get("processes", 1)
+        logger.debug(f"Retrieved from ctx.obj: loglevel={loglevel}, device={device}, processes={processes}")
+    elif hasattr(ctx, 'params') and ctx.params is not None:
+        loglevel = ctx.params.get("loglevel", "INFO")
+        device = ctx.params.get("device", "auto")
+        processes = ctx.params.get("processes", 1)
+        logger.debug(f"Retrieved from ctx.params: loglevel={loglevel}, device={device}, processes={processes}")
+    else:
+        logger.info("Context not available, using defaults")
+        loglevel = "INFO"
+        device = "auto"
+        processes = 1
+
     # Only pass loader/output if they're not None, otherwise use defaults from default_factory
-    config_kwargs = {"input": input, "step": step}
+    config_kwargs = {
+        "input": input,
+        "step": step,
+        "loglevel": loglevel,
+        "device": device,
+        "processes": processes,
+    }
     if loader is not None:
         config_kwargs["loader"] = loader
     if output is not None:
@@ -574,10 +623,10 @@ def preprocess_cmd(
     config = CLIPreprocessorConfig(**config_kwargs)
 
     # Call run_preprocess with the complete CLIPreprocessorConfig
-    run_preprocess(config, ctx)
+    run_preprocess(config)
 
-
-def run_preprocess(config: CLIPreprocessorConfig, ctx: Context) -> None:
+@flow
+def run_preprocess(config: CLIPreprocessorConfig) -> None:
     """Run the preprocess command.
     
     Processes images through a chain of preprocessing steps, handling multiple
@@ -585,7 +634,9 @@ def run_preprocess(config: CLIPreprocessorConfig, ctx: Context) -> None:
 
     Args:
         config: Preprocess configuration containing input/output configuration,
-                step configurations, and processing parameters.
+                step configurations, and processing parameters. The config includes
+                loglevel, device, and processes from CLIAppConfig (inherited from
+                CLIAppConfig via CLISubcommandConfig).
                 
     The function:
     1. Builds processing step chain from configuration
@@ -596,9 +647,17 @@ def run_preprocess(config: CLIPreprocessorConfig, ctx: Context) -> None:
     logger.info(f"Running preprocess command with config: {config}")
     
     # Build FileList from config and get files
-    file_list = FileList(config.input).run()
+    file_list_result = FileList(config.input).run()
+    # Prefect tasks return the actual value, but ensure we have a list
+    if isinstance(file_list_result, list):
+        file_list = file_list_result
+    else:
+        # If Prefect wrapped it somehow, try to unwrap
+        file_list = list(file_list_result) if hasattr(file_list_result, '__iter__') else [file_list_result]
+    
     if not file_list:
-        raise ValueError("No files found for input path: {config.input.paths}")
+        raise ValueError(f"No files found for input path: {config.input.paths}")
+    
     first_file = file_list[0]
     logger.info(f"Found {len(file_list)} files, using the first one: {first_file}")
 
@@ -606,50 +665,71 @@ def run_preprocess(config: CLIPreprocessorConfig, ctx: Context) -> None:
     component_names, built_components = build_component_chain(config.step)
     
     # Get absolute path of input and strip extension for output directory
-    input_path = first_file
-    input_path_obj = Path(input_path).resolve()
-    input_path_str = str(input_path)
+    # first_file should already be a Path object from the validator
+    if isinstance(first_file, Path):
+        input_path_obj = first_file.resolve()
+        input_path_str = str(first_file)
+    else:
+        # Fallback: convert to Path if somehow it's not
+        input_path_obj = Path(first_file).resolve()
+        input_path_str = str(first_file)
     
     # Determine output directory (defaults to current directory if not specified)
     if config.output and config.output.path:
-        output_base = Path(config.output.path).resolve()
+        # config.output.path is already a Path object from the validator, but ~/ hasn't been expanded yet
+        output_base = config.output.path.expanduser().resolve()
     else:
         output_base = Path.cwd().resolve()
     
     scenes = get_scenes(input_path_str)
-    for idx, sc in enumerate(scenes):
-        logger.info(f"Processing scene: {sc}")
-        # Load image with substack slicing if specified
-        
-        loader_config = config.loader.copy(update={"scene_index": idx})
-        img, metadata = ImageLoader(loader_config).run(path=first_file)
+    progress_id = create_progress_artifact(
+        progress=0.0,
+        description="Indicates the progress of processing image scenes.",
+    )
+    for f_idx, first_file in enumerate(file_list):
+        for idx, sc in enumerate(scenes):
+            logger.info(f"Processing scene: {sc}")
+            # Load image with substack slicing if specified
+            
+            loader_config = config.loader.copy(update={"scene_index": idx})
+            img, metadata = ImageLoader(loader_config).run(path=first_file)
 
-        #img, metadata = load_image(input_path_str, scene_index=idx, substack=substack_slices, squeeze=True, rename_channel=config.loader.rename_channel if config.loader else None)
-        channel_names = metadata["channel_names"]
-        
-        ishape = str(img.shape).replace(" ", "")
-        component_names_str = "-".join(component_names) if component_names else "none"
-        output_dir = output_base / input_path_obj.stem / f"{sc}-{ishape}-{component_names_str}"
-        os.makedirs(output_dir, exist_ok=True)
-        logger.info(f"Output directory: {output_dir}")
+            #img, metadata = load_image(input_path_str, scene_index=idx, substack=substack_slices, squeeze=True, rename_channel=config.loader.rename_channel if config.loader else None)
+            channel_names = metadata["channel_names"]
+            
+            ishape = str(img.shape).replace(" ", "")
+            component_names_str = "-".join(component_names) if component_names else "none"
+            output_dir = output_base / input_path_obj.stem / f"{sc}-{ishape}-{component_names_str}"
+            os.makedirs(output_dir, exist_ok=True)
+            logger.info(f"Output directory: {output_dir}")
 
-        logger.info(f"Image shape: {img.shape}, channel names: {channel_names}, metadata: {metadata}")
+            logger.info(f"Image shape: {img.shape}, channel names: {channel_names}, metadata: {metadata}")
 
-        result = img
-        result_metadata = metadata
-        for i, component in enumerate(built_components):
-            logger.info(f"Running component {i+1}/{len(built_components)}: {component.name()}")
-            result, result_metadata = component.run(result, workers=config.processes, metadata=result_metadata)
-        
-        result_metadata.update({"dim_order":_infer_dim_order(result.ndim)})
-        logger.info(f"Result shape: {result.shape}, metadata: {result_metadata}")
-        logger.info(f"Channel axis: {result_metadata.get('channel_axis', None)}")
-        logger.info(f"result metadata: {result_metadata}")
-        imgwriter = ImageWriter(config.output)
-        #preprocessed = np.stack(result, axis=0)
-        output_path = output_dir / f"Preprocessed.tif"
-        #OmeTiffWriter.save(preprocessed, str(output_path), physical_pixel_sizes=metadata["used_scale"], channel_names=channel_names, dim_order=_infer_dim_order(preprocessed.ndim))
-        imgwriter.run(result, output_path, metadata=result_metadata)
+            result = img
+            result_metadata = metadata
+            # Use config.processes if available, otherwise default to 1 (single process)
+            # Ensure workers is a positive integer, not -1 (which means "use all cores")
+            workers = config.processes if config.processes is not None and config.processes > 0 else 1
+            logger.info(f"Using workers={workers} (from config.processes={config.processes}) for component processing")
+            for i, component in enumerate(built_components):
+                logger.info(f"Running component {i+1}/{len(built_components)}: {component.name()} with workers={workers}")
+                result, result_metadata = component.run(result, workers=workers, metadata=result_metadata)
+            
+            result_metadata.update({"dim_order":_infer_dim_order(result.ndim)})
+            logger.info(f"Result shape: {result.shape}, metadata: {result_metadata}")
+            logger.info(f"Channel axis: {result_metadata.get('channel_axis', None)}")
+            logger.info(f"result metadata: {result_metadata}")
+            imgwriter = ImageWriter(config.output)
+            #preprocessed = np.stack(result, axis=0)
+            output_path = output_dir / f"Preprocessed.tif"
+            #OmeTiffWriter.save(preprocessed, str(output_path), physical_pixel_sizes=metadata["used_scale"], channel_names=channel_names, dim_order=_infer_dim_order(preprocessed.ndim))
+            imgwriter.run(result, output_path, metadata=result_metadata)
+        update_progress_artifact(
+            artifact_id=progress_id,
+            progress=float(f_idx + 1) / len(file_list),
+            description=f"Processed file {first_file.name}: number {f_idx + 1} of {len(file_list)}",
+        )
+
 
 def main() -> None:
     """Entry point for the vistiq CLI using Typer.

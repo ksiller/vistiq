@@ -4,6 +4,7 @@ from pydantic import BaseModel
 import logging
 
 from vistiq.core import Configuration, StackProcessor, StackProcessorConfig
+from prefect import task
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,7 @@ class BaseClass:
         """
         self.config = config
 
+    @task(name="BaseClass.run")
     def run(self, img: np.ndarray, workers: int = -1, verbose: int = 10, metadata: Optional[dict[str, Any]] = None, **kwargs) -> np.ndarray:
         """Run the workflow component on an image.
         
@@ -134,6 +136,7 @@ class WorkflowStep(BaseClass):
         """
         super().__init__(config)
 
+    @task(name="WorkflowStep.run")
     def run(
         self, img: np.ndarray, *args, workers: int = -1, verbose: int = 10, metadata: Optional[dict[str, Any]] = None, **kwargs
     ) -> np.ndarray:

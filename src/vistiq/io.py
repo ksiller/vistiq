@@ -12,19 +12,43 @@ import os
 from pydantic import Field, field_validator
 from bioio import Dimensions,Scale
 from bioio_ome_tiff.writers import OmeTiffWriter
-
 from vistiq.core import Configuration, Configurable
+from prefect import task
 from vistiq.utils import str_to_dict, NamedTuple
 
 logger = logging.getLogger(__name__)
 
-def unstack_image(data: np.ndarray, metadata: dict[str, Any], axis: Union[int, str], key:str="axes") -> tuple[np.ndarray, dict[str, Any]]:
+def unstack_image(data: np.ndarray, metadata: dict[str, Any], axis: Union[int, str], key:str="axes") -> tuple[list[np.ndarray], list[dict[str, Any]]]:
     """Split image data and metadata along a given axis.
     
+    Splits the image array along the specified axis and updates metadata accordingly.
+    When splitting along the channel axis ("C"), each resulting array gets its own
+    channel name from the metadata.
+    
     Args:
-        data: Image data.
-        metadata: Image metadata.
-        axis: Axis to split along.
+        data: Image data array to split.
+        metadata: Image metadata dictionary containing axes information and other metadata.
+        axis: Axis to split along. Can be an integer index or a string axis label (e.g., "C", "T", "Z").
+        key: Key in metadata dictionary that contains the axes labels. Default is "axes".
+        
+    Returns:
+        Tuple of (list of split image arrays, list of metadata dictionaries).
+        Each metadata dictionary corresponds to one split array. When splitting channels,
+        each metadata dict contains a single channel name.
+        
+    Examples:
+        Example 1: Split along channel axis
+            Input: data shape (3, 100, 200), metadata["axes"] = ["C", "Y", "X"], 
+                   metadata["channel_names"] = ["Red", "Green", "Blue"], axis = "C"
+            Output: 3 arrays of shape (100, 200), each with metadata["channel_names"] = ["Red"], ["Green"], ["Blue"]
+        
+        Example 2: Split along time axis
+            Input: data shape (10, 100, 200), metadata["axes"] = ["T", "Y", "X"], axis = "T"
+            Output: 10 arrays of shape (100, 200), each with metadata["axes"] = ["Y", "X"]
+        
+        Example 3: Split along axis by index
+            Input: data shape (5, 10, 20), metadata["axes"] = ["Z", "Y", "X"], axis = 0
+            Output: 5 arrays of shape (10, 20), each with metadata["axes"] = ["Y", "X"]
     """
     if isinstance(axis, str):
         axis_idx = metadata[key].index(axis)
@@ -64,14 +88,32 @@ def unstack_image(data: np.ndarray, metadata: dict[str, Any], axis: Union[int, s
     return data, new_metadata
 
 def squeeze_image(data: np.ndarray, metadata: dict[str, Any]) -> tuple[np.ndarray, dict[str, Any]]:
-    """Squeeze image data and metadata.
+    """Squeeze image data and metadata by removing singleton dimensions.
+    
+    Removes dimensions of size 1 from the image array and updates metadata
+    accordingly, including axes labels, shape, scale, and dimension order.
     
     Args:
-        data: Image data.
-        metadata: Image metadata.
+        data: Image data array to squeeze.
+        metadata: Image metadata dictionary containing axes, shape, scale, and other information.
         
     Returns:
-        Tuple of (image data, image metadata).
+        Tuple of (squeezed image data, updated metadata dictionary).
+        The metadata is updated to reflect the new shape and axes after removing
+        singleton dimensions. If the channel axis is removed, channel_axis is set to None.
+        
+    Examples:
+        Example 1: Remove singleton time dimension
+            Input: data shape (1, 10, 20, 30), metadata["axes"] = ["T", "Z", "Y", "X"]
+            Output: data shape (10, 20, 30), metadata["axes"] = ["Z", "Y", "X"]
+        
+        Example 2: Remove multiple singleton dimensions
+            Input: data shape (1, 5, 1, 100, 200), metadata["axes"] = ["T", "C", "Z", "Y", "X"]
+            Output: data shape (5, 100, 200), metadata["axes"] = ["C", "Y", "X"]
+        
+        Example 3: No singleton dimensions
+            Input: data shape (3, 100, 200), metadata["axes"] = ["C", "Y", "X"]
+            Output: data shape (3, 100, 200), metadata["axes"] = ["C", "Y", "X"] (unchanged)
     """
     singular_axes = [index for index, value in enumerate(data.shape) if value == 1]
     data = np.squeeze(data)
@@ -139,8 +181,8 @@ def unsqueeze_image(data: np.ndarray, metadata: dict[str, Any], target:Union[str
     if "scale" in metadata:
         #metadata["scale"] = [axis for i, axis in enumerate(metadata["scale"]) if i != idx]
         metadata["scale"] = Scale(**{s:v if data.shape[i] != 1 else None for i, (s,v) in enumerate(metadata["scale"]._asdict().items())})
-    if "channel_axis" in metadata:
-        metadata["channel_axis"] = metadata[key].index(channel_axis)
+    if "channel_axis" in metadata and "C" in target:
+        metadata["channel_axis"] = target.index("C")
     if "dims" in metadata:
         metadata["dims"] = Dimensions("".join(target), data.shape)
     if "dim_order" in metadata:
@@ -155,8 +197,8 @@ class FileListConfig(Configuration):
     
     Attributes:
         paths: List of paths (files or directories) to search for files.
-        include: Optional list of patterns to include files (e.g., ['*.tif', '*.tiff']).
-        exclude: Optional list of patterns to exclude files (e.g., ['*.tmp', '*.bak']).
+        include: Optional string or list of patterns to include files (e.g., '*.tif' or ['*.tif', '*.tiff']).
+        exclude: Optional string or list of patterns to exclude files (e.g., '*.tmp' or ['*.tmp', '*.bak']).
     """
     paths: Union[str, Path, List[Union[str, Path]]] = Field(
         description="List of paths (files or directories) to search for files"
@@ -169,18 +211,69 @@ class FileListConfig(Configuration):
         default=True,
         description="Whether to follow symlinks"
     )
-    include: Optional[list[str]] = Field(
+    include: Optional[Union[str, List[str]]] = Field(
         default=None,
-        description="List of file patterns to include (e.g., ['*.tif', '*.csv'])"
+        description="String or list of file patterns to include (e.g., '*.tif' or ['*.tif', '*.csv'])"
     )
-    exclude: Optional[list[str]] = Field(
+    exclude: Optional[Union[str, List[str]]] = Field(
         default=None,
-        description="List of file patterns to exclude (e.g., ['*.bak', '*.tmp'])"
-    )
+        description="String or list of file patterns to exclude (e.g., '*.bak' or ['*.bak', '*.tmp'])"
+    )    
     skip_on_error: bool = Field(
         default=True,
         description="Whether to skip paths that do not exist"
     )
+    
+    @field_validator('paths', mode='before')
+    @classmethod
+    def normalize_paths(cls, v: Any) -> List[Path]:
+        """Normalize paths to always be a list of Path objects.
+        
+        Converts all strings to Path objects. Does NOT expand '~/' to preserve
+        portability across different users. Expansion happens at runtime in the run method.
+        
+        Args:
+            v: Input value (string, Path, list, or None).
+            
+        Returns:
+            List of Path objects (empty list if None). Strings are converted to Path.
+        """
+        if v is None:
+            return []
+        
+        def to_path(path: Union[str, Path]) -> Path:
+            """Convert to Path without expanding ~/."""
+            if isinstance(path, str):
+                return Path(path)
+            elif isinstance(path, Path):
+                return path
+            else:
+                raise ValueError(f"Path must be a string or Path, got {type(path)}")
+        
+        if isinstance(v, (str, Path)):
+            return [to_path(v)]
+        if isinstance(v, list):
+            return [to_path(p) for p in v]
+        raise ValueError(f"paths must be a string, Path, or list of strings/Paths, got {type(v)}")
+    
+    @field_validator('include', 'exclude', mode='before')
+    @classmethod
+    def normalize_patterns(cls, v: Any) -> Optional[List[str]]:
+        """Normalize string patterns to lists.
+        
+        Args:
+            v: Input value (string, list, or None).
+            
+        Returns:
+            List of patterns or None.
+        """
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return [v]
+        if isinstance(v, list):
+            return v
+        raise ValueError(f"include/exclude must be a string or list of strings, got {type(v)}")
 
 class FileList(Configurable[FileListConfig]):
     """File list generator for finding and filtering files.
@@ -214,6 +307,7 @@ class FileList(Configurable[FileListConfig]):
         """
         return cls(config)
     
+    @task(name="FileList.run")
     def run(self) -> list[Path]:
         """Generate a list of files according to the configuration.
         
@@ -226,31 +320,41 @@ class FileList(Configurable[FileListConfig]):
         """
         all_files = []
         
-        # Normalize input_paths to always be a list
-        if self.config.paths is None:
-            input_paths = []
-        elif isinstance(self.config.paths, (str, Path)):
-            input_paths = [self.config.paths]
-        else:
-            input_paths = self.config.paths
+        # paths is already normalized to a list by the validator
+        input_paths = self.config.paths
         
         if not input_paths:
             logger.warning("No input paths specified")
             return []
         
-        base_path = Path(input_paths[0]) if input_paths else Path.cwd()
+        # Resolve base_path to absolute path for proper relative path resolution
+        # Expand ~/ at runtime (not in validator) to preserve portability across users
+        base_path = input_paths[0].expanduser().resolve() if input_paths else Path.cwd()
         
         # Collect files from specified paths using glob patterns
-        for path_spec in input_paths:
-            path_obj = Path(path_spec)
+        # paths are already normalized to Path objects by the validator
+        for path_obj in input_paths:
+            # Expand ~/ at runtime (not in validator) to preserve portability across users
+            path_obj = path_obj.expanduser()
             
             # If relative, resolve relative to base_path
             if not path_obj.is_absolute():
-                path_obj = base_path / path_obj
+                path_obj = (base_path.parent if base_path.is_file() else base_path) / path_obj
+                path_obj = path_obj.resolve()
             else:
                 path_obj = path_obj.resolve()
             
+            # Log the resolved path for debugging
+            logger.debug(f"Checking path existence: {path_obj} (resolved from {path_obj})")
+            
             if not path_obj.exists():
+                # Try to provide more helpful error message
+                logger.error(f"Path does not exist: {path_obj}")
+                logger.error(f"  Original path: {path_obj}")
+                logger.error(f"  Resolved path: {path_obj.resolve()}")
+                logger.error(f"  Path is absolute: {path_obj.is_absolute()}")
+                logger.error(f"  Path parent exists: {path_obj.parent.exists() if path_obj.parent else False}")
+                
                 if self.config.skip_on_error:
                     logger.warning(f"Path does not exist: {path_obj}. Ignoring.")
                     continue
@@ -265,6 +369,10 @@ class FileList(Configurable[FileListConfig]):
             
             # If it's a directory, use glob patterns for efficient search
             elif path_obj.is_dir():
+                # Check if follow_symlinks parameter is supported (Python 3.13+)
+                import sys
+                supports_follow_symlinks = sys.version_info >= (3, 13)
+                
                 if self.config.include:
                     # Use glob patterns directly for search
                     for pattern in self.config.include:
@@ -277,7 +385,17 @@ class FileList(Configurable[FileListConfig]):
                             glob_pattern = pattern
                             search_method = path_obj.glob
                         
-                        for file_path in search_method(glob_pattern, follow_symlinks=self.config.follow_symlinks):
+                        # Conditionally pass follow_symlinks based on Python version
+                        if supports_follow_symlinks:
+                            file_iter = search_method(glob_pattern, follow_symlinks=self.config.follow_symlinks)
+                        else:
+                            file_iter = search_method(glob_pattern)
+                            # If follow_symlinks=False and not supported, we can't filter symlinks
+                            # In older Python versions, symlinks are always followed
+                            if not self.config.follow_symlinks:
+                                logger.warning("follow_symlinks=False is not supported in Python < 3.13. Symlinks will be followed.")
+                        
+                        for file_path in file_iter:
                             if file_path.is_file():
                                 all_files.append(file_path)
                 else:
@@ -289,7 +407,17 @@ class FileList(Configurable[FileListConfig]):
                         search_method = path_obj.glob
                         glob_pattern = "*"
                     
-                    for file_path in search_method(glob_pattern, follow_symlinks=self.config.follow_symlinks):
+                    # Conditionally pass follow_symlinks based on Python version
+                    if supports_follow_symlinks:
+                        file_iter = search_method(glob_pattern, follow_symlinks=self.config.follow_symlinks)
+                    else:
+                        file_iter = search_method(glob_pattern)
+                        # If follow_symlinks=False and not supported, we can't filter symlinks
+                        # In older Python versions, symlinks are always followed
+                        if not self.config.follow_symlinks:
+                            logger.warning("follow_symlinks=False is not supported in Python < 3.13. Symlinks will be followed.")
+                    
+                    for file_path in file_iter:
                         if file_path.is_file():
                             all_files.append(file_path)
         
@@ -334,6 +462,28 @@ class DataWriterConfig(Configuration):
         default=False,
         description="Whether to overwrite existing files"
     )
+    
+    @field_validator('path', mode='before')
+    @classmethod
+    def normalize_path(cls, v: Any) -> Path:
+        """Normalize path to a Path object.
+        
+        Converts strings to Path objects. Does NOT expand '~/' to preserve
+        portability across different users. Expansion happens at runtime in the run method.
+        
+        Args:
+            v: Input value (string, Path, or None).
+            
+        Returns:
+            Path object. Strings are converted to Path.
+        """
+        if v is None:
+            return Path(".")
+        if isinstance(v, str):
+            return Path(v)
+        if isinstance(v, Path):
+            return v
+        raise ValueError(f"path must be a string or Path, got {type(v)}")
     #df_writer: Optional[DataFrameWriterConfig] = Field(
     #    default=DataFrameWriterConfig(),
     #    description="Configuration for saving dataframes"
@@ -367,6 +517,7 @@ class DataWriter(Configurable[DataWriterConfig]):
         """
         return cls(config)
     
+    @task(name="DataWriter.run")
     def run(self, data: Any, path: Path|str, metadata: Optional[dict[str, Any]] = None) -> None:
         """Write data to a file according to the configuration.
         
@@ -411,15 +562,23 @@ class DataFrameWriter(DataWriter):
         """
         return cls(config)
 
+    @task(name="DataFrameWriter.run")
     def run(self, data: pd.DataFrame, path: Path|str, metadata: Optional[dict[str, Any]] = None) -> None:
         """Write dataframe data to a file according to the configuration.
         
         Args:
             data: Dataframe data to write.
+            path: Path to output file (expands ~/ at runtime).
             metadata: Optional metadata to pass to the writer.
         """
+        # Expand ~/ at runtime (not in validator) to preserve portability across users
+        if isinstance(path, str):
+            path = Path(path).expanduser()
+        else:
+            path = path.expanduser()
+        
         if os.path.exists(path) and not self.config.overwrite:
-            raise FileExistsError(f"File already exists: {self.config.path}")
+            raise FileExistsError(f"File already exists: {path}")
         if self.config.format == "csv":
             data.to_csv(path, index=self.config.save_index)
         elif self.config.format == "parquet":
@@ -479,18 +638,38 @@ class ImageWriter(DataWriter):
         """
         return cls(config)
 
+    @task(name="ImageWriter.run")
     def run(self, data: np.ndarray, path: Path|str, metadata: Optional[dict[str, Any]] = None) -> None:
         """Write image data to a file according to the configuration.
         
+        Writes image data to a file using OME-TIFF format. If split_channels is True,
+        the image is split along the channel axis and each channel is saved as a
+        separate file with the channel name in the filename.
+        
         Args:
-            data: Image data to write.
-            metadata: Optional metadata to pass to the writer.
+            data: Image data array to write.
+            path: Path to the output file or directory. If split_channels is True,
+                  channel names will be added to the filename.
+            metadata: Optional metadata dictionary containing:
+                - channel_names: List of channel names (required if split_channels is True)
+                - dim_order: Dimension order string (e.g., "TCYX", "ZYX")
+                - physical_pixel_sizes: Named tuple with Z, Y, X pixel sizes
+                - image_names: Optional list of image names
+                
+        Raises:
+            FileExistsError: If the output file already exists and overwrite is False.
+            ValueError: If metadata is missing required fields (e.g., channel_names when split_channels is True).
         """
+        # Expand ~/ at runtime (not in validator) to preserve portability across users
+        if isinstance(path, str):
+            path = Path(path).expanduser()
+        else:
+            path = path.expanduser()
+        
         if os.path.exists(path) and not self.config.overwrite:
             raise FileExistsError(f"File already exists: {path}")
         
         logger.info(f"Preparing to save image with metadata: {metadata}")
-        path = Path(path)
         from collections import namedtuple
         PhysicalPixelSizes = namedtuple("PhysicalPixelSizes", ["Z", "Y", "X"])
         if self.config.split_channels:
@@ -762,11 +941,7 @@ class ImageLoader(DataLoader):
         metadata["shape"] = reader_instance.shape
         metadata["dims"] = reader_instance.dims
         metadata["pixel_unit"] = "um"
-        metadata["xy_pixel_res"] = (
-            reader_instance.physical_pixel_sizes.X + reader_instance.physical_pixel_sizes.Y
-        ) / 2
         metadata["scale"] = reader_instance.scale
-        metadata["xy_pixel_res_description"] = f"{1/metadata['xy_pixel_res']} pixels per {metadata['pixel_unit']}"
         metadata["physical_pixel_sizes"] = reader_instance.physical_pixel_sizes    
         # Validate the data
         if scene_data is None:
@@ -785,15 +960,31 @@ class ImageLoader(DataLoader):
         
         return scene_data, metadata
 
+    @task(name="ImageLoader.run")
     def run(self, path: Path|str) -> tuple[np.ndarray, dict[str, Any]]:
         """Load image data according to the configuration.
         
-        Returns:
-            Tuple of (image array, metadata dictionary).
+        Loads an image file using bioio, optionally selecting a specific scene,
+        applying substack slicing, and squeezing singleton dimensions.
+        
+        Args:
+            path: Path to the image file to load.
             
+        Returns:
+            Tuple of (image array, metadata dictionary). The metadata includes:
+                - channel_names: List of channel names (as strings)
+                - axes: List of axis labels (e.g., ["T", "C", "Z", "Y", "X"])
+                - shape: Shape of the loaded image
+                - scale: Scale information for each dimension
+                - channel_axis: Index of the channel axis
+                - dim_order: Dimension order string
+                - physical_pixel_sizes: Physical pixel sizes for Z, Y, X dimensions
+                - Other metadata from the image file
+                
         Raises:
             FileNotFoundError: If the specified path does not exist.
-            ValueError: If the image cannot be loaded or processed.
+            ValueError: If the image cannot be loaded, scene index is out of range,
+                       or substack specification is invalid.
         """
         path = Path(path)
         if not path.exists():

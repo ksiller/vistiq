@@ -11,6 +11,7 @@ from typing import Literal, Tuple, List, Optional, Union, Callable
 from micro_sam.util import export_custom_sam_model
 from bioio import BioImage
 from vistiq.core import Configuration, Configurable
+from prefect import task
 from vistiq.utils import find_matching_file_pairs
 from pydantic import Field, PositiveInt
 from bioio_ome_tiff.writers import OmeTiffWriter
@@ -46,6 +47,7 @@ class DatasetCreator(Configurable[DatasetCreatorConfig]):
         """
         return cls(config)
 
+    @task(name="DatasetCreator.run")
     def run(self, image_path: Path, label_path: Path) -> List[Tuple[Path, Path]]:
         """Run the dataset creation.
         
@@ -175,6 +177,7 @@ class Trainer(Configurable[TrainerConfig]):
         """
         return cls(config)
 
+    @task(name="Trainer.run")
     def run(self, image_paths: List[str | Path], label_paths: List[str | Path]) -> None:
         """Run the trainer.
         
@@ -406,6 +409,7 @@ class MicroSAMTrainer(Trainer):
             label = BioImage(label_path)
             assert image.shape == label.shape
     
+    @task(name="MicroSAMTrainer.run")
     def run(self, image_paths: List[str | Path], label_paths: List[str | Path]) -> None:
         """Fine-tune a Segment Anything model.
         

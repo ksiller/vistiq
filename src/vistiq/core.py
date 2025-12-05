@@ -6,8 +6,10 @@ import numpy as np
 import pandas as pd
 # Lazy import joblib to avoid slow initialization at module import time
 import logging
-
+from prefect import task
+from functools import wraps
 from joblib import Parallel, delayed
+from bioio import Dimensions, Scale
 from vistiq.utils import ArrayIterator, ArrayIteratorConfig
 
 logger = logging.getLogger(__name__)
@@ -294,6 +296,18 @@ class Configurable(ABC, Generic[ConfigType]):
         """
         return f"{self.name()}({self.config})"
 
+    @task(name="Configurable.run")
+    def run(self, *args, **kwargs) -> Any:
+        """Run the configurable object.
+
+        Args:
+            *args: Additional arguments to pass to the run method.
+            **kwargs: Additional keyword arguments to pass to the run method.
+
+        Returns:
+            The result of the run method.
+        """
+        raise NotImplementedError("Subclasses must implement this method")
 
 class StackProcessorConfig(Configuration):
     """Configuration for stack processing operations.
@@ -368,14 +382,15 @@ class StackProcessor(Configurable):
         """
         return cls(config)
 
+    @task(name="StackProcessor.run")
     def run(
-        self, stack: np.ndarray, *args, workers: int = -1, verbose: int = 10, metadata: Optional[dict[str, Any]] = None, **kwargs) -> tuple[Any, Optional[dict[str, Any]]]:
+        self, stack: np.ndarray, *args, workers: int = 1, verbose: int = 10, metadata: Optional[dict[str, Any]] = None, **kwargs) -> tuple[Any, Optional[dict[str, Any]]]:
         """Run the stack processor on an image.
 
         Args:
             stack: Input stack array.
             *args: Additional arguments to pass to _process_slice.
-            workers: Number of parallel workers (-1 for all cores).
+            workers: Number of parallel workers (1 for single process, -1 for all cores).
             verbose: Verbosity level for parallel processing.
             metadata: Optional metadata to pass to the processor.
             **kwargs: Additional keyword arguments to pass to the processor.
@@ -384,6 +399,8 @@ class StackProcessor(Configurable):
             Tuple of (processed result array or tuple of lists depending on output_type, updated metadata or None).
         """
         logger.info(f"Running {type(self).__name__} with config: {self.config}")
+        logger.info(f"StackProcessor.run: received workers={workers} (type: {type(workers)})")
+        # Ensure workers is a valid positive integer (not -1 which means "all cores")
         iterator = ArrayIterator(stack, self.config.iterator_config)
         n_iterations = len(iterator)
         if n_iterations == 1:
@@ -391,6 +408,7 @@ class StackProcessor(Configurable):
                 stack, *args, metadata=metadata, **kwargs
             )
         else:
+            logger.info(f"Using Parallel with n_jobs={workers} for {n_iterations} iterations")
             results = Parallel(n_jobs=workers, verbose=verbose, batch_size=self.config.batch_size)(
                 delayed(self._process_slice)(
                     stack_slice, *args, metadata=metadata, **kwargs)
@@ -401,16 +419,106 @@ class StackProcessor(Configurable):
         updated_metadata = self._update_metadata(stack, results, *args, metadata=metadata, **kwargs)
         return (results, updated_metadata)
 
-    def _update_metadata(self, stack, results, *args,metadata: Optional[dict[str, Any]] = None, **kwargs) -> Optional[dict[str, Any]]:
-        """Update the metadata with the current configuration.
+    def _update_after_resize(self, orig_shape, new_shape, new_metadata: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
+        change = np.array(orig_shape) / np.array(new_shape)
+        logger.info(f"Updating metadata with new shape ratio: {change}")
         
+        # Update shape if present
+        if "shape" in new_metadata:
+            new_metadata["shape"] = tuple(new_shape)
+        
+        # Get axes labels to map change array indices to axis letters
+        axes = new_metadata.get("axes", [])
+        
+        # Update dims if present
+        if "dims" in new_metadata:
+            if axes:
+                # Use axes list directly (Dimensions accepts list or string)
+                new_metadata["dims"] = Dimensions(axes, tuple(new_shape))
+            else:
+                # Try to preserve existing dims structure if possible
+                if hasattr(new_metadata["dims"], "order"):
+                    dim_order = new_metadata["dims"].order
+                    new_metadata["dims"] = Dimensions(dim_order, tuple(new_shape))
+                else:
+                    # Fallback: create default dimension order
+                    dim_order = "".join([chr(ord('A') + i) for i in range(len(new_shape))])
+                    new_metadata["dims"] = Dimensions(dim_order, tuple(new_shape))
+        
+        if not axes:
+            logger.warning("No axes information in metadata, cannot update scale and physical_pixel_sizes")
+            return new_metadata
+        
+        # Update scale: multiply each axis's scale value by the corresponding change ratio
+        if "scale" in new_metadata and new_metadata["scale"] is not None:
+            scale_dict = new_metadata["scale"]._asdict()
+            # Map each dimension in change to its axis letter and update the scale
+            for i, axis_letter in enumerate(axes):
+                if i < len(change) and axis_letter in scale_dict and scale_dict[axis_letter] is not None:
+                    scale_dict[axis_letter] = float(scale_dict[axis_letter] * change[i])
+            new_metadata["scale"] = Scale(**scale_dict)
+        
+        # Update physical_pixel_sizes: multiply each axis's pixel size by the corresponding change ratio
+        pps_dict = None
+        if "physical_pixel_sizes" in new_metadata and new_metadata["physical_pixel_sizes"] is not None:
+            pps = new_metadata["physical_pixel_sizes"]
+            # Handle both namedtuple and other types
+            if hasattr(pps, '_asdict'):
+                pps_dict = pps._asdict()
+                # Map each dimension in change to its axis letter and update the pixel sizes
+                for i, axis_letter in enumerate(axes):
+                    if i < len(change) and axis_letter in pps_dict and pps_dict[axis_letter] is not None:
+                        pps_dict[axis_letter] = float(pps_dict[axis_letter] * change[i])
+                # Reconstruct the namedtuple with the same type
+                new_metadata["physical_pixel_sizes"] = type(pps)(**pps_dict)
+            elif hasattr(pps, '_fields'):
+                # It's a namedtuple, use _fields to get field names
+                pps_dict = pps._asdict()
+                for i, axis_letter in enumerate(axes):
+                    if i < len(change) and axis_letter in pps_dict and pps_dict[axis_letter] is not None:
+                        pps_dict[axis_letter] = float(pps_dict[axis_letter] * change[i])
+                new_metadata["physical_pixel_sizes"] = type(pps)(**pps_dict)
+            else:
+                logger.warning(f"Cannot update physical_pixel_sizes: unsupported type {type(pps)}")
+            
+        return new_metadata
+
+    def _update_metadata(self, stack, results, *args, metadata: Optional[dict[str, Any]] = None, **kwargs) -> Optional[dict[str, Any]]:
+        """Update the metadata with the new shape.
+
         Args:
+            stack: Original input stack.
+            results: Processed results.
+            *args: Additional arguments.
             metadata: Optional metadata to pass to the processor.
+            **kwargs: Additional keyword arguments to pass to the processor.
+
+        Returns:
+            Updated metadata or None.
         """
-        if metadata is None or len(metadata) == 0:
-            return metadata
-        logger.info(f"Updating metadata {metadata}")
-        return metadata
+        if metadata is None:
+            return None
+        # Store original metadata for comparison
+        original_metadata = metadata.copy()
+        new_metadata = metadata.copy()
+        new_metadata = self._update_after_resize(stack.shape, results.shape, new_metadata)
+        
+        # Compare and log changed key:value pairs
+        changed_keys = []
+        for key in set(list(original_metadata.keys()) + list(new_metadata.keys())):
+            original_value = original_metadata.get(key)
+            new_value = new_metadata.get(key)
+            if original_value != new_value:
+                changed_keys.append((key, original_value, new_value))
+        
+        if changed_keys:
+            logger.info(f"Metadata updated in {type(self).__name__}: {len(changed_keys)} key(s) changed")
+            for key, old_val, new_val in changed_keys:
+                logger.info(f"  {key}: {old_val} -> {new_val}")
+        else:
+            logger.debug(f"Metadata unchanged in {type(self).__name__}")
+        
+        return new_metadata
 
     def _process_slice(
         self, slice: np.ndarray, *args, metadata: Optional[dict[str, Any]] = None, **kwargs) -> np.ndarray | tuple[Any,...]:
@@ -515,6 +623,7 @@ class ChainProcessor(Configurable[ChainProcessorConfig]):
         """
         return cls(config)
 
+    @task(name="ChainProcessor.run")
     def run(
         self, stack: np.ndarray, *args, workers: int = -1, verbose: int = 10, metadata: Optional[dict[str, Any]] = None, **kwargs ) -> np.ndarray:
         """Run the chain processor on an image stack.

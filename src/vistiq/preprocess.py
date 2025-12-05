@@ -10,6 +10,7 @@ from joblib import Parallel, delayed
 import logging
 
 from vistiq.core import Configuration, Configurable, StackProcessorConfig, StackProcessor, cli_config
+from prefect import task
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +71,8 @@ class Preprocessor(StackProcessor):
         logger.info(f"Normalized stack with shape {stack.shape}, min:max {stack_min}:{stack_max} -> {np.min(stack)}:{np.max(stack)}")
         return stack.astype(np.float32, copy=False)
 
-    def run(self, stack: np.ndarray, *args, workers: int = -1, verbose: int = 10, metadata: Optional[dict[str, Any]] = None, **kwargs) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
+    @task(name="Preprocessor.run")
+    def run(self, stack: np.ndarray, *args, workers: int = 1, verbose: int = 10, metadata: Optional[dict[str, Any]] = None, **kwargs) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
         """Run the preprocess chain on an image stack.
 
         Args:
@@ -166,8 +168,8 @@ class PreprocessChain(Configurable):
         """
         return cls(config)
 
-
-    def run(self, stack: np.ndarray, *args, workers: int = -1, verbose: int = 10, metadata: Optional[dict[str, Any]] = None, **kwargs) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
+    @task(name="PreprocessChain.run")
+    def run(self, stack: np.ndarray, *args, workers: int = 1, verbose: int = 10, metadata: Optional[dict[str, Any]] = None, **kwargs) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
         """Run the preprocess chain on an image stack.
 
         Args:
@@ -234,6 +236,18 @@ class DoG(Preprocessor):
         )
         return g_low - g_high
 
+    @task(name="DoG.run")
+    def run(self, *args, **kwargs) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
+        """Run the DoG filter on an image stack.
+
+        Args:
+            *args: Additional arguments to pass to the processor.
+            **kwargs: Additional keyword arguments to pass to the processor.
+
+        Returns:
+            Tuple of (DoG filtered image stack, updated metadata or None).
+        """
+        return super().run(*args, **kwargs)
 
 class DoGConfig(PreprocessorConfig):
     """Configuration for Difference of Gaussians (DoG) filtering operations.
@@ -368,6 +382,7 @@ class Noise2Stack(Preprocessor):
 
         return denoised
 
+    @task(name="Noise2Stack.run")
     def run(self, stack: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
         """Denoise an image stack by averaging temporal neighbors.
 
@@ -521,6 +536,7 @@ class Resize(Preprocessor):
         logger.debug(f"Resized slice from {original_shape} to {resized.shape}")
         return resized
 
+    @task(name="Resize.run")
     def run(self, stack: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
         """Resize an image stack.
         
@@ -558,4 +574,5 @@ class Resize(Preprocessor):
             # Fallback for older Pydantic versions
             self.config.output_shape = tuple(target_shape)
         logger.info(f"RESIZING stack from {original_shape} to {target_shape}")
-        return super().run(stack, metadata=metadata, **kwargs)
+        return super().run(stack, metadata=metadata)
+

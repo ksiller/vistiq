@@ -34,6 +34,14 @@ class ComponentRegistry:
         configurable_name = configurable_class.__name__
         config_name = config_class.__name__
         
+        # Check if already registered to avoid duplicate registration
+        if configurable_name in self._configurable_classes:
+            if self._configurable_classes[configurable_name] is configurable_class:
+                # Already registered with the same class, skip
+                return
+            else:
+                logger.warning(f"Overwriting existing registration for {configurable_name}")
+        
         self._configurable_classes[configurable_name] = configurable_class
         self._config_classes[config_name] = config_class
         self._config_to_configurable[config_class] = configurable_class
@@ -605,8 +613,11 @@ def auto_register_configurables(base_class: Type[Configurable], modules: Optiona
                     if hasattr(module, config_name):
                         config_class = getattr(module, config_name)
                         if inspect.isclass(config_class) and issubclass(config_class, Configuration):
+                            # Only log if this is a new registration (register() will skip if already registered)
+                            was_registered = name in _registry._configurable_classes
                             _registry.register(obj, config_class)
-                            logger.info(f"Registered {name} (inherits from {base_class.__name__}) with {config_name}")
+                            if not was_registered:
+                                logger.debug(f"Registered {name} (inherits from {base_class.__name__}) with {config_name}")
         except ImportError as e:
             logger.warning(f"Could not import module {module_name}: {e}")
 

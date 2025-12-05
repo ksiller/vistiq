@@ -19,6 +19,7 @@ from skimage.measure import label as sk_label
 from skimage.measure import regionprops, regionprops_table
 from skimage.morphology import disk, binary_dilation
 from vistiq.core import Configuration, Configurable, StackProcessorConfig, StackProcessor, ChainProcessorConfig, ChainProcessor
+from prefect import task
 from vistiq.workflow import Workflow
 from vistiq.utils import ArrayIterator, ArrayIteratorConfig, create_unique_folder
 
@@ -450,6 +451,7 @@ class RegionFilter(Configurable[RegionFilterConfig]):
             if filter.config.attribute is not None
         ]
 
+    @task(name="RegionFilter.run")
     def run(
         self, regions: Union[List["RegionProperties"], pd.DataFrame]
     ) -> Tuple[Union[List["RegionProperties"], pd.DataFrame], Union[List["RegionProperties"], pd.DataFrame]]:
@@ -642,6 +644,7 @@ class Relabeler(StackProcessor):
         # For a single slice, no relabeling needed (already unique)
         return labels
 
+    @task(name="Relabeler.run")
     def run(
         self,
         labels: np.ndarray | List[np.ndarray],
@@ -989,6 +992,7 @@ class LabelRemover(StackProcessor):
             logger.debug (f"{len(label_ids)} labels removed, {len(np.unique(labels))} unique labels before removal, {len(np.unique(result))} labels remaining, {len(np.unique(result))} unique labels after removal")
         return result
     
+    @task(name="RegionRemover.run")
     def run(
         self, 
         labels: np.ndarray, 
@@ -1137,6 +1141,7 @@ class Labeller(StackProcessor):
                 labels[region_mask] = region.label
         return labels, regions
 
+    @task(name="Labeller.run")
     def run(self, mask: np.ndarray, workers: int = -1, verbose: int = 10, metadata: Optional[dict[str, Any]] = None, **kwargs) -> tuple[np.ndarray, List["RegionProperties"]]:
         """Run the labeller on a binary mask.
         
@@ -1516,6 +1521,7 @@ class RegionAnalyzer(StackProcessor):
         """
         return super()._reshape_slice_results(results, slice_indices=slice_indices, input_shape=input_shape)
     
+    @task(name="RegionAnalyzer.run")
     def run(self, labels: np.ndarray, workers: int = -1, verbose: int = 10, metadata: Optional[dict[str, Any]] = None, **kwargs) -> List["RegionProperties"] | pd.DataFrame:
         """Run the region analyzer on a labeled array.
         
@@ -1743,6 +1749,7 @@ class BinaryProcessor(Configurable[BinaryProcessorConfig]):
         """
         return cls(config)
 
+    @task(name="BinaryProcessor.run")
     def run(self, mask: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs) -> np.ndarray:
         """Run the binary processor on a mask.
         
@@ -1859,6 +1866,7 @@ class Segmenter(Workflow):
             self.config.region_analyzer = RegionAnalyzer(RegionAnalyzerConfig(iterator_config=iterator_config, output_type="list", properties=properties))
         logger.info(f"Segmenter config: {self.config}")
     
+    @task(name="Segmenter.run")
     def run(
         self,
         img: np.ndarray,
@@ -1965,6 +1973,7 @@ class IterativeSegmenter(Workflow):
                 raise ValueError(f"Mask must be 2D or 3D, got {mask.ndim}D")
         return mask
 
+    @task(name="IterativeSegmenter.run")
     def run(
         self,
         img: np.ndarray,
@@ -2063,6 +2072,7 @@ class SeriesSegmenter(Workflow):
         """
         super().__init__(config)
 
+    @task(name="SeriesSegmenter.run")
     def run(
         self, img: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs
     ) -> Union[np.ndarray, Tuple[np.ndarray, List["RegionProperties"]]]:
@@ -2109,7 +2119,7 @@ class MicroSAMSegmenter(Segmenter):
         self.config.do_labels = True
         #self.config.do_regions = self.config.region_analyzer is not None
 
-
+    @task(name="MicroSAMSegmenter.run")
     def run(self, img: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs) -> np.ndarray:
         """Run the MicroSAM segmenter on an image.
         

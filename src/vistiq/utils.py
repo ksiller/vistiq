@@ -414,13 +414,7 @@ def load_image(
     metadata["shape"] = reader_instance.shape
     metadata["dims"] = reader_instance.dims
     metadata["pixel_unit"] = "um"
-    metadata["xy_pixel_res"] = (
-        reader_instance.physical_pixel_sizes.X + reader_instance.physical_pixel_sizes.Y
-    ) / 2
     metadata["scale"] = reader_instance.scale
-    UsedScale = NamedTuple("UsedScale", [(s,type(v)) for s,v in reader_instance.scale._asdict().items() if v is not None])
-    metadata["used_scale"] = UsedScale(**{s:abs(v) for s,v in reader_instance.scale._asdict().items() if v is not None})
-    metadata["xy_pixel_res_description"] = f"{1/metadata['xy_pixel_res']} pixels per {metadata['pixel_unit']}"
     metadata["physical_pixel_sizes"] = reader_instance.physical_pixel_sizes    
     # Validate the data
     if scene_data is None:
