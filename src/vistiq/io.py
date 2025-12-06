@@ -336,25 +336,24 @@ class FileList(Configurable[FileListConfig]):
             logger.warning("No input paths specified")
             return []
         
-        # Resolve base_path to absolute path for proper relative path resolution
-        # Expand ~/ at runtime (not in validator) to preserve portability across users
-        base_path = input_paths[0].expanduser().resolve() if input_paths else Path.cwd()
-        
         # Collect files and/or directories from specified paths using glob patterns
         # paths are already normalized to Path objects by the validator
         for path_obj in input_paths:
             # Expand ~/ at runtime (not in validator) to preserve portability across users
             path_obj = path_obj.expanduser()
+            logger.debug(f"Processing path object: {path_obj} (is_absolute: {path_obj.is_absolute()})")
             
-            # If relative, resolve relative to base_path
+            # If relative, resolve relative to current working directory
             if not path_obj.is_absolute():
-                path_obj = (base_path.parent if base_path.is_file() else base_path) / path_obj
+                path_obj = Path.cwd() / path_obj
                 path_obj = path_obj.resolve()
             else:
                 path_obj = path_obj.resolve()
             
+            logger.debug(f"Resolved path: {path_obj}")
+            
             # Log the resolved path for debugging
-            logger.debug(f"Checking path existence: {path_obj} (resolved from {path_obj})")
+            logger.debug(f"Checking path existence: {path_obj}")
             
             if not path_obj.exists():
                 # Try to provide more helpful error message

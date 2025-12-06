@@ -1106,7 +1106,8 @@ def run_training(config: CLITrainerConfig) -> None:
         # If Prefect wrapped it somehow, try to unwrap
         input_list = list(input_list_result) if hasattr(input_list_result, '__iter__') else [input_list_result]
     if not input_list:
-        raise ValueError(f"No files found for input path: {config.input.paths}")
+        logger.warning(f"No files found for input path: {config.input.paths}")
+        return
 
     # Build FileList from config and get labelled image files
     labels_list_result = FileList(config.labels).run()
