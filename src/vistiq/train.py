@@ -13,7 +13,7 @@ from bioio import BioImage
 from vistiq.core import Configuration, Configurable
 from prefect import task
 from vistiq.utils import find_matching_file_pairs, collect_all_files
-from pydantic import Field, PositiveInt
+from pydantic import Field, PositiveInt, field_validator, ValidationInfo, model_validator
 from bioio_ome_tiff.writers import OmeTiffWriter
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,12 @@ class DatasetCreatorConfig(Configuration):
     """Configuration for dataset.
     
     Attributes:
-        patch_shape: Shape of patches for training (default: (1, 256, 256)).
+        out_path: Path to save the dataset files (default: "./training_data").
+        patterns: Tuple of image and label patterns (default: ("*_img.tif", "*_label.tif")).
+        rematch: Whether to rematch the image and label pairs (default: False).
+        strategy: Tuple of image and label strategy (default: (0,1)).
+        remove_empty_labels: Whether to remove empty labels (default: True).
+        random_samples: Number of random slices to take from each image stack and label stack pair. Ignored for 2D datasets (default: None, all slices are used).
     """
     out_path: Path = Field(description="Path to save the dataset files", default="./training_data")
     patterns: Tuple[str,str] = Field(description="Tuple of image and label patterns", default=("*_img.tif", "*_label.tif"))
@@ -30,6 +35,24 @@ class DatasetCreatorConfig(Configuration):
     strategy: Tuple[int,int] = (0,1)
     remove_empty_labels: bool = True
     random_samples: Optional[PositiveInt] = None
+    
+    @field_validator('out_path', mode='after')
+    @classmethod
+    def normalize_out_path(cls, v: Optional[Path]) -> Path:
+        """Normalize out_path to a Path object.
+        
+        Ensures out_path is always a Path object. Does NOT expand '~/' to preserve
+        portability across different users. Expansion happens at runtime.
+        
+        Args:
+            v: Path object or None (Pydantic already converts strings to Path).
+            
+        Returns:
+            Path object (defaults to "./training_data" if None).
+        """
+        if v is None:
+            return Path("./training_data")
+        return v
 
 class DatasetCreator(Configurable[DatasetCreatorConfig]):
     """Create a dataset.
@@ -99,16 +122,20 @@ class DatasetCreator(Configurable[DatasetCreatorConfig]):
         
         logger.info(f"Found {len(matches)} matching pairs")
         # check if self.config.out_path is relative path; if so use image_path dir and label_path dir as root and append out_path to it
+        # Expand ~/ at runtime for portability
+        out_path = self.config.out_path.expanduser().resolve()
+        
         training_pairs = []
+        total_2d_pairs = 0
         for image_path, label_path in matches:
-            if not self.config.out_path.is_absolute():
+            if not out_path.is_absolute():
                 # Relative path: append to parent directories of the matched files
-                out_path_img = image_path.parent / self.config.out_path
-                out_path_label = label_path.parent / self.config.out_path
+                out_path_img = image_path.parent / out_path
+                out_path_label = label_path.parent / out_path
             else:
                 # Absolute path: use as-is
-                out_path_img = self.config.out_path
-                out_path_label = self.config.out_path
+                out_path_img = out_path
+                out_path_label = out_path
             os.makedirs(out_path_img, exist_ok=True)
             os.makedirs(out_path_label, exist_ok=True)
             img_out = out_path_img / image_path.name
@@ -128,8 +155,10 @@ class DatasetCreator(Configurable[DatasetCreatorConfig]):
                 label_data = label_data[rnd_indices]
             OmeTiffWriter.save(img_data, img_out, dim_order=img.dims.order[-img_data.ndim:], physical_pixel_sizes=img.physical_pixel_sizes, channel_names=img.channel_names)
             OmeTiffWriter.save(label_data, label_out, dim_order=(label.dims.order[-label_data.ndim:]), physical_pixel_sizes=label.physical_pixel_sizes, channel_names=label.channel_names)
-            logger.debug(f"Created dataset pair with image {img_data.shape} and label {label_data.shape}")
+            logger.info(f"Created dataset pair with image {img_data.shape} and label {label_data.shape}")
             training_pairs.append((img_out, label_out))
+            total_2d_pairs += len(img_data)
+        logger.info(f"Total 2D pairs: {total_2d_pairs}")
         return training_pairs
 
 class TrainerConfig(Configuration):
@@ -145,16 +174,55 @@ class TrainerConfig(Configuration):
         device: Device to use for training, "cuda" or "cpu" (default: "cuda").
         split_ratio: Ratio for train/validation split (default: 0.8).
     """
-    #dataset_creator: DatasetCreator = DatasetCreator(DatasetCreatorConfig())
     model_type: str = "vit_l_lm"
-    checkpoint_name: str = "sam_synthetic"
-    export_path: str = "./finetuned_synthetic_model.pth"
+    export_path: Path = "./"
+    export_model_name: str | None = None # field validator will ensure that a default will be generated if not provided
+    save_root: Path = "./"
     batch_size: int = 1
     patch_shape: Tuple[int, ...] = (1, 256, 256)
     roi_def: tuple[Union[int, slice], ...] = np.s_[:, :, :] # default all slices in volume
     device: str = "cuda"
     split_ratio: float = 0.8
     transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
+
+    @field_validator('export_path', 'save_root', mode='after')
+    @classmethod
+    def normalize_path_fields(cls, v: Optional[Path]) -> Path:
+        """Normalize path fields to Path objects.
+        
+        Ensures path fields are always Path objects. Does NOT expand '~/' to preserve
+        portability across different users. Expansion happens at runtime.
+        
+        Args:
+            v: Path object or None (Pydantic already converts strings to Path).
+            
+        Returns:
+            Path object (defaults to "." if None).
+        """
+        if v is None:
+            return Path("./")
+        return v
+
+    @model_validator(mode='after')
+    def set_export_model_name(self) -> 'TrainerConfig':
+        """Set default export_model_name if not provided.
+        
+        If export_model_name is empty, generates a default name based on model_type.
+        This runs after all field validators, so we can access model_type.
+        """
+        # Only update if value is empty
+        if not self.export_model_name or self.export_model_name == "":
+            new_value = f"finetuned_{self.model_type}_model.pth"
+        else:
+            new_value = self.export_model_name
+        
+        # Ensure .pth suffix
+        new_value = str(Path(new_value).with_suffix(".pth"))
+        
+        # Return new instance if value changed, otherwise return self
+        if new_value != self.export_model_name:
+            return self.model_copy(update={"export_model_name": new_value})
+        return self
 
 class MicroSAMTrainerConfig(TrainerConfig):
     """Configuration for MicroSAM trainer.
@@ -239,6 +307,8 @@ class MicroSAMTrainer(Trainer):
         train_loader: Training data loader.
         val_loader: Validation data loader.
     """
+    CHECKPOINTS_FOLDER = "checkpoints"
+    BEST_MODEL_NAME = "best.pt"
 
     def __init__(self, config: MicroSAMTrainerConfig):
         """Initialize the MicroSAM trainer.
@@ -247,6 +317,7 @@ class MicroSAMTrainer(Trainer):
             config: MicroSAM trainer configuration.
         """
         super().__init__(config)
+        self.checkpoint_name = str(Path(self.config.export_model_name).stem)
         # Note: These lines reference attributes that may not exist in the config
         # They are commented out or would need to be fixed based on actual config structure
         # self.train_loader = self._get_dataloader(image_paths=self.config.train_image_paths, label_paths=self.config.train_label_paths, split="train", workers=self.config.workers, split_ratio=self.config.split_ratio, raw_key=self.config.raw_key, label_key=self.config.label_key)
@@ -294,7 +365,7 @@ class MicroSAMTrainer(Trainer):
             image_paths = image_paths[train_size:]
             label_paths = label_paths[train_size:]
 
-        raw_transform = v2.Compose([self._reshape_array, v2.ToDtype(torch.uint8, scale=True)])
+        raw_transform = v2.Compose([sam_training.identity]) # v2.Compose([self._reshape_array, v2.ToDtype(torch.uint8, scale=True)])
         if self.config.instance_segmentation:
             # Computes the distance transform for objects to perform end-to-end automatic instance segmentation.
             label_transform = v2.Compose([
@@ -303,7 +374,7 @@ class MicroSAMTrainer(Trainer):
                 foreground=True, instances=True, min_size=25
             )])
         else:
-            label_transform = v2.Compose([sam_training.direct])
+            label_transform = v2.Compose([sam_training.identity])
 
         loader = torch_em.default_segmentation_loader(
             raw_paths=image_paths,
@@ -352,7 +423,8 @@ class MicroSAMTrainer(Trainer):
         """
         # Run training.
         sam_training.train_sam(
-            name=self.config.checkpoint_name,
+            save_root=str(self.config.save_root.expanduser().resolve()),
+            name=self.checkpoint_name,
             model_type=self.config.model_type,
             train_loader=train_loader,
             val_loader=val_loader,
@@ -389,8 +461,10 @@ class MicroSAMTrainer(Trainer):
         convert_inputs = sam_training.ConvertToSamInputs(transform=self.config.transform, box_distortion_factor=None)
 
         # the trainer which performs training and validation (implemented using "torch_em")
+        # checkpoints will be saved as {self.config.save_root}/checkpoints/{self.checkpoint_name}/*.pt files
+        # logs will be saved as {save_root}/logs/{self.checkpoint_name}/event* files
         trainer = sam_training.SamTrainer(
-            name=self.config.checkpoint_name,
+            name=self.checkpoint_name,
             train_loader=train_loader,
             val_loader=val_loader,
             model=model,
@@ -419,12 +493,14 @@ class MicroSAMTrainer(Trainer):
         specified export path.
         """
         # export the model after training so that it can be used by the rest of the micro_sam library
-        export_path = self.config.export_path
-        checkpoint_path = os.path.join("checkpoints", self.config.checkpoint_name, "best.pt")
+        # Expand ~/ at runtime for portability
+        save_root = str(self.config.save_root.expanduser().resolve())
+        export_path = str(self.config.export_path.expanduser().resolve())
+        
         export_custom_sam_model(
-            checkpoint_path=checkpoint_path,
+            checkpoint_path=os.path.join(save_root, self.CHECKPOINTS_FOLDER, self.checkpoint_name, self.BEST_MODEL_NAME),
             model_type=self.config.model_type,
-            save_path=export_path,
+            save_path=os.path.join(export_path, self.config.export_model_name),
         )
 
     def validate_image_label_pairs(self, image_paths: List[str | Path], label_paths: List[str | Path]) -> None:
@@ -445,6 +521,7 @@ class MicroSAMTrainer(Trainer):
             image = BioImage(image_path)
             label = BioImage(label_path)
             assert image.shape == label.shape
+        logger.info(f"Validation of {len(image_paths)} image and label pairs: Passed")
     
     @task(name="MicroSAMTrainer.run")
     def run(self, image_paths: List[str | Path], label_paths: List[str | Path]) -> None:
@@ -469,10 +546,10 @@ class MicroSAMTrainer(Trainer):
         train_loader = self._get_dataloader(image_paths, label_paths, mode="train")
         val_loader = self._get_dataloader(image_paths, label_paths, mode="val")
 
-        t, _ = next(iter(train_loader))
-        v, _ = next(iter(val_loader))
-        logger.debug(f" t, _ = next(iter(train_loader)):{t.shape}, {t.dtype}, min: {t.min()}, max: {t.max()}, t.is_contiguous: {t.is_contiguous()}")
-        logger.debug(f" v, _ = next(iter(val_loader)): {v.shape}, {v.dtype}, min: {v.min()}, max: {v.max()}, v.is_contiguous: {v.is_contiguous()}")
+        #t, _ = next(iter(train_loader))
+        #v, _ = next(iter(val_loader))
+        #logger.debug(f" t, _ = next(iter(train_loader)):{t.shape}, {t.dtype}, min: {t.min()}, max: {t.max()}, t.is_contiguous: {t.is_contiguous()}")
+        #logger.debug(f" v, _ = next(iter(val_loader)): {v.shape}, {v.dtype}, min: {v.min()}, max: {v.max()}, v.is_contiguous: {v.is_contiguous()}")
 
         # Train and validate a finetuned model.
         self._finetune_new(train_loader, val_loader)

@@ -580,18 +580,32 @@ def cli_to_config(value: str, default_value_field:str="classname", alt_classname
     
     # Get the Config class from the registry
     config_class = registry.get_config_class(config_class_name)
+    logger.debug(f"Looking up config_class_name='{config_class_name}', found: {config_class}")
     
     # If not found in registry, try to get it from configurable class name
     if config_class is None:
         # Try treating config_class_name as a configurable class name (e.g., "DoG" -> "DoGConfig")
         configurable_class = registry.get_configurable_class(config_class_name)
+        logger.debug(f"Looking up configurable_class_name='{config_class_name}', found: {configurable_class}")
         if configurable_class is not None:
             configurable_name = configurable_class.__name__
-            config_class_name = f"{configurable_name}Config"
-            config_class = registry.get_config_class(config_class_name)
+            derived_config_name = f"{configurable_name}Config"
+            logger.debug(f"Derived config name: {derived_config_name}")
+            config_class = registry.get_config_class(derived_config_name)
+            logger.debug(f"Looking up derived config '{derived_config_name}', found: {config_class}")
+            if config_class is not None:
+                config_class_name = derived_config_name  # Update for error message
     
     if config_class is None:
-        raise ValueError(f"Config class '{config_class_name}' not found in registry. Available configs: {registry.list_configs()}")
+        available_configs = registry.list_configs()
+        available_configurables = registry.list_configurables()
+        error_msg = (
+            f"Config class '{config_class_name}' not found in registry.\n"
+            f"Available configs: {available_configs}\n"
+            f"Available configurables: {available_configurables}"
+        )
+        logger.error(error_msg)
+        raise ValueError(error_msg)
     
     try:
         # Use Pydantic's model_validate to create the config instance from dict
@@ -660,7 +674,18 @@ def cli_to_component_config(value: str) -> Configuration:
     Raises:
         ValueError: If the component name is not found in the registry or JSON is invalid.
     """
-    return cli_to_config(value)
+    try:
+        return cli_to_config(value)
+    except ValueError as e:
+        # Re-raise with more context for Typer error messages
+        error_msg = str(e)
+        if "not found in registry" in error_msg:
+            # Add suggestion for common issues
+            error_msg += (
+                "\n\nTip: Make sure the component is registered. "
+                "For trainer components, use 'MicroSAMTrainer' (not 'MicroSAMTrainerConfig')."
+            )
+        raise ValueError(error_msg) from e
 
 
 def cli_to_imagewriter_config(value: str) -> ImageWriterConfig:
@@ -870,9 +895,7 @@ def train_cmd(
     patterns = (config.input.include[0] if config.input.include is not None else None, config.labels.include[0] if config.labels.include is not None else None) 
     dc = config.dataset.copy(update={
         "patterns": patterns, 
-        "out_path": config.output.path,
-        "random_samples": 5,
-        "remove_empty_labels": True})
+        "out_path": config.output.path})
     config = config.copy(update={"dataset": dc})
 
     # Call run_training with the complete CLITrainerConfig
@@ -1106,7 +1129,7 @@ def run_training(config: CLITrainerConfig) -> None:
         # If Prefect wrapped it somehow, try to unwrap
         input_list = list(input_list_result) if hasattr(input_list_result, '__iter__') else [input_list_result]
     if not input_list:
-        logger.warning(f"No files found for input path: {config.input.paths}")
+        logger.error(f"No files found for input path: {config.input.paths}")
         return
 
     # Build FileList from config and get labelled image files
@@ -1116,7 +1139,8 @@ def run_training(config: CLITrainerConfig) -> None:
     else:
         labels_list = list(labels_list_result) if hasattr(labels_list_result, '__iter__') else [labels_list_result]
     if not labels_list:
-        raise ValueError(f"No files found for labels path: {config.labels.paths}")
+        logger.error(f"No files found for input path: {config.input.paths}")
+        return
 
     logger.info(input_list)
     logger.info(labels_list)
