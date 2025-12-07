@@ -122,8 +122,12 @@ class DatasetCreator(Configurable[DatasetCreatorConfig]):
         
         logger.info(f"Found {len(matches)} matching pairs")
         # check if self.config.out_path is relative path; if so use image_path dir and label_path dir as root and append out_path to it
-        # Expand ~/ at runtime for portability
-        out_path = self.config.out_path.expanduser().resolve()
+        # Expand ~/ at runtime for portability (but don't resolve yet - need to check if absolute first)
+        out_path = self.config.out_path.expanduser()
+        
+        # If absolute, resolve it once before the loop
+        if out_path.is_absolute():
+            out_path = out_path.resolve()
         
         training_pairs = []
         total_2d_pairs = 0
@@ -187,20 +191,22 @@ class TrainerConfig(Configuration):
 
     @field_validator('export_path', 'save_root', mode='after')
     @classmethod
-    def normalize_path_fields(cls, v: Optional[Path]) -> Path:
+    def normalize_path_fields(cls, v: Union[str, Path, None]) -> Path:
         """Normalize path fields to Path objects.
         
         Ensures path fields are always Path objects. Does NOT expand '~/' to preserve
         portability across different users. Expansion happens at runtime.
         
         Args:
-            v: Path object or None (Pydantic already converts strings to Path).
+            v: Path object, string, or None. Handles both cases in case validation is bypassed.
             
         Returns:
-            Path object (defaults to "." if None).
+            Path object (defaults to "./" if None).
         """
         if v is None:
             return Path("./")
+        if isinstance(v, str):
+            return Path(v)
         return v
 
     @model_validator(mode='after')
@@ -422,8 +428,10 @@ class MicroSAMTrainer(Trainer):
         the training loop for the specified number of iterations.
         """
         # Run training.
+        # Ensure save_root is a Path object
+        save_root_path = self.config.save_root if isinstance(self.config.save_root, Path) else Path(self.config.save_root)
         sam_training.train_sam(
-            save_root=str(self.config.save_root.expanduser().resolve()),
+            save_root=str(save_root_path.expanduser().resolve()),
             name=self.checkpoint_name,
             model_type=self.config.model_type,
             train_loader=train_loader,
@@ -494,8 +502,11 @@ class MicroSAMTrainer(Trainer):
         """
         # export the model after training so that it can be used by the rest of the micro_sam library
         # Expand ~/ at runtime for portability
-        save_root = str(self.config.save_root.expanduser().resolve())
-        export_path = str(self.config.export_path.expanduser().resolve())
+        # Ensure paths are Path objects
+        save_root_path = self.config.save_root if isinstance(self.config.save_root, Path) else Path(self.config.save_root)
+        export_path_path = self.config.export_path if isinstance(self.config.export_path, Path) else Path(self.config.export_path)
+        save_root = str(save_root_path.expanduser().resolve())
+        export_path = str(export_path_path.expanduser().resolve())
         
         export_custom_sam_model(
             checkpoint_path=os.path.join(save_root, self.CHECKPOINTS_FOLDER, self.checkpoint_name, self.BEST_MODEL_NAME),
