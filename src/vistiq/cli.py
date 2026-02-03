@@ -225,6 +225,7 @@ class CLISegmenterConfig(CLISubcommandConfig):
         input: Configuration for collecting input file(s) or directories.
         step: List of thresholding/segmenting/labelling component configurations to run in sequence.
         output: Configuration for output data writing.
+        checkpoint: Path to a .pth file to load a trained model checkpoint for segmentation.
     """
     loader: Optional[ImageLoaderConfig] = Field(
         default_factory=ImageLoaderConfig, description="Configuration for input data loading"
@@ -235,6 +236,10 @@ class CLISegmenterConfig(CLISubcommandConfig):
     output: Optional[ImageWriterConfig] = Field(
         default_factory=ImageWriterConfig, description="Configuration for output data writing"
     )
+    checkpoint: Optional[Path] = Field(
+        default=None, description="Optional path to a .pth model checkpoint to load for segmentation"
+)
+
 
     @field_validator("step")
     @classmethod
@@ -715,6 +720,7 @@ def cli_command_config(
     loader: Optional[DataLoaderConfig] = None,
     step: Optional[List[Configuration]] = None,
     output: Optional[DataWriterConfig] = None,
+    checkpoint: Optional[Path] = None,
 ) -> dict:
     """Build configuration dictionary from CLI arguments.
     
@@ -771,6 +777,7 @@ def cli_command_config(
         "loglevel": loglevel,
         "device": device,
         "processes": processes,
+        "checkpoint": checkpoint,
     }
     if labels is not None:
         config_kwargs["labels"] = labels
@@ -780,6 +787,8 @@ def cli_command_config(
         config_kwargs["loader"] = loader
     if output is not None:
         config_kwargs["output"] = output
+    if checkpoint is not None:
+        config_kwargs["checkpoint"] = checkpoint
     return config_kwargs
 
 
@@ -827,6 +836,8 @@ def segment_cmd(
     loader: Optional[ImageLoaderConfig] = Option(None, "--loader", help="Configuration to specify the data loader to use", parser=cli_to_imageloader_config),
     step: List[StackProcessorConfig] = Option(None, "--step", "-s", help="Processing step/component to include (can be specified multiple times). Use --step NAME to add a step.", parser=cli_to_component_config),
     output: Optional[ImageWriterConfig] = Option(None, "--output", "-o", help="Output file or directory configuration", parser=cli_to_imagewriter_config),
+    checkpoint: Optional[Path] = Option(None, "--checkpoint", "-c", help="Path to a model checkpoint (.pth) to load",
+)
 ) -> None:
     """Segment and label images with a chain of processing steps.
 
@@ -851,7 +862,7 @@ def segment_cmd(
     
     """
     # Create config from CLI arguments (labels and dataset are not used in segment, loader is optional)
-    config_kwargs = cli_command_config(ctx, input=input, labels=None, dataset=None, loader=loader, step=step, output=output)
+    config_kwargs = cli_command_config(ctx, input=input, labels=None, dataset=None, loader=loader, step=step, output=output, checkpoint=checkpoint)
     config = CLISegmenterConfig(**config_kwargs)
     # Call run_segment with the complete CLISegmenterConfig
     run_segment(config)
@@ -1045,6 +1056,18 @@ def run_segment(config: CLISegmenterConfig) -> None:
 
     # Build component chain from config
     component_names, built_components = build_component_chain(config.step)
+
+    # propagates checkpoint to all config fields if provided 
+    if config.checkpoint is not None:
+        ckpt = str(config.checkpoint.expanduser().resolve())
+        logger.info(f"Using checkpoint: {ckpt}")
+
+        for comp in built_components:
+            # If the component has a pydantic config with a checkpoint field, set it
+            if hasattr(comp, "config") and hasattr(comp.config, "checkpoint"):
+                if getattr(comp.config, "checkpoint") in (None, "", False):
+                    setattr(comp.config, "checkpoint", ckpt)
+                    logger.info(f"Injected checkpoint into component {comp.name()}: {ckpt}")
     
     # Get absolute path of input and strip extension for output directory
     # first_file should already be a Path object from the validator
