@@ -1489,7 +1489,7 @@ def run_segment(config: CLISegmentConfig, args: Optional[argparse.Namespace] = N
         #feature_dfs = {}
 
         for ch_name, im in zip(channel_names, img_ch):
-            logger.debug(f"metadata[used_scale]: {''.join(metadata["used_scale"]._fields)}")
+            logger.debug(f"metadata[used_scale]: {''.join(metadata['used_scale']._fields)}")
             logger.debug(f"type(im): {type(im)}, shape: {im.shape}, ch_name: {ch_name}")
 
             # MicroSAMSegmenter with RegionFilter
@@ -1517,7 +1517,7 @@ def run_segment(config: CLISegmentConfig, args: Optional[argparse.Namespace] = N
                 OmeTiffWriter.save(labels, str(output_path), physical_pixel_sizes=metadata["used_scale"], channel_names=[ch_name], dim_order=_infer_dim_order(labels.ndim))
         else:
             labels = np.stack(labels_ch, axis=0)
-            output_path = output_dir / f"Labels-{"-".join(channel_names)}.tif"
+            output_path = output_dir / f"Labels-{'-'.join(channel_names)}.tif"
             OmeTiffWriter.save(labels, str(output_path), physical_pixel_sizes=metadata["used_scale"], channel_names=channel_names, dim_order=_infer_dim_order(labels.ndim))
 
 
@@ -1731,7 +1731,7 @@ def run_coincidence(config: CLICoincidenceConfig) -> None:
         feature_dfs = {}
 
         for ch_name, im in zip(channel_names, img_ch):
-            logger.info(f"{''.join(metadata["used_scale"]._fields)}")
+            logger.info(f"{''.join(metadata['used_scale']._fields)}")
             # 1. DoG preprocessing
             dog = DoG(dog_config)
             preprocessed = dog.run(im)
