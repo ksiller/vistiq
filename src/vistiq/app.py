@@ -1441,7 +1441,7 @@ def run_segment(config: CLISegmentConfig, args: Optional[argparse.Namespace] = N
                     OmeTiffWriter.save(labels, str(output_path), physical_pixel_sizes=metadata["used_scale"], channel_names=[ch_name], dim_order=_infer_dim_order(labels.ndim))
             else:
                 labels = np.stack(labels_ch, axis=0)
-                output_path = output_dir / f"Labels-{"-".join(channel_names)}.tif"
+                output_path = output_dir / f"Labels-{'-'.join(channel_names)}.tif"
                 OmeTiffWriter.save(labels, str(output_path), physical_pixel_sizes=metadata["used_scale"], channel_names=channel_names, dim_order=_infer_dim_order(labels.ndim))
         return
     
