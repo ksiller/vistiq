@@ -1425,7 +1425,7 @@ def run_segment(config: CLISegmentConfig, args: Optional[argparse.Namespace] = N
 
             labels_ch = []
             for ch_name, im in zip(channel_names, img_ch):
-                logger.info(f"{''.join(metadata["used_scale"]._fields)}")
+                logger.info(f"{''.join(metadata['used_scale']._fields)}")
                 # Run components in sequence
                 result = im
                 for i, component in enumerate(built_components):
