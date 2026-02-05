@@ -714,7 +714,7 @@ class ImageWriter(DataWriter):
                 channel_names = m.get("channel_names", [])
                 OmeTiffWriter.save(
                     data=img,
-                    uri=path.with_suffix(f".{"-".join(channel_names)}.{self.config.extension}"),
+                    uri=path.with_suffix(f".{'-'.join(channel_names)}.{self.config.extension}"),
                     dim_order=m.get("dim_order", ""),
                     channel_names=m.get("channel_names", None),
                     image_name=m.get("image_names", None),
@@ -724,7 +724,7 @@ class ImageWriter(DataWriter):
             channel_names = metadata.get("channel_names", [])
             OmeTiffWriter.save(
                 data=data,
-                uri=path.with_suffix(f".{"-".join(channel_names)}.{self.config.extension}"),
+                uri=path.with_suffix(f".{'-'.join(channel_names)}.{self.config.extension}"),
                 dim_order=metadata.get("dim_order", ""),
                 channel_names=metadata.get("channel_names", []),
                 image_name=metadata.get("image_names", ""),
