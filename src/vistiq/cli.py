@@ -238,7 +238,7 @@ class CLISegmenterConfig(CLISubcommandConfig):
     )
     checkpoint: Optional[Path] = Field(
         default=None, description="Optional path to a .pth model checkpoint to load for segmentation"
-)
+    )
 
 
     @field_validator("step")
@@ -274,6 +274,7 @@ class CLITrainerConfig(CLISubcommandConfig):
         dataset: Configuration for dataset creation (DatasetCreatorConfig). Defaults to DatasetCreatorConfig.
         step: List of training component configurations to run in sequence (TrainerConfig).
         output: Configuration for output data writing (ImageWriterConfig). Defaults to ImageWriterConfig.
+        checkpoint: Path to a .pth file to load a trained model checkpoint for segmentation.
     """
     input: Optional[FileListConfig] = Field(
         default=None, description="Configuration for input images"
@@ -292,6 +293,9 @@ class CLITrainerConfig(CLISubcommandConfig):
     )
     output: Optional[ImageWriterConfig] = Field(
         default_factory=ImageWriterConfig, description="Configuration for output data writing"
+    )
+    checkpoint: Optional[Path] = Field(
+        default=None, description="Optional path to a .pth model checkpoint to load for segmentation"
     )
 
     @field_validator("step")
@@ -735,6 +739,8 @@ def cli_command_config(
         loader: Optional data loader configuration.
         step: Optional list of processing step configurations.
         output: Optional output writer configuration.
+        checkpoint: Optional path to a model checkpoint to load (passed through to command config).
+
         
     Returns:
         Dictionary containing configuration values ready for Pydantic model instantiation.
@@ -745,6 +751,8 @@ def cli_command_config(
     logger.info(f"CLI loader: {loader}")
     logger.info(f"CLI component: {step}")
     logger.info(f"CLI output: {output}")
+    logger.info(f"CLI checkpoint: {checkpoint}")
+
 
     # Get common options from context (set by common_callback)
     # Try ctx.obj first (recommended), then ctx.params (for compatibility)
@@ -777,7 +785,6 @@ def cli_command_config(
         "loglevel": loglevel,
         "device": device,
         "processes": processes,
-        "checkpoint": checkpoint,
     }
     if labels is not None:
         config_kwargs["labels"] = labels
@@ -876,6 +883,7 @@ def train_cmd(
     loader: Optional[ImageLoaderConfig] = Option(None, "--loader", help="Configuration to specify the data loader to use", parser=cli_to_imageloader_config),
     step: List[TrainerConfig] = Option(None, "--step", "-s", help="Processing step/component to include (can be specified multiple times). Use --step NAME to add a step.", parser=cli_to_component_config),
     output: Optional[ImageWriterConfig] = Option(None, "--output", "-o", help="Output file or directory configuration", parser=cli_to_imagewriter_config),
+    checkpoint: Optional[Path] = Option(None, "--checkpoint", "-c", help="Path to a model checkpoint (.pth) to load"),
 ) -> None:
     """Train a model with a chain of processing steps.
 
@@ -899,7 +907,7 @@ def train_cmd(
     
     """
     # Create config from CLI arguments
-    config_kwargs = cli_command_config(ctx, input=input, labels=labels, dataset=dataset, loader=loader, step=step, output=output)
+    config_kwargs = cli_command_config(ctx, input=input, labels=labels, dataset=dataset, loader=loader, step=step, output=output, checkpoint=checkpoint)
     config = CLITrainerConfig(**config_kwargs)
 
     # properly connect components to dataset creator
@@ -1187,8 +1195,21 @@ def run_training(config: CLITrainerConfig) -> None:
         if isinstance(c, MicroSAMTrainerConfig):
             microsam_trainer_config = c.copy(update={"device": config.device})
             break
+
     if microsam_trainer_config is None:
         raise ValueError("No MicroSAMTrainerConfig found in 'step'")
+    
+    # Inject checkpoint into the trainer config if provided and not already set
+    if config.checkpoint is not None:
+        ckpt = config.checkpoint.expanduser().resolve()
+        logger.info(f"Using checkpoint: {ckpt}")
+
+        # Only override if the step didn't already specify a checkpoint
+        current = getattr(microsam_trainer_config, "checkpoint", None)
+        if current in (None, "", False):
+            microsam_trainer_config = microsam_trainer_config.copy(update={"checkpoint": ckpt})
+            logger.info("Injected checkpoint into MicroSAMTrainerConfig")
+
     trainer = MicroSAMTrainer(microsam_trainer_config)
     trainer.run(image_paths, label_paths)
 
