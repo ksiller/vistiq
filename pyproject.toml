@@ -19,12 +19,12 @@ dependencies = [
     "bioio>=3.0.0",
     "bioio-ome-tiff>=1.4.0",
 ]
-requires-python = ">=3.12, <3.12"
+requires-python = ">=3.12"
 description = "Turn complex imaging data into actionable, quantitative insight with modular, multi-step analysis."
 readme = "README.md"
 classifiers = [
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
 
@@ -77,7 +77,7 @@ include = ["/src/vistiq", "/README.md", "/LICENSE", "/pyproject.toml"]
 
 [tool.black]
 line-length = 88
-target-version = ['py311']
+target-version = ['py312']
 include = '\.pyi?$'
 extend-exclude = '''
 /(
