@@ -275,6 +275,10 @@ class CLITrainerConfig(CLISubcommandConfig):
         step: List of training component configurations to run in sequence (TrainerConfig).
         output: Configuration for output data writing (ImageWriterConfig). Defaults to ImageWriterConfig.
         checkpoint: Path to a .pth file to load a trained model checkpoint for segmentation.
+        pred_iou_thresh: Prediction IoU threshold used for fine-tuning.
+        stability_score_thresh: Stability score threshold used for fine-tuning.
+        box_nms_thresh: Box NMS threshold used for fine-tuning.
+        min_object_size: Minimum object size (in pixels) used for fine-tuning.
     """
     input: Optional[FileListConfig] = Field(
         default=None, description="Configuration for input images"
@@ -296,6 +300,18 @@ class CLITrainerConfig(CLISubcommandConfig):
     )
     checkpoint: Optional[Path] = Field(
         default=None, description="Optional path to a .pth model checkpoint to load for segmentation"
+    )
+    pred_iou_thresh: float = Field(
+        default=0.88, description="Prediction IoU threshold used during fine-tuning"
+    )
+    stability_score_thresh: float = Field(
+        default=0.95, description="Stability score threshold used during fine-tuning"
+    )
+    box_nms_thresh: float = Field(
+        default=0.7, description="Box NMS threshold used during fine-tuning"
+    )
+    min_object_size: int = Field(
+        default=50, description="Minimum object size (in pixels) used during fine-tuning"
     )
 
     @field_validator("step")
@@ -725,6 +741,7 @@ def cli_command_config(
     step: Optional[List[Configuration]] = None,
     output: Optional[DataWriterConfig] = None,
     checkpoint: Optional[Path] = None,
+    **extra_kwargs: Any,
 ) -> dict:
     """Build configuration dictionary from CLI arguments.
     
@@ -740,6 +757,7 @@ def cli_command_config(
         step: Optional list of processing step configurations.
         output: Optional output writer configuration.
         checkpoint: Optional path to a model checkpoint to load (passed through to command config).
+        extra_kwargs: Additional keyword arguments that will be forwarded into the config.
 
         
     Returns:
@@ -796,6 +814,8 @@ def cli_command_config(
         config_kwargs["output"] = output
     if checkpoint is not None:
         config_kwargs["checkpoint"] = checkpoint
+    # Forward any additional keyword arguments (used by specific subcommands like 'train').
+    config_kwargs.update(extra_kwargs)
     return config_kwargs
 
 
@@ -884,6 +904,10 @@ def train_cmd(
     step: List[TrainerConfig] = Option(None, "--step", "-s", help="Processing step/component to include (can be specified multiple times). Use --step NAME to add a step.", parser=cli_to_component_config),
     output: Optional[ImageWriterConfig] = Option(None, "--output", "-o", help="Output file or directory configuration", parser=cli_to_imagewriter_config),
     checkpoint: Optional[Path] = Option(None, "--checkpoint", "-c", help="Path to a model checkpoint (.pth) to load"),
+    pred_iou_thresh: float = Option(0.88, "--pred-iou-thresh", help="Prediction IoU threshold used during fine-tuning"),
+    stability_score_thresh: float = Option(0.95, "--stability-score-thresh", help="Stability score threshold used during fine-tuning"),
+    box_nms_thresh: float = Option(0.7, "--box-nms-thresh", help="Box NMS threshold used during fine-tuning"),
+    min_object_size: int = Option(50, "--min-object-size", help="Minimum object size (in pixels) used during fine-tuning"),
 ) -> None:
     """Train a model with a chain of processing steps.
 
@@ -907,7 +931,20 @@ def train_cmd(
     
     """
     # Create config from CLI arguments
-    config_kwargs = cli_command_config(ctx, input=input, labels=labels, dataset=dataset, loader=loader, step=step, output=output, checkpoint=checkpoint)
+    config_kwargs = cli_command_config(
+        ctx,
+        input=input,
+        labels=labels,
+        dataset=dataset,
+        loader=loader,
+        step=step,
+        output=output,
+        checkpoint=checkpoint,
+        pred_iou_thresh=pred_iou_thresh,
+        stability_score_thresh=stability_score_thresh,
+        box_nms_thresh=box_nms_thresh,
+        min_object_size=min_object_size,
+    )
     config = CLITrainerConfig(**config_kwargs)
 
     # properly connect components to dataset creator
@@ -1193,7 +1230,15 @@ def run_training(config: CLITrainerConfig) -> None:
     microsam_trainer_config = None
     for c in config.step:
         if isinstance(c, MicroSAMTrainerConfig):
-            microsam_trainer_config = c.copy(update={"device": config.device})
+            microsam_trainer_config = c.copy(
+                update={
+                    "device": config.device,
+                    "pred_iou_thresh": config.pred_iou_thresh,
+                    "stability_score_thresh": config.stability_score_thresh,
+                    "box_nms_thresh": config.box_nms_thresh,
+                    "min_object_size": config.min_object_size,
+                }
+            )
             break
 
     if microsam_trainer_config is None:
