@@ -177,6 +177,7 @@ class TrainerConfig(Configuration):
         roi_def: Region of interest definition as a slice (default: all slices).
         device: Device to use for training, "cuda" or "cpu" (default: "cuda").
         split_ratio: Ratio for train/validation split (default: 0.8).
+        checkpoint: Path to an existing model to load before training (default: None).
     """
     model_type: str = "vit_l_lm"
     export_path: Path = "./"
@@ -188,6 +189,7 @@ class TrainerConfig(Configuration):
     device: str = "cuda"
     split_ratio: float = 0.8
     transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
+    checkpoint: Optional[Path] = None  
 
     @field_validator('export_path', 'save_root', mode='after')
     @classmethod
@@ -430,6 +432,13 @@ class MicroSAMTrainer(Trainer):
         # Run training.
         # Ensure save_root is a Path object
         save_root_path = self.config.save_root if isinstance(self.config.save_root, Path) else Path(self.config.save_root)
+
+        # Optional checkpoint initialization (maps your config.checkpoint -> train_sam(checkpoint_path=...))
+        ckpt_path = None
+        if getattr(self.config, "checkpoint", None) is not None:
+            ckpt_path = str(Path(self.config.checkpoint).expanduser().resolve())
+            logger.info(f"Initializing SAM from checkpoint_path: {ckpt_path}")
+
         sam_training.train_sam(
             save_root=str(save_root_path.expanduser().resolve()),
             name=self.checkpoint_name,
@@ -438,6 +447,7 @@ class MicroSAMTrainer(Trainer):
             val_loader=val_loader,
             n_epochs=self.config.epochs,
             n_objects_per_batch=self.config.n_objects_per_batch,
+            checkpoint_path=ckpt_path,
             with_segmentation_decoder=self.config.instance_segmentation,
             device=self.config.device,
             verify_n_labels_in_loader=None
@@ -462,6 +472,26 @@ class MicroSAMTrainer(Trainer):
 
         # Get the segment anything model, the optimizer and the LR scheduler
         model = sam_training.get_trainable_sam_model(model_type=self.config.model_type, device=device)
+
+        # Load starting weights if provided
+        ckpt = getattr(self.config, "checkpoint", None)
+        if ckpt:
+            ckpt_path = Path(ckpt).expanduser().resolve()
+            logger.info(f"Loading checkpoint weights into model: {ckpt_path}")
+
+            state = torch.load(str(ckpt_path), map_location=device)
+
+            # Handle common checkpoint formats
+            if isinstance(state, dict):
+                if "state_dict" in state:
+                    state = state["state_dict"]
+                elif "model_state_dict" in state:
+                    state = state["model_state_dict"]
+
+            missing, unexpected = model.load_state_dict(state, strict=False)
+            logger.info(f"Checkpoint loaded. missing={len(missing)} unexpected={len(unexpected)}")
+
+
         optimizer = torch.optim.Adam(model.parameters(), lr=self.config.learning_rate)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.9, patience=10, verbose=self.config.verbose)
 

@@ -420,7 +420,25 @@ class StackProcessor(Configurable):
         return (results, updated_metadata)
 
     def _update_after_resize(self, orig_shape, new_shape, new_metadata: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
-        change = np.array(orig_shape) / np.array(new_shape)
+        orig = np.array(orig_shape, dtype=float)
+        new = np.array(new_shape, dtype=float)
+
+        # Handle dimensionality changes (e.g., squeezing away T/C so TCZYX -> ZYX)
+        if orig.size != new.size:
+            if orig.size > new.size:
+                # Keep trailing dims (typically spatial dims) to align with new_shape
+                orig = orig[-new.size:]
+                # Also align axes to trailing axes, since scale update uses enumerate(axes)
+                if "axes" in new_metadata and new_metadata["axes"]:
+                    new_metadata["axes"] = list(new_metadata["axes"])[-new.size:]
+                    axes = new_metadata.get("axes", [])
+            else:
+                # Pad orig with leading ones to align
+                orig = np.pad(orig, (new.size - orig.size, 0), mode="constant", constant_values=1.0)
+
+        change = orig / new        
+
+        
         logger.info(f"Updating metadata with new shape ratio: {change}")
         
         # Update shape if present

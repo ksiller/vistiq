@@ -225,6 +225,7 @@ class CLISegmenterConfig(CLISubcommandConfig):
         input: Configuration for collecting input file(s) or directories.
         step: List of thresholding/segmenting/labelling component configurations to run in sequence.
         output: Configuration for output data writing.
+        checkpoint: Path to a .pth file to load a trained model checkpoint for segmentation.
     """
     loader: Optional[ImageLoaderConfig] = Field(
         default_factory=ImageLoaderConfig, description="Configuration for input data loading"
@@ -235,6 +236,10 @@ class CLISegmenterConfig(CLISubcommandConfig):
     output: Optional[ImageWriterConfig] = Field(
         default_factory=ImageWriterConfig, description="Configuration for output data writing"
     )
+    checkpoint: Optional[Path] = Field(
+        default=None, description="Optional path to a .pth model checkpoint to load for segmentation"
+    )
+
 
     @field_validator("step")
     @classmethod
@@ -269,6 +274,7 @@ class CLITrainerConfig(CLISubcommandConfig):
         dataset: Configuration for dataset creation (DatasetCreatorConfig). Defaults to DatasetCreatorConfig.
         step: List of training component configurations to run in sequence (TrainerConfig).
         output: Configuration for output data writing (ImageWriterConfig). Defaults to ImageWriterConfig.
+        checkpoint: Path to a .pth file to load a trained model checkpoint for segmentation.
     """
     input: Optional[FileListConfig] = Field(
         default=None, description="Configuration for input images"
@@ -287,6 +293,9 @@ class CLITrainerConfig(CLISubcommandConfig):
     )
     output: Optional[ImageWriterConfig] = Field(
         default_factory=ImageWriterConfig, description="Configuration for output data writing"
+    )
+    checkpoint: Optional[Path] = Field(
+        default=None, description="Optional path to a .pth model checkpoint to load for segmentation"
     )
 
     @field_validator("step")
@@ -715,6 +724,7 @@ def cli_command_config(
     loader: Optional[DataLoaderConfig] = None,
     step: Optional[List[Configuration]] = None,
     output: Optional[DataWriterConfig] = None,
+    checkpoint: Optional[Path] = None,
 ) -> dict:
     """Build configuration dictionary from CLI arguments.
     
@@ -729,6 +739,8 @@ def cli_command_config(
         loader: Optional data loader configuration.
         step: Optional list of processing step configurations.
         output: Optional output writer configuration.
+        checkpoint: Optional path to a model checkpoint to load (passed through to command config).
+
         
     Returns:
         Dictionary containing configuration values ready for Pydantic model instantiation.
@@ -739,6 +751,8 @@ def cli_command_config(
     logger.info(f"CLI loader: {loader}")
     logger.info(f"CLI component: {step}")
     logger.info(f"CLI output: {output}")
+    logger.info(f"CLI checkpoint: {checkpoint}")
+
 
     # Get common options from context (set by common_callback)
     # Try ctx.obj first (recommended), then ctx.params (for compatibility)
@@ -780,6 +794,8 @@ def cli_command_config(
         config_kwargs["loader"] = loader
     if output is not None:
         config_kwargs["output"] = output
+    if checkpoint is not None:
+        config_kwargs["checkpoint"] = checkpoint
     return config_kwargs
 
 
@@ -827,6 +843,8 @@ def segment_cmd(
     loader: Optional[ImageLoaderConfig] = Option(None, "--loader", help="Configuration to specify the data loader to use", parser=cli_to_imageloader_config),
     step: List[StackProcessorConfig] = Option(None, "--step", "-s", help="Processing step/component to include (can be specified multiple times). Use --step NAME to add a step.", parser=cli_to_component_config),
     output: Optional[ImageWriterConfig] = Option(None, "--output", "-o", help="Output file or directory configuration", parser=cli_to_imagewriter_config),
+    checkpoint: Optional[Path] = Option(None, "--checkpoint", "-c", help="Path to a model checkpoint (.pth) to load",
+)
 ) -> None:
     """Segment and label images with a chain of processing steps.
 
@@ -851,7 +869,7 @@ def segment_cmd(
     
     """
     # Create config from CLI arguments (labels and dataset are not used in segment, loader is optional)
-    config_kwargs = cli_command_config(ctx, input=input, labels=None, dataset=None, loader=loader, step=step, output=output)
+    config_kwargs = cli_command_config(ctx, input=input, labels=None, dataset=None, loader=loader, step=step, output=output, checkpoint=checkpoint)
     config = CLISegmenterConfig(**config_kwargs)
     # Call run_segment with the complete CLISegmenterConfig
     run_segment(config)
@@ -865,6 +883,7 @@ def train_cmd(
     loader: Optional[ImageLoaderConfig] = Option(None, "--loader", help="Configuration to specify the data loader to use", parser=cli_to_imageloader_config),
     step: List[TrainerConfig] = Option(None, "--step", "-s", help="Processing step/component to include (can be specified multiple times). Use --step NAME to add a step.", parser=cli_to_component_config),
     output: Optional[ImageWriterConfig] = Option(None, "--output", "-o", help="Output file or directory configuration", parser=cli_to_imagewriter_config),
+    checkpoint: Optional[Path] = Option(None, "--checkpoint", "-c", help="Path to a model checkpoint (.pth) to load"),
 ) -> None:
     """Train a model with a chain of processing steps.
 
@@ -888,7 +907,7 @@ def train_cmd(
     
     """
     # Create config from CLI arguments
-    config_kwargs = cli_command_config(ctx, input=input, labels=labels, dataset=dataset, loader=loader, step=step, output=output)
+    config_kwargs = cli_command_config(ctx, input=input, labels=labels, dataset=dataset, loader=loader, step=step, output=output, checkpoint=checkpoint)
     config = CLITrainerConfig(**config_kwargs)
 
     # properly connect components to dataset creator
@@ -1045,6 +1064,18 @@ def run_segment(config: CLISegmenterConfig) -> None:
 
     # Build component chain from config
     component_names, built_components = build_component_chain(config.step)
+
+    # propagates checkpoint to all config fields if provided 
+    if config.checkpoint is not None:
+        ckpt = str(config.checkpoint.expanduser().resolve())
+        logger.info(f"Using checkpoint: {ckpt}")
+
+        for comp in built_components:
+            # If the component has a pydantic config with a checkpoint field, set it
+            if hasattr(comp, "config") and hasattr(comp.config, "checkpoint"):
+                if getattr(comp.config, "checkpoint") in (None, "", False):
+                    setattr(comp.config, "checkpoint", ckpt)
+                    logger.info(f"Injected checkpoint into component {comp.name()}: {ckpt}")
     
     # Get absolute path of input and strip extension for output directory
     # first_file should already be a Path object from the validator
@@ -1164,8 +1195,21 @@ def run_training(config: CLITrainerConfig) -> None:
         if isinstance(c, MicroSAMTrainerConfig):
             microsam_trainer_config = c.copy(update={"device": config.device})
             break
+
     if microsam_trainer_config is None:
         raise ValueError("No MicroSAMTrainerConfig found in 'step'")
+    
+    # Inject checkpoint into the trainer config if provided and not already set
+    if config.checkpoint is not None:
+        ckpt = config.checkpoint.expanduser().resolve()
+        logger.info(f"Using checkpoint: {ckpt}")
+
+        # Only override if the step didn't already specify a checkpoint
+        current = getattr(microsam_trainer_config, "checkpoint", None)
+        if current in (None, "", False):
+            microsam_trainer_config = microsam_trainer_config.copy(update={"checkpoint": ckpt})
+            logger.info("Injected checkpoint into MicroSAMTrainerConfig")
+
     trainer = MicroSAMTrainer(microsam_trainer_config)
     trainer.run(image_paths, label_paths)
 
