@@ -1,6 +1,7 @@
-name: vistiq-env
+name: vistiq-env-gpu
 channels:
   - conda-forge
+  - nvidia
   - pytorch
   - defaults
 
@@ -24,16 +25,17 @@ dependencies:
   - prefect>=3.0.0
   - typer
 
-  # CPU torch stack
+  # GPU torch stack
   - pytorch
   - torchvision
-  - cpuonly
+  - pytorch-cuda=12.1
 
   # Imaging / IO
   - bioio>=3.0.0
   - bioio-ome-tiff>=1.4.0
+  - micro_sam=1.6.2
 
-
+  # Prefer conda if it resolves cleanly
   - torch_em
 
   - pip:
