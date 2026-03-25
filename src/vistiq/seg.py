@@ -2111,7 +2111,23 @@ class MicroSAMSegmenter(Segmenter):
     """
     def __init__(self, config: MicroSAMSegmenterConfig):
         super().__init__(config)
-        predictor, segmenter = get_predictor_and_segmenter(model_type=self.config.model_type)
+        try:
+            if self.config.checkpoint:
+                predictor, segmenter = get_predictor_and_segmenter(
+                    model_type=self.config.model_type,
+                    checkpoint=self.config.checkpoint,
+                )
+            else:
+                predictor, segmenter = get_predictor_and_segmenter(model_type=self.config.model_type)
+        except TypeError:
+            # Older micro_sam versions may not accept `checkpoint=...`
+            predictor, segmenter = get_predictor_and_segmenter(model_type=self.config.model_type)
+            if self.config.checkpoint:
+                raise ValueError(
+                "Checkpoint was provided, but this micro_sam version doesn't support "
+                "passing `checkpoint` to get_predictor_and_segmenter."
+                )
+            
         if self.config.predictor is None:
             self.config.predictor = predictor
         if self.config.segmenter is None:
