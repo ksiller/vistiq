@@ -247,6 +247,10 @@ class MicroSAMTrainerConfig(TrainerConfig):
         mixed_precision: Whether to use mixed precision training (default: True).
         compile_model: Whether to compile the model (default: False).
         verbose: Whether to print verbose output (default: True).
+        pred_iou_thresh: Prediction IoU threshold used for fine-tuning.
+        stability_score_thresh: Stability score threshold used for fine-tuning.
+        box_nms_thresh: Box NMS threshold used for fine-tuning.
+        min_object_size: Minimum object size (in pixels) used for fine-tuning.
     """
     raw_key: Optional[str] = None
     label_key: Optional[str] = None
@@ -260,6 +264,10 @@ class MicroSAMTrainerConfig(TrainerConfig):
     compile_model: bool = False
     instance_segmentation: bool = True
     verbose: bool = True
+    pred_iou_thresh: float = 0.88
+    stability_score_thresh: float = 0.95
+    box_nms_thresh: float = 0.7
+    min_object_size: int = 50
 
 class Trainer(Configurable[TrainerConfig]):
     """Base trainer class for model training.
