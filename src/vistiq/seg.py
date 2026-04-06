@@ -469,6 +469,8 @@ class RegionFilter(Configurable[RegionFilterConfig]):
             - removed_labels: Region labels that failed at least one filter.
             Returns the same type as input (list or DataFrame).
         """
+        print("DEBUG: entered RegionFilter.run")
+        print("DEBUG: region_properties type =", type(region_properties))
         logger.info(f"Running {type(self).__name__} with config: {self.config}")
         if self.config.filters is None or len(self.config.filters) == 0:
             logger.info("RegionFilter: no filters, returning all regions")
@@ -682,6 +684,8 @@ class Relabeler(StackProcessor):
         Returns:
             Relabeled array with unique labels. Same shape as input (stacked if input was a list).
         """
+        print("DEBUG: entered Relabeler.run")
+        print("DEBUG: input type =", type(labels))
         # Convert list to array if needed
         if isinstance(labels, list):
             labels_array = np.stack(labels, axis=0)
@@ -1041,6 +1045,8 @@ class LabelRemover(StackProcessor):
             If remap=True: Tuple of (processed label array, mapping list) where mapping is
                 list of (old_label, new_label) tuples.
         """
+        print("DEBUG: entered LabelRemover.run")
+        print("DEBUG: region_properties type =", type(region_properties))
         # Extract label IDs from various input formats
         label_ids_array = self._extract_label_ids(region_properties)
         logger.debug(f"label_ids_array={label_ids_array}")
@@ -1553,6 +1559,8 @@ class RegionAnalyzer(StackProcessor):
         Returns:
             Region properties as list or DataFrame, depending on output_type.
         """
+        print("DEBUG: entered RegionAnalyzer.run")
+        print("DEBUG: labels shape =", getattr(labels, "shape", None))
         results = super().run(labels, workers=workers, verbose=verbose, metadata=metadata, **kwargs)
         return results
 
