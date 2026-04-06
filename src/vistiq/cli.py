@@ -1048,6 +1048,8 @@ def run_preprocess(config: CLIPreprocessorConfig) -> None:
                 logger.info(f"Running component {i+1}/{len(built_components)}: {component.name()} with workers={workers}")
                 result, result_metadata = component.run(result, workers=workers, metadata=result_metadata)
             
+            if result_metadata is None:
+                result_metadata = {}
             result_metadata.update({"dim_order":_infer_dim_order(result.ndim)})
             logger.info(f"Result shape: {result.shape}, metadata: {result_metadata}")
             logger.info(f"Channel axis: {result_metadata.get('channel_axis', None)}")
@@ -1165,6 +1167,8 @@ def run_segment(config: CLISegmenterConfig) -> None:
                 logger.info(f"Running component {i+1}/{len(built_components)}: {component.name()} with workers={workers}")
                 result, result_metadata = component.run(result, workers=workers, metadata=result_metadata)
             
+            if result_metadata is None:
+                result_metadata = {}
             result_metadata.update({"dim_order":_infer_dim_order(result.ndim)})
             logger.info(f"Result shape: {result.shape}, metadata: {result_metadata}")
             logger.info(f"Channel axis: {result_metadata.get('channel_axis', None)}")
