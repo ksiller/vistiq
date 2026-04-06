@@ -464,9 +464,9 @@ class RegionFilter(Configurable[RegionFilterConfig]):
             regions: List of region properties or pandas DataFrame to filter.
             
         Returns:
-            Tuple of (accepted_regions, removed_regions):
+            Tuple of (accepted_regions, removed_labels):
             - accepted_regions: Regions that passed all filters.
-            - removed_regions: Regions that failed at least one filter.
+            - removed_labels: Region labels that failed at least one filter.
             Returns the same type as input (list or DataFrame).
         """
         logger.info(f"Running {type(self).__name__} with config: {self.config}")
@@ -478,27 +478,48 @@ class RegionFilter(Configurable[RegionFilterConfig]):
         if isinstance(regions, pd.DataFrame):
             logger.debug(f"Applying RegionFilter to a DataFrame: {regions.head()}")
             removed_indices = []
+
             for idx, row in regions.iterrows():
                 for filter in self.config.filters:
                     if filter.config.attribute not in row.index:
-                        logger.warning(f"Attribute '{filter.config.attribute}' not found in DataFrame columns")
+                        logger.warning(
+                            f"Attribute '{filter.config.attribute}' not found in DataFrame columns"
+                        )
                         continue
+
                     value = row[filter.config.attribute]
                     if not filter.in_range(value):
                         removed_indices.append(idx)
                         break
+
             accepted_regions = regions.drop(index=removed_indices)
-            #removed_regions = regions.loc[removed_indices] if removed_indices else pd.DataFrame()
-            #logger.info(f"RegionFilter: len(accepted_regions)={len(accepted_regions)}, len(removed_regions)={len(removed_regions)}")
-            if "label" in regions.columns:
-                removed_labels = regions.loc[removed_indices, 'label'].values.astype(np.int32) if removed_indices else np.array([], dtype=np.int32)
+
+            if removed_indices:
+                if "label" in regions.columns:
+                    removed_labels = (
+                        regions.loc[removed_indices, "label"]
+                        .astype(np.int32)
+                        .to_numpy()
+                    )
+                elif regions.index.name == "label":
+                    removed_labels = np.asarray(removed_indices, dtype=np.int32)
+                else:
+                    raise ValueError(
+                        "RegionFilter received a DataFrame without a 'label' column "
+                        "or index named 'label', so filtered rows cannot be mapped "
+                        "back to segmentation labels safely."
+                    )
             else:
-                removed_labels = removed_indices
-            logger.info(f"RegionFilter: len(accepted_regions)={len(accepted_regions)}, len(removed_labels)={len(removed_labels)}")
+                removed_labels = np.array([], dtype=np.int32)
+
+            logger.info(
+                f"RegionFilter: len(accepted_regions)={len(accepted_regions)}, "
+                f"len(removed_labels)={len(removed_labels)}"
+            )
             return accepted_regions, removed_labels
         
         # Handle list of RegionProperties input
-        #removed_regions = []
+        #removed_labels = []
         removed_labels = set()  # Use set for O(1) lookup by label
         for region in regions:
             for filter in self.config.filters:
@@ -507,7 +528,7 @@ class RegionFilter(Configurable[RegionFilterConfig]):
                     #logger.debug(
                     #    f"filter {filter.config.attribute} value={value} not in range for region {region.label}"
                     #)
-                    #removed_regions.append(region)
+                    #removed_labels.append(region)
                     removed_labels.add(region.label)
                     break
         # Compare by label instead of using 'in' to avoid triggering RegionProperties.__eq__
@@ -776,7 +797,8 @@ def remap_dataframe_labels(
     df = df.copy()  # Work on a copy to avoid modifying the original
     
     # Determine where to get labels from and where to write them
-    if key is None or key.lower() == "index" or df.index.name.lower() == key.lower():
+    index_name = df.index.name
+    if key is None or key.lower() == "index" or (index_name is not None and index_name.lower() == key.lower()):
         # Use index
         labels = df.index.values
         target_is_index = True
@@ -916,45 +938,43 @@ class LabelRemover(StackProcessor):
         self, 
         label_ids: Union[List["RegionProperties"], pd.DataFrame, List[int], np.ndarray]
     ) -> np.ndarray:
-        """Extract label IDs from various input formats.
-        
-        Args:
-            label_ids: Can be:
-                - List of RegionProperties (extracts .label attribute)
-                - pandas DataFrame with a 'label' column or index
-                - List of ints
-                - numpy array of ints
-                
-        Returns:
-            numpy array of label IDs to remove.
         """
+        Extract label IDs from input formats.
+
+        IMPORTANT:
+        Label IDs must match segmentation labels, not DataFrame row indices.
+
+        For DataFrames:
+        - Use 'label' column if present
+        - Otherwise use index only if named 'label'
+        - Do not assume row indices are labels
+
+    Returns:
+    np.ndarray of int32 label IDs.
+"""
         logger.debug(f"type(label_ids)={type(label_ids)}")
+
         if isinstance(label_ids, pd.DataFrame):
-            # Handle pandas DataFrame
-            if 'label' in label_ids.columns:
-                # Extract from 'label' column
-                return label_ids['label'].values.astype(np.int32)
-            elif label_ids.index.name == 'label' or 'label' in str(label_ids.index.name):
-                # Extract from index if it's named 'label'
-                return label_ids.index.values.astype(np.int32)
-            elif hasattr(label_ids.index, 'name') and label_ids.index.name is None:
-                # Try to use index values if index appears to be label IDs
-                return label_ids.index.values.astype(np.int32)
+            if "label" in label_ids.columns:
+                return label_ids["label"].astype(np.int32).to_numpy()
+            elif label_ids.index.name == "label":
+                return label_ids.index.to_numpy(dtype=np.int32)
             else:
-                # Default: use index values
-                return label_ids.index.values.astype(np.int32)
+                raise ValueError(
+                    "LabelRemover received a DataFrame without a 'label' column "
+                    "or index named 'label', so labels cannot be extracted safely."
+                )
+
         elif isinstance(label_ids, list) and len(label_ids) > 0:
-            # Check if first element is a RegionProperties object
-            if hasattr(label_ids[0], 'label'):
-                # Extract label attribute from RegionProperties
+            if hasattr(label_ids[0], "label"):
                 return np.array([region.label for region in label_ids], dtype=np.int32)
             else:
-                # Assume it's a list of ints
                 return np.array(label_ids, dtype=np.int32)
+
         elif isinstance(label_ids, np.ndarray):
             return label_ids.astype(np.int32)
+
         else:
-            # Empty or None
             return np.array([], dtype=np.int32)
     
     def _process_slice(self, labels: np.ndarray, label_ids: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs) -> np.ndarray:
@@ -1133,7 +1153,7 @@ class Labeller(StackProcessor):
                 # Check if first element is a list (nested structure from iterator)
                 if isinstance(regions[0], list):
                     regions = [region for sublist in regions for region in sublist]
-            regions, removed_regions = self.config.region_filter.run(regions)
+            regions, removed_labels = self.config.region_filter.run(regions)
             labels = np.zeros_like(labels)
             for region in regions:
                 # Use original_labels to create mask, not the zeroed labels
@@ -1912,10 +1932,10 @@ class Segmenter(Workflow):
                     if isinstance(regions[0], list):
                         regions = [region for sublist in regions for region in sublist]
                 if self.config.region_filter is not None:
-                    regions, removed_regions = self.config.region_filter.run(regions)
+                    regions, removed_labels = self.config.region_filter.run(regions)
                     # remove the areas in labels corresponding to the removed regions
                     label_remover = LabelRemover(LabelRemoverConfig(iterator_config=ArrayIteratorConfig(slice_def=()), output_type="stack", squeeze=False))
-                    labels = label_remover.run(labels, removed_regions)
+                    labels = label_remover.run(labels, removed_labels)
                 return binary_mask, labels, regions
             else:
                 logger.info("No regions to compute, returning binary mask and labels")
@@ -1993,33 +2013,46 @@ class IterativeSegmenter(Workflow):
         """
         include_mask = None
         exclude_mask = None
-        regions = []
-        masks = []
-        labels = []
+
+        all_regions = []
+        all_masks = []
+        all_labels = []
+
         for s in self.steps:
-            mask, regions, labels = s.run(img, include_mask, exclude_mask)
+            mask, step_labels, step_regions = s.run(img, include_mask, exclude_mask)
+
             dilated_mask = self._dilate_regions(mask)
+
             if exclude_mask is not None:
                 exclude_mask = dilated_mask | exclude_mask
             else:
                 exclude_mask = dilated_mask
-            regions.append(regions)
-            masks.append(dilated_mask)
-            labels.append(labels)
+
+            all_regions.append(step_regions)
+            all_masks.append(dilated_mask)
+            all_labels.append(step_labels)
+
         if self.output == "last":
-            masks = masks[-1]
-            regions = regions[-1]
-            labels = labels[-1]
+            masks = all_masks[-1]
+            regions = all_regions[-1]
+            labels = all_labels[-1]
             return masks, labels, regions
-        labels, _ = Relabeler.assign_unique_labels(labels)
+
+        labels, _ = Relabeler.assign_unique_labels(all_labels)
+
         if self.output == "stack":
-            masks = np.stack(masks, axis=0)
-            regions = np.stack(regions, axis=0)
+            masks = np.stack(all_masks, axis=0)
+            regions = np.stack(all_regions, axis=0)
             labels = np.stack(labels, axis=0)
         elif self.output == "combine":
-            masks = np.sum(masks, axis=0)
-            regions = np.sum(regions, axis=0)
+            masks = np.sum(all_masks, axis=0)
+            regions = np.sum(all_regions, axis=0)
             labels = np.sum(labels, axis=0)
+        else:
+            masks = all_masks
+            regions = all_regions
+            labels = labels
+
         return masks, labels, regions
 
 
@@ -2084,9 +2117,40 @@ class SeriesSegmenter(Workflow):
         Returns:
             Results from the segmenters, format depends on output configuration.
         """
+        all_masks = []
+        all_labels = []
+        all_regions = []
+
         for segmenter in self.config.segmenters:
-            mask, regions, labels = segmenter.run(img)
-            return mask, regions, labels
+            mask, labels, regions = segmenter.run(img, metadata=metadata, **kwargs)
+            all_masks.append(mask)
+            all_labels.append(labels)
+            all_regions.append(regions)
+
+        if self.config.output == "last":
+            return all_masks[-1], all_labels[-1], all_regions[-1]
+
+        all_labels, _ = Relabeler.assign_unique_labels(all_labels)
+
+        if self.config.output == "stack":
+            masks = np.stack(all_masks, axis=0)
+            labels = np.stack(all_labels, axis=0)
+            regions = all_regions
+        elif self.config.output == "combine":
+            masks = np.sum(all_masks, axis=0)
+            labels = np.sum(all_labels, axis=0)
+            regions = all_regions
+        elif self.config.output == "list":
+            masks = all_masks
+            labels = all_labels
+            regions = all_regions
+        else:
+            raise ValueError(
+                f"Invalid output mode: {self.config.output}. "
+                f"Expected one of: stack, combine, last, list"
+            )
+
+        return masks, labels, regions
 
 class MicroSAMSegmenterConfig(SegmenterConfig):
     """Configuration for MicroSAM segmenter.
@@ -2165,11 +2229,11 @@ class MicroSAMSegmenter(Segmenter):
                 if isinstance(regions[0], list):
                     regions = [region for sublist in regions for region in sublist]
             if self.config.region_filter is not None:
-                regions, removed_regions = self.config.region_filter.run(regions)
+                regions, removed_labels = self.config.region_filter.run(regions)
                 # remove the areas in labels corresponding to the removed regions
-                logger.debug(f"Starting label removal with {len(removed_regions)} removed regions")
+                logger.debug(f"Starting label removal with {len(removed_labels)} removed regions")
                 label_remover = LabelRemover(LabelRemoverConfig(iterator_config=ArrayIteratorConfig(slice_def=()), remap=True, output_type="stack", squeeze=False))
-                labels, newlabels_map = label_remover.run(labels, removed_regions)
+                labels, newlabels_map = label_remover.run(labels, removed_labels)
                 regions = remap_regions(regions, newlabels_map, key="label")
             return binary_mask, labels, regions
         else:
