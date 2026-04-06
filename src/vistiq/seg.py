@@ -116,6 +116,14 @@ def dilate_regions(
 
     return dilated_mask
 
+    # helper for debugging labels
+
+def debug_mask_labels(name, labels):
+    import numpy as np
+    unique_labels = sorted(set(np.unique(labels)) - {0})
+    print(f"{name} mask labels (first 20):", unique_labels[:20])
+    print(f"{name} mask label count:", len(unique_labels))
+
 
 class ThresholderConfig(StackProcessorConfig):
     """Base configuration for thresholding operations.
@@ -1514,12 +1522,14 @@ class RegionAnalyzer(StackProcessor):
         Raises:
             ValueError: If output_type is invalid.
         """
+
         if metadata is None or metadata.get("scale", None) is None:
             spacing = None
         else:
             spacing = metadata.get("scale", None)
         if spacing is not None:
             spacing = spacing[-labels.ndim:]
+        debug_mask_labels("RegionAnalyzer._process_slice", labels)
         print (f"spacing={spacing}")
         
         # Get extra_properties functions with spacing wrapped in
@@ -1531,7 +1541,16 @@ class RegionAnalyzer(StackProcessor):
             results = pd.DataFrame(regionprops_table(labels, properties=self.used_builtin_properties(), extra_properties=extra_props_funcs, spacing=spacing)).set_index("label")
         else:
             raise ValueError(f"Invalid output type: {self.config.output_type}. Allowed output types are: list, dataframe")
-        logger.info(f"Identified {len(results)} regions, return as {self.config.output_type}, results: {results.head()}")
+        
+        if isinstance(results, list):
+            print("DEBUG RegionAnalyzer labels:", [r.label for r in results[:10]])
+        elif hasattr(results, "columns") and "label" in results.columns:
+            print("DEBUG RegionAnalyzer labels:", results["label"].tolist()[:10])
+        else:
+            print("DEBUG RegionAnalyzer result type:", type(results))
+
+        preview = results.head() if hasattr(results, "head") else results[:5]
+        logger.info(f"Identified {len(results)} regions, return as {self.config.output_type}, results: {preview}")
         return results
 
     def _reshape_slice_results(self, results: list[Any], slice_indices: list[tuple[int,...]], input_shape: tuple[int,...]) -> List["RegionProperties"] | pd.DataFrame:
@@ -1561,6 +1580,7 @@ class RegionAnalyzer(StackProcessor):
         """
         print("DEBUG: entered RegionAnalyzer.run")
         print("DEBUG: labels shape =", getattr(labels, "shape", None))
+        debug_mask_labels("RegionAnalyzer.run", labels)
         results = super().run(labels, workers=workers, verbose=verbose, metadata=metadata, **kwargs)
         return results
 
