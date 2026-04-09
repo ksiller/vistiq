@@ -1166,11 +1166,95 @@ def run_segment(config: CLISegmenterConfig) -> None:
             for i, component in enumerate(built_components):
                 logger.info(f"Running component {i+1}/{len(built_components)}: {component.name()} with workers={workers}")
                 result, result_metadata = component.run(result, workers=workers, metadata=result_metadata)
+
+
+
+
+            if isinstance(result, tuple):
+                label_slices = result[0]
+                feature_slices = result[1]
+            else:
+                raise ValueError(f"Unexpected result type: {type(result)}")
+
+
+            print("DEBUG final result type:", type(result))
+            print("DEBUG label_slices type:", type(label_slices), "len:", len(label_slices))
+            print("DEBUG feature_slices type:", type(feature_slices), "len:", len(feature_slices))
             
+
+            for i in range(min(len(label_slices), len(feature_slices))):
+                labels_i = label_slices[i]
+                feats_i = feature_slices[i]
+
+                mask_ids = sorted(set(np.unique(labels_i)) - {0})
+
+                # feature output as a tuple
+                if isinstance(feats_i, tuple):
+                    feats_obj = feats_i[0]
+                else:
+                    feats_obj = feats_i
+
+                if feats_obj is None:
+                    feature_ids = None
+                elif isinstance(feats_obj, list):
+                    feature_ids = sorted([r.label for r in feats_obj])
+                elif hasattr(feats_obj, "columns") and "label" in feats_obj.columns:
+                    feature_ids = sorted(feats_obj["label"].tolist())
+                elif hasattr(feats_obj, "index") and getattr(feats_obj.index, "name", None) == "label":
+                    feature_ids = sorted(feats_obj.index.tolist())
+                else: 
+                    feature_ids = f"unhandled feature type: {type(feats_obj)}"
+
+                if feature_ids != mask_ids: 
+                    print(f"\nMISMATCH AT SLICE {i}")
+                    print("mask ids (first 25):", mask_ids[:25])
+                    print("feature ids (first 25):", feature_ids[:25] if isinstance(feature_ids, list) else feature_ids)
+                    print("mask count:", len(mask_ids))
+                    print("feature:", len(feature_ids) if isinstance(feature_ids, list) else feature_ids)
+                    raise SystemExit("Stopped at first mismatch")
+                
+            print("\nNo mismatch found between mask labels and feature labels before writing.")
+            raise SystemExit("Stopping before writer on purpose")
+
             if result_metadata is None:
                 result_metadata = {}
-            result_metadata.update({"dim_order":_infer_dim_order(result.ndim)})
-            logger.info(f"Result shape: {result.shape}, metadata: {result_metadata}")
+
+
+            # Unpack structured outputs from the final component
+            if isinstance(result, tuple):
+                primary_result = result[0]
+            else:
+                primary_result = result
+
+            
+            # If primary_result is a list of 2D arrays, stack into one volume
+            if isinstance(primary_result, list) and len(primary_result) > 0 and hasattr(primary_result[0], "shape"):
+                primary_result = np.stack(primary_result, axis=0)
+
+            '''
+            print("DEBUG result type:", type(result))
+            print("DEBUG result_metadata type:", type(result_metadata))
+            print("DEBUG result repr:", repr(result)[:1000])
+            print("DEBUG primary result type:", type(result[0]) if isinstance(result, tuple) else type(result))
+            if isinstance(result, tuple):
+                print("DEBUG tuple len:", len(result))
+                if len(result) > 0 and isinstance(result[0], list) and len(result[0]) > 0:
+                    print("DEBUG first item in result[0] type:", type(result[0][0]))
+            if isinstance(result, tuple):
+                print("DEBUG tuple len:", len(result))
+                for i, item in enumerate(result):
+                    print(f"DEBUG result[{i}] type:", type(item))
+                    if isinstance(item, list):
+                        print(f"DEBUG result[{i}] len:", len(item))
+                        if len(item) > 0:
+                            print(f"DEBUG result[{i}][0] type:", type(item[0]))
+                            print(f"DEBUG result[{i}][0] shape:", getattr(item[0], "shape", None))
+                    else:
+                        print(f"DEBUG result[{i}] shape:", getattr(item, "shape", None))
+            '''
+
+            result_metadata.update({"dim_order":_infer_dim_order(primary_result.ndim)})
+            logger.info(f"Result shape: {primary_result.shape}, metadata: {result_metadata}")
             logger.info(f"Channel axis: {result_metadata.get('channel_axis', None)}")
             logger.info(f"result metadata: {result_metadata}")
             imgwriter = ImageWriter(config.output)
