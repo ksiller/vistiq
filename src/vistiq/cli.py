@@ -1214,7 +1214,7 @@ def run_segment(config: CLISegmenterConfig) -> None:
                     raise SystemExit("Stopped at first mismatch")
                 
             print("\nNo mismatch found between mask labels and feature labels before writing.")
-            raise SystemExit("Stopping before writer on purpose")
+
 
             if result_metadata is None:
                 result_metadata = {}
