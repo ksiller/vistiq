@@ -1779,7 +1779,16 @@ def run_coincidence(config: CLICoincidenceConfig) -> None:
         for key, dfs in feature_dfs.items():
             output_path = output_dir / f"Features_{key}.csv"
             logger.info(f"Saving to: {output_path}")
-            dfs[0].join(dfs[1:]).to_csv(output_path, index=True)
+
+            ch_idx = channel_names.index(key)
+            label_set = set(int(x) for x in np.unique(labels_ch[ch_idx]) if int(x) != 0)
+
+
+            combined_df = dfs[0].join(dfs[1:])
+            combined_df = combined_df.loc[combined_df.index.isin(label_set)]
+
+            combined_df.to_csv(output_path, index=True)
+
 
 
 def run_workflow(config: CLIAppConfig, args: argparse.Namespace) -> None:

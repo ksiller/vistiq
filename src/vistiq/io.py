@@ -705,6 +705,9 @@ class ImageWriter(DataWriter):
         if os.path.exists(path) and not self.config.overwrite:
             raise FileExistsError(f"File already exists: {path}")
         
+        if metadata is None: 
+            metadata = {}
+            
         logger.info(f"Preparing to save image with metadata: {metadata}")
         from collections import namedtuple
         PhysicalPixelSizes = namedtuple("PhysicalPixelSizes", ["Z", "Y", "X"])
@@ -712,23 +715,29 @@ class ImageWriter(DataWriter):
             data, metadata = unstack_image(data, metadata, "C", key="axes")
             for img, m in zip(data, metadata):
                 channel_names = m.get("channel_names", [])
+                pps = m.get("physical_pixel_sizes", None)
+                physical_pixel_sizes = PhysicalPixelSizes(*map(abs, pps)) if pps is not None else None
+
                 OmeTiffWriter.save(
                     data=img,
                     uri=path.with_suffix(f".{'-'.join(channel_names)}.{self.config.extension}"),
                     dim_order=m.get("dim_order", ""),
                     channel_names=m.get("channel_names", None),
                     image_name=m.get("image_names", None),
-                    physical_pixel_sizes=PhysicalPixelSizes(*map(abs, m.get("physical_pixel_sizes", None))), 
+                    physical_pixel_sizes=physical_pixel_sizes,
                 )
         else:   
             channel_names = metadata.get("channel_names", [])
+            pps = metadata.get("physical_pixel_sizes", None)
+            physical_pixel_sizes = PhysicalPixelSizes(*map(abs, pps)) if pps is not None else None
+
             OmeTiffWriter.save(
                 data=data,
                 uri=path.with_suffix(f".{'-'.join(channel_names)}.{self.config.extension}"),
                 dim_order=metadata.get("dim_order", ""),
                 channel_names=metadata.get("channel_names", []),
                 image_name=metadata.get("image_names", ""),
-                physical_pixel_sizes=PhysicalPixelSizes(*map(abs, metadata.get("physical_pixel_sizes", None))), 
+                physical_pixel_sizes=physical_pixel_sizes,
             )
         logger.info(f"Saved image to {path}")
 
