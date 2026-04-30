@@ -17,7 +17,6 @@ if len(_root_logger.handlers) == 0:
     )
 
 # Export configure_logger for users who want to customize logging
-from .app import configure_logger
+# from .app import configure_logger
 
-__all__ = ["__version__", "configure_logger"]
-
+# __all__ = ["__version__", "configure_logger"]
