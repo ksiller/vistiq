@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=analyze
-#SBATCH --output=analyze-%A-%a.log
-#SBATCH --error=analyze-%A-%a.err
-#SBATCH --time=1:00:00
+#SBATCH --job-name=enrich
+#SBATCH --output=enrich-%A-%a.log
+#SBATCH --error=enrich-%A-%a.err
+#SBATCH --time=0:30:00
 #SBATCH --partition=standard
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
 
 set -euo pipefail
 
@@ -18,7 +18,7 @@ if [[ $# -lt 1 ]]; then
     echo "              If file list has second column with output dir, it will be used with priority:"
     echo "              - If second column is absolute path, it overrides CLI output_dir"
     echo "              - If second column is relative path, it is joined with CLI output_dir (or PWD)"
-    echo "  Cross-channel coincidence only (run after segment)."
+    echo "  Runs after segment; enriches Features_*.csv under each brain output tree."
     exit 1
 fi
 
@@ -75,19 +75,13 @@ else
 fi
 
 echo "Task ID: $TASK_ID"
-echo "Coincidence under: $output_dir"
+echo "Enrich under: $output_dir"
 
 module purge
 module load miniforge
 source activate /standard/vol191/siegristlab/software/vistiq-env # replace with your own environment path
 
-# Run vistiq coincidence on the selected file
-export QT_QPA_PLATFORM=offscreen # for napari headless
-vistiq coincidence \
+# Run vistiq enrich on Features_*.csv under the output directory
+vistiq enrich \
     -i "$output_dir" \
-    -o "$output_dir" \
-    --threshold 0.1 \
-    --method dice \
-    --mode outline \
-    --loglevel DEBUG \
-    --processes "${SLURM_CPUS_PER_TASK:-8}"
+    --loglevel DEBUG

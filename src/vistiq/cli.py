@@ -47,6 +47,20 @@ from .workflow_builder import (
     auto_register_configurables,
 )
 from .utils import load_image, get_scenes
+from .cli_batch import (
+    channel_name_from_stem,
+    collect_label_volumes,
+    iter_channels,
+    run_coincidence_on_directory,
+    run_component_chain,
+    save_channel_outputs,
+)
+from .analysis.enrichment import (
+    RegionDataFrameEnricher,
+    RegionDataFrameEnrichmentConfig,
+)
+from .io import DataFrameWriter, DataFrameWriterConfig
+import pandas as pd
 
 # from .app import configure_logger
 
@@ -64,7 +78,7 @@ def _register_all_configurables() -> None:
         [
             "vistiq.io",  # FileList, DataLoader, ImageLoader, DataWriter, ImageWriter
             "vistiq.preprocess",  # Preprocessor classes
-            "vistiq.seg",  # Segmenter classes
+            "vistiq.segment",  # Segmenter classes
             "vistiq.analysis",  # Analysis classes
             "vistiq.train",  # Trainer classes
             "vistiq.core",  # Core classes
@@ -300,13 +314,46 @@ class CLISegmenterConfig(CLISubcommandConfig):
         if v is None:
             return None
         # Validate that each item is one of the allowed config types
-        allowed_types = (ThresholderConfig, SegmenterConfig, LabellerConfig)
+        allowed_types = (
+            PreprocessorConfig,
+            ThresholderConfig,
+            SegmenterConfig,
+            LabellerConfig,
+        )
         for item in v:
             if not isinstance(item, allowed_types):
                 raise ValueError(
-                    f"Each item in 'step' must be a ThresholderConfig, SegmenterConfig, or LabellerConfig instance, got {type(item)}"
+                    "Each item in 'step' must be a PreprocessorConfig, ThresholderConfig, "
+                    f"SegmenterConfig, or LabellerConfig instance, got {type(item)}"
                 )
         return v
+
+
+class CLIPipelineConfig(CLISegmenterConfig):
+    """Full brain pipeline: chained steps, then enrich and coincidence."""
+
+    do_enrich: bool = True
+    do_coincidence: bool = True
+    threshold: float = Field(default=0.1, ge=0.0, le=1.0)
+    method: Literal["iou", "dice"] = "dice"
+    mode: Literal["bounding_box", "outline"] = "outline"
+
+
+class CLICoincidenceConfig(CLISubcommandConfig):
+    """Configuration for the coincidence subcommand."""
+
+    threshold: float = Field(default=0.1, ge=0.0, le=1.0)
+    method: Literal["iou", "dice"] = "dice"
+    mode: Literal["bounding_box", "outline"] = "outline"
+
+
+class CLIEnrichConfig(CLISubcommandConfig):
+    """Configuration for the enrich subcommand."""
+
+    output: Optional[DataFrameWriterConfig] = Field(
+        default_factory=lambda: DataFrameWriterConfig(overwrite=True, save_index=False),
+        description="Configuration for writing enriched feature CSVs",
+    )
 
 
 class CLITrainerConfig(CLISubcommandConfig):
@@ -1056,6 +1103,145 @@ def segment_cmd(
     run_segment(config)
 
 
+@app.command("enrich")
+def enrich_cmd(
+    ctx: Context,
+    input: Optional[FileListConfig] = Option(
+        None,
+        "--input",
+        "-i",
+        help="Directory or Features_*.csv file(s) to enrich",
+        parser=cli_to_filelist_config,
+    ),
+) -> None:
+    """Add neighbor and grid-density columns to existing Features_*.csv files."""
+    config_kwargs = cli_command_config(ctx, input=input)
+    config = CLIEnrichConfig(**config_kwargs)
+    run_enrich(config)
+
+
+@app.command("coincidence")
+def coincidence_cmd(
+    ctx: Context,
+    input: Optional[FileListConfig] = Option(
+        None,
+        "--input",
+        "-i",
+        help="Directory containing Labels_<channel>.tif from segment",
+        parser=cli_to_filelist_config,
+    ),
+    output: Optional[ImageWriterConfig] = Option(
+        None,
+        "--output",
+        "-o",
+        help="Output directory (defaults to same as input search root)",
+        parser=cli_to_imagewriter_config,
+    ),
+    threshold: float = Option(
+        0.1, "--threshold", help="Coincidence score threshold"
+    ),
+    method: Literal["iou", "dice"] = Option(
+        "dice", "--method", help="Overlap metric"
+    ),
+    mode: Literal["bounding_box", "outline"] = Option(
+        "outline", "--mode", help="Coincidence geometry mode"
+    ),
+) -> None:
+    """Cross-channel coincidence from aligned Labels_<channel>.tif volumes."""
+    config_kwargs = cli_command_config(ctx, input=input, output=output)
+    config = CLICoincidenceConfig(
+        **config_kwargs,
+        threshold=threshold,
+        method=method,
+        mode=mode,
+    )
+    run_coincidence(config)
+
+
+@app.command("pipeline")
+def pipeline_cmd(
+    ctx: Context,
+    input: Optional[FileListConfig] = Option(
+        None,
+        "--input",
+        "-i",
+        help="Input .lif or image file",
+        parser=cli_to_filelist_config,
+    ),
+    loader: Optional[ImageLoaderConfig] = Option(
+        None,
+        "--loader",
+        help="Image loader configuration",
+        parser=cli_to_imageloader_config,
+    ),
+    step: List[StackProcessorConfig] = Option(
+        None,
+        "--step",
+        "-s",
+        help="Ordered pipeline steps (e.g. DoG then MicroSAMSegmenter); repeat -s for each",
+        parser=cli_to_component_config,
+    ),
+    output: Optional[ImageWriterConfig] = Option(
+        None,
+        "--output",
+        "-o",
+        help="Output directory",
+        parser=cli_to_imagewriter_config,
+    ),
+    checkpoint: Optional[Path] = Option(
+        None,
+        "--checkpoint",
+        "-c",
+        help="MicroSAM checkpoint (.pth)",
+    ),
+    enrich: bool = Option(
+        True,
+        "--enrich/--no-enrich",
+        help="Run feature enrichment after segmentation",
+    ),
+    coincidence: bool = Option(
+        True,
+        "--coincidence/--no-coincidence",
+        help="Run cross-channel coincidence after segmentation",
+    ),
+    threshold: float = Option(
+        0.1, "--threshold", help="Coincidence score threshold"
+    ),
+    method: Literal["iou", "dice"] = Option(
+        "dice", "--method", help="Coincidence overlap metric"
+    ),
+    mode: Literal["bounding_box", "outline"] = Option(
+        "outline", "--mode", help="Coincidence geometry mode"
+    ),
+) -> None:
+    """Run a chained pipeline: -s steps, then enrich and coincidence.
+
+    Example (equivalent to the legacy monolithic analyze job)::
+
+        vistiq pipeline -i brain.lif -o out/ \\
+          -s DoG --step0-sigma-low 1.0 --step0-sigma-high 12.0 \\
+          -s MicroSAMSegmenter --step1-volume-max 5000 --step1-aspect-ratio-min 0.1 \\
+          --threshold 0.1 --method dice --mode outline
+    """
+    config_kwargs = cli_command_config(
+        ctx,
+        input=input,
+        loader=loader,
+        step=step,
+        output=output,
+        checkpoint=checkpoint,
+    )
+    config = CLIPipelineConfig(
+        **config_kwargs,
+        do_enrich=enrich,
+        do_coincidence=coincidence,
+        threshold=threshold,
+        method=method,
+        mode=mode,
+    )
+    run_pipeline(config)
+
+
 @app.command("train")
 def train_cmd(
     ctx: Context,
@@ -1293,10 +1479,14 @@ def run_preprocess(config: CLIPreprocessorConfig) -> None:
             logger.info(f"Channel axis: {result_metadata.get('channel_axis', None)}")
             logger.info(f"result metadata: {result_metadata}")
             imgwriter = ImageWriter(config.output)
-            # preprocessed = np.stack(result, axis=0)
-            output_path = output_dir / f"Preprocessed.tif"
-            # OmeTiffWriter.save(preprocessed, str(output_path), physical_pixel_sizes=metadata["used_scale"], channel_names=channel_names, dim_order=_infer_dim_order(preprocessed.ndim))
-            imgwriter.run(result, output_path, metadata=result_metadata)
+            for ch_name, ch_img in iter_channels(result, result_metadata):
+                ch_meta = {
+                    **result_metadata,
+                    "channel_names": [ch_name],
+                    "dim_order": _infer_dim_order(ch_img.ndim),
+                }
+                out_path = output_dir / f"Preprocessed_{ch_name}.tif"
+                imgwriter.run(ch_img, out_path, metadata=ch_meta)
         update_progress_artifact(
             artifact_id=progress_id,
             progress=float(f_idx + 1) / len(file_list),
@@ -1308,22 +1498,10 @@ def run_preprocess(config: CLIPreprocessorConfig) -> None:
 def run_segment(config: CLISegmenterConfig) -> None:
     """Run the segment command.
 
-    Processes images through a chain of segmentation steps (thresholding, segmentation, labelling),
-    handling multiple scenes and channels. Saves segmented images as OME-TIFF files with metadata.
-
-    Args:
-        config: Segment configuration containing input/output configuration,
-                step configurations, and processing parameters. The config includes
-                loglevel, device, and processes from CLIAppConfig (inherited from
-                CLIAppConfig via CLISubcommandConfig).
-
-    The function:
-    1. Builds processing step chain from configuration
-    2. Loads images from input path (supports multiple scenes)
-    3. Processes each channel through the step chain
-    4. Saves segmented images to output directory with metadata
+    Processes images per channel, saves aligned ``Labels_<channel>.tif`` and
+    ``Features_<channel>.csv`` under each scene output directory.
     """
-    logger.info(f"Running preprocess command with config: {config}")
+    logger.info(f"Running segment command with config: {config}")
 
     # Build FileList from config and get files
     file_list_result = FileList(config.input).run()
@@ -1341,17 +1519,17 @@ def run_segment(config: CLISegmenterConfig) -> None:
     if not file_list:
         raise ValueError(f"No files found for input path: {config.input.paths}")
 
-    first_file = file_list[0]
-    logger.info(f"Found {len(file_list)} files, using the first one: {first_file}")
-
     # Build component chain from config
     component_names, built_components = build_component_chain(config.step)
+    if not built_components:
+        raise ValueError(
+            "segment requires at least one --step (e.g. -s MicroSAMSegmenter)"
+        )
 
     # propagates checkpoint to all config fields if provided
     if config.checkpoint is not None:
         ckpt = str(config.checkpoint.expanduser().resolve())
         logger.info(f"Using checkpoint: {ckpt}")
-
         for comp in built_components:
             # If the component has a pydantic config with a checkpoint field, set it
             if hasattr(comp, "config") and hasattr(comp.config, "checkpoint"):
@@ -1361,16 +1539,6 @@ def run_segment(config: CLISegmenterConfig) -> None:
                         f"Injected checkpoint into component {comp.name()}: {ckpt}"
                     )
 
-    # Get absolute path of input and strip extension for output directory
-    # first_file should already be a Path object from the validator
-    if isinstance(first_file, Path):
-        input_path_obj = first_file.resolve()
-        input_path_str = str(first_file)
-    else:
-        # Fallback: convert to Path if somehow it's not
-        input_path_obj = Path(first_file).resolve()
-        input_path_str = str(first_file)
-
     # Determine output directory (defaults to current directory if not specified)
     if config.output and config.output.path:
         # config.output.path is already a Path object from the validator, but ~/ hasn't been expanded yet
@@ -1378,184 +1546,195 @@ def run_segment(config: CLISegmenterConfig) -> None:
     else:
         output_base = Path.cwd().resolve()
 
-    scenes = get_scenes(input_path_str)
+    # Use config.processes if available, otherwise default to 1 (single process)
+    # Ensure workers is a positive integer, not -1 (which means "use all cores")
+    workers = (
+        config.processes
+        if config.processes is not None and config.processes > 0
+        else 1
+    )
+    imgwriter = ImageWriter(config.output)
+    dfwriter = DataFrameWriter(
+        DataFrameWriterConfig(overwrite=True, save_index=False)
+    )
+    component_names_str = "-".join(component_names) if component_names else "none"
+
     progress_id = create_progress_artifact(
         progress=0.0,
-        description="Indicates the progress of processing image scenes.",
+        description="Indicates the progress of segment jobs.",
     )
-    for f_idx, first_file in enumerate(file_list):
-        for idx, sc in enumerate(scenes):
-            logger.info(f"Processing scene: {sc}")
-            # Load image with substack slicing if specified
 
-            loader_config = config.loader.copy(update={"scene_index": idx})
-            img, metadata = ImageLoader(loader_config).run(path=first_file)
+    for f_idx, input_file in enumerate(file_list):
+        input_path_obj = Path(input_file).resolve()
+        preprocessed_ch = channel_name_from_stem(
+            input_path_obj.stem, "Preprocessed"
+        )
 
-            # img, metadata = load_image(input_path_str, scene_index=idx, substack=substack_slices, squeeze=True, rename_channel=config.loader.rename_channel if config.loader else None)
-            channel_names = metadata["channel_names"]
-
-            ishape = str(img.shape).replace(" ", "")
-            component_names_str = (
-                "-".join(component_names) if component_names else "none"
+        if preprocessed_ch is not None:
+            img, metadata = ImageLoader(config.loader).run(path=input_path_obj)
+            ch_meta = {**metadata, "channel_names": [preprocessed_ch]}
+            output_dir = input_path_obj.parent
+            labels, preprocessed, regions, meta = run_component_chain(
+                img, ch_meta, built_components, workers
             )
+            save_channel_outputs(
+                output_dir,
+                preprocessed_ch,
+                labels,
+                regions,
+                imgwriter,
+                dfwriter,
+                meta,
+                preprocessed=preprocessed,
+                context="segment",
+            )
+            continue
+
+        scenes = get_scenes(str(input_path_obj))
+        if not scenes:
+            scenes = [0]
+
+        for idx, sc in enumerate(scenes):
+            loader_config = config.loader.copy(update={"scene_index": idx})
+            img, metadata = ImageLoader(loader_config).run(path=input_path_obj)
+            ishape = str(img.shape).replace(" ", "")
             output_dir = (
                 output_base
                 / input_path_obj.stem
                 / f"{sc}-{ishape}-{component_names_str}"
             )
             os.makedirs(output_dir, exist_ok=True)
-            logger.info(f"Output directory: {output_dir}")
+            logger.info("Output directory: %s", output_dir)
 
-            logger.info(
-                f"Image shape: {img.shape}, channel names: {channel_names}, metadata: {metadata}"
-            )
-
-            result = img
-            result_metadata = metadata
-            # Use config.processes if available, otherwise default to 1 (single process)
-            # Ensure workers is a positive integer, not -1 (which means "use all cores")
-            workers = (
-                config.processes
-                if config.processes is not None and config.processes > 0
-                else 1
-            )
-            logger.info(
-                f"Using workers={workers} (from config.processes={config.processes}) for component processing"
-            )
-            for i, component in enumerate(built_components):
-                logger.info(
-                    f"Running component {i+1}/{len(built_components)}: {component.name()} with workers={workers}"
+            for ch_name, ch_img in iter_channels(img, metadata):
+                ch_meta = {**metadata, "channel_names": [ch_name]}
+                labels, preprocessed, regions, meta = run_component_chain(
+                    ch_img, ch_meta, built_components, workers
                 )
-                result, result_metadata = component.run(
-                    result, workers=workers, metadata=result_metadata
+                save_channel_outputs(
+                    output_dir,
+                    ch_name,
+                    labels,
+                    regions,
+                    imgwriter,
+                    dfwriter,
+                    meta,
+                    preprocessed=preprocessed,
+                    context="segment",
                 )
 
-            if isinstance(result, tuple):
-                label_slices = result[0]
-                feature_slices = result[1]
-            else:
-                raise ValueError(f"Unexpected result type: {type(result)}")
-
-            print("DEBUG final result type:", type(result))
-            print(
-                "DEBUG label_slices type:",
-                type(label_slices),
-                "len:",
-                len(label_slices),
-            )
-            print(
-                "DEBUG feature_slices type:",
-                type(feature_slices),
-                "len:",
-                len(feature_slices),
-            )
-
-            for i in range(min(len(label_slices), len(feature_slices))):
-                labels_i = label_slices[i]
-                feats_i = feature_slices[i]
-
-                mask_ids = sorted(set(np.unique(labels_i)) - {0})
-
-                # feature output as a tuple
-                if isinstance(feats_i, tuple):
-                    feats_obj = feats_i[0]
-                else:
-                    feats_obj = feats_i
-
-                if feats_obj is None:
-                    feature_ids = None
-                elif isinstance(feats_obj, list):
-                    feature_ids = sorted([r.label for r in feats_obj])
-                elif hasattr(feats_obj, "columns") and "label" in feats_obj.columns:
-                    feature_ids = sorted(feats_obj["label"].tolist())
-                elif (
-                    hasattr(feats_obj, "index")
-                    and getattr(feats_obj.index, "name", None) == "label"
-                ):
-                    feature_ids = sorted(feats_obj.index.tolist())
-                else:
-                    feature_ids = f"unhandled feature type: {type(feats_obj)}"
-
-                if feature_ids != mask_ids:
-                    print(f"\nMISMATCH AT SLICE {i}")
-                    print("mask ids (first 25):", mask_ids[:25])
-                    print(
-                        "feature ids (first 25):",
-                        (
-                            feature_ids[:25]
-                            if isinstance(feature_ids, list)
-                            else feature_ids
-                        ),
-                    )
-                    print("mask count:", len(mask_ids))
-                    print(
-                        "feature:",
-                        (
-                            len(feature_ids)
-                            if isinstance(feature_ids, list)
-                            else feature_ids
-                        ),
-                    )
-                    raise SystemExit("Stopped at first mismatch")
-
-            print(
-                "\nNo mismatch found between mask labels and feature labels before writing."
-            )
-
-            if result_metadata is None:
-                result_metadata = {}
-
-            # Unpack structured outputs from the final component
-            if isinstance(result, tuple):
-                primary_result = result[0]
-            else:
-                primary_result = result
-
-            # If primary_result is a list of 2D arrays, stack into one volume
-            if (
-                isinstance(primary_result, list)
-                and len(primary_result) > 0
-                and hasattr(primary_result[0], "shape")
-            ):
-                primary_result = np.stack(primary_result, axis=0)
-
-            """
-            print("DEBUG result type:", type(result))
-            print("DEBUG result_metadata type:", type(result_metadata))
-            print("DEBUG result repr:", repr(result)[:1000])
-            print("DEBUG primary result type:", type(result[0]) if isinstance(result, tuple) else type(result))
-            if isinstance(result, tuple):
-                print("DEBUG tuple len:", len(result))
-                if len(result) > 0 and isinstance(result[0], list) and len(result[0]) > 0:
-                    print("DEBUG first item in result[0] type:", type(result[0][0]))
-            if isinstance(result, tuple):
-                print("DEBUG tuple len:", len(result))
-                for i, item in enumerate(result):
-                    print(f"DEBUG result[{i}] type:", type(item))
-                    if isinstance(item, list):
-                        print(f"DEBUG result[{i}] len:", len(item))
-                        if len(item) > 0:
-                            print(f"DEBUG result[{i}][0] type:", type(item[0]))
-                            print(f"DEBUG result[{i}][0] shape:", getattr(item[0], "shape", None))
-                    else:
-                        print(f"DEBUG result[{i}] shape:", getattr(item, "shape", None))
-            """
-
-            result_metadata.update({"dim_order": _infer_dim_order(primary_result.ndim)})
-            logger.info(
-                f"Result shape: {primary_result.shape}, metadata: {result_metadata}"
-            )
-            logger.info(f"Channel axis: {result_metadata.get('channel_axis', None)}")
-            logger.info(f"result metadata: {result_metadata}")
-            imgwriter = ImageWriter(config.output)
-            # preprocessed = np.stack(result, axis=0)
-            output_path = output_dir / f"Preprocessed.tif"
-            # OmeTiffWriter.save(preprocessed, str(output_path), physical_pixel_sizes=metadata["used_scale"], channel_names=channel_names, dim_order=_infer_dim_order(preprocessed.ndim))
-            imgwriter.run(result, output_path, metadata=result_metadata)
         update_progress_artifact(
             artifact_id=progress_id,
             progress=float(f_idx + 1) / len(file_list),
-            description=f"Processed file {first_file.name}: number {f_idx + 1} of {len(file_list)}",
+            description=f"Processed file {input_path_obj.name}: {f_idx + 1} of {len(file_list)}",
+        )
+
+
+@flow(name="vistiq.enrich")
+def run_enrich(config: CLIEnrichConfig) -> None:
+    """Enrich existing Features_<channel>.csv files in place."""
+    file_list_result = FileList(config.input).run()
+    file_list = (
+        list(file_list_result)
+        if isinstance(file_list_result, list)
+        else [file_list_result]
+    )
+    if not file_list:
+        raise ValueError(f"No files found for input path: {config.input.paths}")
+
+    enricher = RegionDataFrameEnricher(RegionDataFrameEnrichmentConfig())
+    dfwriter = DataFrameWriter(config.output)
+
+    targets: list[Path] = []
+    for item in file_list:
+        path = Path(item).resolve()
+        if path.is_file():
+            targets.append(path)
+        else:
+            targets.extend(sorted(path.rglob("Features_*.csv")))
+
+    if not targets:
+        raise ValueError("No Features_*.csv files found for enrich command")
+
+    for csv_path in targets:
+        logger.info("Enriching %s", csv_path)
+        df = pd.read_csv(csv_path)
+        enriched = enricher.run(df)
+        dfwriter.run(enriched, csv_path)
+
+
+@flow(name="vistiq.coincidence")
+def run_coincidence(config: CLICoincidenceConfig) -> None:
+    """Run cross-channel coincidence on existing Labels_<channel>.tif files."""
+    file_list_result = FileList(config.input).run()
+    file_list = (
+        list(file_list_result)
+        if isinstance(file_list_result, list)
+        else [file_list_result]
+    )
+    if not file_list:
+        raise ValueError(f"No files found for input path: {config.input.paths}")
+
+    work_dirs: set[Path] = set()
+    for item in file_list:
+        path = Path(item).resolve()
+        if path.is_file() and path.name.startswith("Labels_"):
+            work_dirs.add(path.parent)
+        elif path.is_dir():
+            work_dirs.update(collect_label_volumes(path).keys())
+        else:
+            parent_groups = collect_label_volumes(path.parent)
+            work_dirs.update(parent_groups.keys())
+
+    if not work_dirs:
+        raise ValueError(
+            "No Labels_<channel>.tif files found. Run segment before coincidence."
+        )
+
+    for work_dir in sorted(work_dirs):
+        logger.info("Coincidence in %s", work_dir)
+        run_coincidence_on_directory(
+            work_dir,
+            threshold=config.threshold,
+            method=config.method,
+            mode=config.mode,
+        )
+
+
+@flow(name="vistiq.pipeline")
+def run_pipeline(config: CLIPipelineConfig) -> None:
+    """Chained -s steps per channel, then optional enrich and coincidence on the output tree."""
+    run_segment(config)
+
+    if not (config.do_enrich or config.do_coincidence):
+        return
+
+    if config.output and config.output.path:
+        output_base = config.output.path.expanduser().resolve()
+    else:
+        output_base = Path.cwd().resolve()
+
+    downstream_input = FileListConfig(paths=str(output_base))
+    downstream_kwargs = {
+        "loglevel": config.loglevel,
+        "device": config.device,
+        "processes": config.processes,
+    }
+
+    if config.do_enrich:
+        run_enrich(
+            CLIEnrichConfig(input=downstream_input, **downstream_kwargs)
+        )
+    if config.do_coincidence:
+        run_coincidence(
+            CLICoincidenceConfig(
+                input=downstream_input,
+                output=config.output,
+                threshold=config.threshold,
+                method=config.method,
+                mode=config.mode,
+                **downstream_kwargs,
+            )
         )
 
 

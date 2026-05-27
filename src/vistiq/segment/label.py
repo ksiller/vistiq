@@ -30,6 +30,7 @@ from vistiq.segment.select import (
     RegionFilter,
     RegionFilterConfig,
 )
+from vistiq.segment.validation import validate_label_feature_alignment
 from vistiq.segment.threshold import (
     OtsuThreshold,
     OtsuThresholdConfig,
@@ -709,6 +710,9 @@ class Labeller(StackProcessor):
                 # Use original_labels to create mask, not the zeroed labels
                 region_mask = original_labels == region.label
                 labels[region_mask] = region.label
+            validate_label_feature_alignment(
+                labels, regions, context="Labeller._process_slice"
+            )
         return labels, regions
 
     @task(name="Labeller.run")
@@ -912,6 +916,9 @@ class Segmenter(Workflow):
                         )
                     )
                     labels = label_remover.run(labels, removed_labels)
+                validate_label_feature_alignment(
+                    labels, regions, context="Segmenter.run"
+                )
                 return binary_mask, labels, regions
             else:
                 logger.info("No regions to compute, returning binary mask and labels")
@@ -1133,6 +1140,8 @@ class MicroSAMSegmenterConfig(SegmenterConfig):
 
     Attributes:
         model: MicroSAM model to use.
+        volume_max: Upper bound for region volume filter (pixels/voxels).
+        aspect_ratio_min: Lower bound for aspect_ratio filter.
     """
 
     model_type: str = "vit_l_lm"
@@ -1143,6 +1152,8 @@ class MicroSAMSegmenterConfig(SegmenterConfig):
     checkpoint: Optional[str] = None
     embedding_path: Optional[str] = None
     device: Optional[str] = None
+    volume_max: Optional[float] = 5000.0
+    aspect_ratio_min: Optional[float] = 0.1
 
 
 class MicroSAMSegmenter(Segmenter):
@@ -1180,7 +1191,50 @@ class MicroSAMSegmenter(Segmenter):
         if self.config.segmenter is None:
             self.config.segmenter = segmenter
         self.config.do_labels = True
-        # self.config.do_regions = self.config.region_analyzer is not None
+        self.config.do_regions = True
+
+        if self.config.region_filter is None and (
+            self.config.volume_max is not None
+            or self.config.aspect_ratio_min is not None
+        ):
+            filters = []
+            if self.config.aspect_ratio_min is not None:
+                filters.append(
+                    RangeFilter(
+                        RangeFilterConfig(
+                            attribute="aspect_ratio",
+                            range=(self.config.aspect_ratio_min, 1.0),
+                        )
+                    )
+                )
+            if self.config.volume_max is not None:
+                filters.append(
+                    RangeFilter(
+                        RangeFilterConfig(
+                            attribute="volume",
+                            range=(0.0, self.config.volume_max),
+                        )
+                    )
+                )
+            self.config.region_filter = RegionFilter(
+                RegionFilterConfig(filters=filters)
+            )
+
+        if self.config.region_analyzer is None:
+            self.config.region_analyzer = RegionAnalyzer(
+                RegionAnalyzerConfig(
+                    iterator_config=ArrayIteratorConfig(slice_def=(-3, -2, -1)),
+                    output_type="dataframe",
+                    properties=[
+                        "label",
+                        "centroid",
+                        "bbox",
+                        "volume",
+                        "aspect_ratio",
+                        "sphericity",
+                    ],
+                )
+            )
 
     @flow(name="MicroSAMSegmenter.run")
     def run(
@@ -1229,6 +1283,9 @@ class MicroSAMSegmenter(Segmenter):
                 )
                 labels, newlabels_map = label_remover.run(labels, removed_labels)
                 regions = remap_regions(regions, newlabels_map, key="label")
+            validate_label_feature_alignment(
+                labels, regions, context="MicroSAMSegmenter.run"
+            )
             return binary_mask, labels, regions
         else:
             logger.info("No regions to compute, returning binary mask and labels")

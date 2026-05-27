@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=analyze
-#SBATCH --output=analyze-%A-%a.log
-#SBATCH --error=analyze-%A-%a.err
-#SBATCH --time=1:00:00
-#SBATCH --partition=standard
+#SBATCH --job-name=pipeline
+#SBATCH --output=pipeline-%A-%a.log
+#SBATCH --error=pipeline-%A-%a.err
+#SBATCH --time=6:00:00
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
+#SBATCH --mem=64G
 
 set -euo pipefail
+
+# One-shot chained pipeline (like legacy analyze.sbatch), still pure vistiq CLI:
+#   DoG -> MicroSAM -> enrich -> coincidence
+#
+# Usage:
+#   sbatch --array=1-3 scripts/pipeline.sbatch lif_pilot.txt /path/to/jobrun
 
 # Check if file list is provided
 if [[ $# -lt 1 ]]; then
@@ -18,7 +25,6 @@ if [[ $# -lt 1 ]]; then
     echo "              If file list has second column with output dir, it will be used with priority:"
     echo "              - If second column is absolute path, it overrides CLI output_dir"
     echo "              - If second column is relative path, it is joined with CLI output_dir (or PWD)"
-    echo "  Cross-channel coincidence only (run after segment)."
     exit 1
 fi
 
@@ -74,20 +80,36 @@ else
     output_dir="$cli_output_dir"
 fi
 
+# Check if the input file exists
+if [[ ! -f "$input_file" ]]; then
+    echo "Error: input file missing: $input_file"
+    exit 1
+fi
+
 echo "Task ID: $TASK_ID"
-echo "Coincidence under: $output_dir"
+echo "Input:   $input_file"
+echo "Output:  $output_dir"
 
 module purge
 module load miniforge
 source activate /standard/vol191/siegristlab/software/vistiq-env # replace with your own environment path
-
-# Run vistiq coincidence on the selected file
 export QT_QPA_PLATFORM=offscreen # for napari headless
-vistiq coincidence \
-    -i "$output_dir" \
+
+# Run vistiq pipeline on the selected file
+vistiq pipeline \
+    -i "$input_file" \
     -o "$output_dir" \
+    -s DoG \
+    --step0-sigma-low 1.0 \
+    --step0-sigma-high 12.0 \
+    -s MicroSAMSegmenter \
+    --step1-model-type vit_l_lm \
+    --step1-volume-max 5000 \
+    --step1-aspect-ratio-min 0.1 \
     --threshold 0.1 \
     --method dice \
     --mode outline \
+    --enrich \
+    --coincidence \
     --loglevel DEBUG \
     --processes "${SLURM_CPUS_PER_TASK:-8}"

@@ -21,6 +21,12 @@ from vistiq.segment.postprocess import (
     WatershedConfig,
 )
 from vistiq.segment.analysis import RegionAnalyzer, RegionAnalyzerConfig
+from vistiq.segment.validation import (
+    LabelFeatureAlignmentError,
+    label_ids_from_mask,
+    label_ids_from_regions,
+    validate_label_feature_alignment,
+)
 from vistiq.segment.select import (
     RangeFilter,
     RangeFilterConfig,
@@ -55,10 +61,13 @@ __all__ = [
     "WatershedConfig",
     "IterativeSegmenter",
     "IterativeSegmenterConfig",
+    "LabelFeatureAlignmentError",
     "LabelRemover",
     "LabelRemoverConfig",
     "Labeller",
     "LabellerConfig",
+    "label_ids_from_mask",
+    "label_ids_from_regions",
     "LocalThreshold",
     "LocalThresholdConfig",
     "MicroSAMSegmenter",
@@ -89,4 +98,5 @@ __all__ = [
     "remap_labels",
     "remap_regionproperties",
     "remap_regions",
+    "validate_label_feature_alignment",
 ]

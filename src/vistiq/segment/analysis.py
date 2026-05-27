@@ -10,6 +10,10 @@ from skimage.measure import label as sk_label, regionprops, regionprops_table
 
 from vistiq.core import StackProcessor, StackProcessorConfig
 from vistiq.segment._debug import debug_mask_labels
+from vistiq.segment.validation import (
+    LabelFeatureAlignmentError,
+    validate_label_feature_alignment,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -450,7 +454,18 @@ class RegionAnalyzer(StackProcessor):
             labels, workers=workers, verbose=verbose, metadata=metadata, **kwargs
         )
         logger.debug(f"RegionAnalyzer.run(): Results = {results}")
-        return results[0]
+        output = results[0]
+        try:
+            validate_label_feature_alignment(
+                labels, output, context="RegionAnalyzer.run"
+            )
+        except LabelFeatureAlignmentError:
+            raise
+        except Exception as exc:
+            raise LabelFeatureAlignmentError(
+                "RegionAnalyzer.run: alignment check failed unexpectedly"
+            ) from exc
+        return output
 
 
 class RegionAnalyzerConfig(StackProcessorConfig):
