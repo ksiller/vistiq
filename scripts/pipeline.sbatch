@@ -96,7 +96,8 @@ source activate /standard/vol191/siegristlab/software/vistiq-env-gpu # replace w
 export QT_QPA_PLATFORM=offscreen # for napari headless
 
 # Run vistiq pipeline on the selected file
-vistiq pipeline \
+# Global options (--loglevel, --processes, --device) must come before the subcommand name
+vistiq --loglevel DEBUG --processes "${SLURM_CPUS_PER_TASK:-8}" --device cuda pipeline \
     -i "$input_file" \
     -o "$output_dir" \
     -s '{"classname":"DoG","sigma_low":1.0,"sigma_high":12.0,"normalize":true}' \
@@ -105,6 +106,4 @@ vistiq pipeline \
     --method dice \
     --mode outline \
     --enrich \
-    --coincidence \
-    --loglevel DEBUG \
-    --processes "${SLURM_CPUS_PER_TASK:-8}"
+    --coincidence

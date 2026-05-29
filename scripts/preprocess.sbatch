@@ -88,9 +88,7 @@ module load miniforge
 source activate /standard/vol191/siegristlab/software/vistiq-env-gpu # replace with your own environment path
 
 # Run vistiq preprocess on the selected file
-vistiq preprocess \
+vistiq --loglevel DEBUG --processes "${SLURM_CPUS_PER_TASK:-8}" preprocess \
     -i "$input_file" \
     -o "$output_dir" \
-    -s '{"classname":"DoG","sigma_low":1.0,"sigma_high":12.0,"normalize":true}' \
-    --loglevel DEBUG \
-    --processes "${SLURM_CPUS_PER_TASK:-8}"
+    -s '{"classname":"DoG","sigma_low":1.0,"sigma_high":12.0,"normalize":true}'

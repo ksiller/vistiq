@@ -92,10 +92,8 @@ export QT_QPA_PLATFORM=offscreen # for napari headless
 # Chained steps on one command: DoG preprocess then MicroSAM (skip DoG if preprocess.sbatch already ran).
 # For full DoG + MicroSAM + enrich + coincidence in one job, use scripts/pipeline.sbatch instead.
 # Run vistiq segmentation on the selected file
-vistiq segment \
+vistiq --loglevel DEBUG --processes "${SLURM_CPUS_PER_TASK:-8}" --device cuda segment \
     -i "$input_file" \
     -o "$output_dir" \
     -s '{"classname":"DoG","sigma_low":1.0,"sigma_high":12.0,"normalize":true}' \
-    -s '{"classname":"MicroSAMSegmenter","model_type":"vit_l_lm","volume_max":5000,"aspect_ratio_min":0.1}' \
-    --loglevel DEBUG \
-    --processes "${SLURM_CPUS_PER_TASK:-8}"
+    -s '{"classname":"MicroSAMSegmenter","model_type":"vit_l_lm","volume_max":5000,"aspect_ratio_min":0.1}'

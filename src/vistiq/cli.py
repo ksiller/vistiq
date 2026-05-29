@@ -67,6 +67,28 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
+def _register_workflow_segmenters() -> None:
+    """Register Workflow-based segmenters excluded from auto_register.
+
+    ``Segmenter`` and subclasses extend ``Workflow``, not ``Configurable``, so
+    ``auto_register_configurables`` skips them. The CLI still needs registry
+    entries for ``-s MicroSAMSegmenter`` and JSON configs.
+    """
+    import vistiq.segment as segment
+
+    registry = get_registry()
+    for name in (
+        "MicroSAMSegmenter",
+        "Segmenter",
+        "IterativeSegmenter",
+        "SeriesSegmenter",
+    ):
+        configurable = getattr(segment, name, None)
+        config = getattr(segment, f"{name}Config", None)
+        if configurable is not None and config is not None:
+            registry.register(configurable, config)
+
+
 def _register_all_configurables() -> None:
     """Register all Configurable classes from all modules in a single place.
 
@@ -84,6 +106,7 @@ def _register_all_configurables() -> None:
             "vistiq.core",  # Core classes
         ],
     )
+    _register_workflow_segmenters()
 
 
 # Register all configurables once at module import time
@@ -1221,9 +1244,12 @@ def pipeline_cmd(
     Configure each step with -s NAME (defaults) or -s JSON. Per-step flags like
     --step0-sigma-low are not available; pass parameters inside the JSON blob.
 
+    Global options (--loglevel, --processes, --device) must appear before the
+    subcommand name, not after pipeline-specific flags.
+
     Example (equivalent to the legacy monolithic analyze job)::
 
-        vistiq pipeline -i brain.lif -o out/ \\
+        vistiq --loglevel DEBUG --device cuda pipeline -i brain.lif -o out/ \\
           -s '{"classname":"DoG","sigma_low":1.0,"sigma_high":12.0,"normalize":true}' \\
           -s '{"classname":"MicroSAMSegmenter","model_type":"vit_l_lm","volume_max":5000,"aspect_ratio_min":0.1}' \\
           --threshold 0.1 --method dice --mode outline

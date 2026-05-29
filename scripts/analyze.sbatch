@@ -83,11 +83,9 @@ source activate /standard/vol191/siegristlab/software/vistiq-env-gpu # replace w
 
 # Run vistiq coincidence on the selected file
 export QT_QPA_PLATFORM=offscreen # for napari headless
-vistiq coincidence \
+vistiq --loglevel DEBUG --processes "${SLURM_CPUS_PER_TASK:-8}" coincidence \
     -i "$output_dir" \
     -o "$output_dir" \
     --threshold 0.1 \
     --method dice \
-    --mode outline \
-    --loglevel DEBUG \
-    --processes "${SLURM_CPUS_PER_TASK:-8}"
+    --mode outline

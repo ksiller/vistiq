@@ -180,7 +180,7 @@ vistiq preprocess -i input.tif -o output -s '{"classname": "Resize", "width": 25
 ```
 
 #### `--loglevel {DEBUG,INFO,WARNING,ERROR,CRITICAL}` (optional)
-Sets the verbosity level for logging output.
+Sets the verbosity level for logging output. Must appear **before** the subcommand (e.g. `vistiq --loglevel DEBUG pipeline ...`, not after `pipeline`).
 
 - **DEBUG**: Most verbose, shows detailed diagnostic information
 - **INFO**: Default level, shows general informational messages
@@ -192,7 +192,7 @@ Sets the verbosity level for logging output.
 
 **Example:**
 ```bash
-vistiq segment -i data/image.tiff -o output/ --loglevel DEBUG
+vistiq --loglevel DEBUG segment -i data/image.tiff -o output/
 ```
 
 #### `--device {auto,cuda,mps,cpu}` (optional)

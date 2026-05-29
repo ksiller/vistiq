@@ -82,6 +82,5 @@ module load miniforge
 source activate /standard/vol191/siegristlab/software/vistiq-env-gpu # replace with your own environment path
 
 # Run vistiq enrich on Features_*.csv under the output directory
-vistiq enrich \
-    -i "$output_dir" \
-    --loglevel DEBUG
+vistiq --loglevel DEBUG enrich \
+    -i "$output_dir"
