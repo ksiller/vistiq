@@ -85,7 +85,7 @@ echo "Output:  $output_dir"
 
 module purge
 module load miniforge
-source activate /standard/vol191/siegristlab/software/vistiq-env # replace with your own environment path
+source activate /standard/vol191/siegristlab/software/vistiq-env-gpu # replace with your own environment path
 
 # Run vistiq preprocess on the selected file
 vistiq preprocess \

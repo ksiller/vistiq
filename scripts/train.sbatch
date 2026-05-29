@@ -13,7 +13,7 @@ output="$2"
 
 module purge
 module load miniforge
-source activate /standard/vol191/siegristlab/software/vistiq-env # replace with your own environment path
+source activate /standard/vol191/siegristlab/software/vistiq-env-gpu # replace with your own environment path
 
 echo Executing from $(pwd)
 

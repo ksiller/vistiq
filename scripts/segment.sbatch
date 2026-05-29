@@ -86,7 +86,7 @@ echo "Output:  $output_dir"
 
 module purge
 module load miniforge
-source activate /standard/vol191/siegristlab/software/vistiq-env # replace with your own environment path
+source activate /standard/vol191/siegristlab/software/vistiq-env-gpu # replace with your own environment path
 export QT_QPA_PLATFORM=offscreen # for napari headless
 
 # Chained steps on one command: DoG preprocess then MicroSAM (skip DoG if preprocess.sbatch already ran).

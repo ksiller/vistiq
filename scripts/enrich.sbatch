@@ -79,7 +79,7 @@ echo "Enrich under: $output_dir"
 
 module purge
 module load miniforge
-source activate /standard/vol191/siegristlab/software/vistiq-env # replace with your own environment path
+source activate /standard/vol191/siegristlab/software/vistiq-env-gpu # replace with your own environment path
 
 # Run vistiq enrich on Features_*.csv under the output directory
 vistiq enrich \
