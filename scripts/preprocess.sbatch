@@ -91,8 +91,6 @@ source activate /standard/vol191/siegristlab/software/vistiq-env # replace with 
 vistiq preprocess \
     -i "$input_file" \
     -o "$output_dir" \
-    -s DoG \
-    --step0-sigma-low 1.0 \
-    --step0-sigma-high 12.0 \
+    -s '{"classname":"DoG","sigma_low":1.0,"sigma_high":12.0,"normalize":true}' \
     --loglevel DEBUG \
     --processes "${SLURM_CPUS_PER_TASK:-8}"

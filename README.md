@@ -165,7 +165,7 @@ Specifies a processing step/component to include in the pipeline. Can be provide
 - **Component name**: `--step DoG` or `--step OtsuThreshold` (uses default configuration)
 - **JSON configuration**: `--step '{"classname": "DoG", "sigma_low": 1.0, "sigma_high": 5.0}'`
 
-Steps are executed in the order they are specified. Each step can be configured with step-specific arguments using the `--step{i}-*` prefix pattern (e.g., `--step0-sigma-low`, `--step1-threshold`).
+Steps are executed in the order they are specified. Use JSON on `-s` to override step parameters (e.g. `-s '{"classname": "DoG", "sigma_low": 1.0, "sigma_high": 12.0}'`). Component names alone use each step's default configuration.
 
 **Examples:**
 ```bash

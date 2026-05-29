@@ -994,8 +994,9 @@ def preprocess_cmd(
     """Preprocess images with a chain of preprocessing steps.
 
     Processes images through a sequence of preprocessing steps (e.g., denoising, resizing).
-    Each step can be specified multiple times using --step/-s and configured with step-specific
-    arguments using the --step{i}-* prefix pattern (e.g., --step0-sigma-low, --step1-width).
+    Each step can be specified multiple times with --step/-s. Use a component name for
+    defaults (e.g. -s DoG) or a JSON object to set parameters
+    (e.g. -s '{"classname":"DoG","sigma_low":1.0,"sigma_high":12.0}').
 
     Input and output can be specified as:
     - Simple path: --input path/to/file or --input '{"paths": "path/to/file"}'
@@ -1068,8 +1069,9 @@ def segment_cmd(
     """Segment and label images with a chain of processing steps.
 
     Processes images through a sequence of thresholding, segmentation, and labelling steps.
-    Each step can be specified multiple times using --step/-s and configured with step-specific
-    arguments using the --step{i}-* prefix pattern (e.g., --step0-threshold, --step1-method).
+    Each step can be specified multiple times with --step/-s. Use a component name for
+    defaults or JSON for custom settings
+    (e.g. -s '{"classname":"MicroSAMSegmenter","volume_max":5000}').
 
     Input and output can be specified as:
     - Simple path: --input path/to/file or --input '{"paths": "path/to/file"}'
@@ -1216,11 +1218,14 @@ def pipeline_cmd(
 ) -> None:
     """Run a chained pipeline: -s steps, then enrich and coincidence.
 
+    Configure each step with -s NAME (defaults) or -s JSON. Per-step flags like
+    --step0-sigma-low are not available; pass parameters inside the JSON blob.
+
     Example (equivalent to the legacy monolithic analyze job)::
 
         vistiq pipeline -i brain.lif -o out/ \\
-          -s DoG --step0-sigma-low 1.0 --step0-sigma-high 12.0 \\
-          -s MicroSAMSegmenter --step1-volume-max 5000 --step1-aspect-ratio-min 0.1 \\
+          -s '{"classname":"DoG","sigma_low":1.0,"sigma_high":12.0,"normalize":true}' \\
+          -s '{"classname":"MicroSAMSegmenter","model_type":"vit_l_lm","volume_max":5000,"aspect_ratio_min":0.1}' \\
           --threshold 0.1 --method dice --mode outline
     """
     config_kwargs = cli_command_config(
@@ -1312,8 +1317,7 @@ def train_cmd(
 
     Trains models (e.g., MicroSAM) using paired image and label datasets. The command handles
     dataset creation, splitting into training/validation sets, and model training.
-    Each step can be specified multiple times using --step/-s and configured with step-specific
-    arguments using the --step{i}-* prefix pattern.
+    Each step can be specified multiple times with --step/-s (component name or JSON config).
 
     Input and output can be specified as:
     - Simple path: --input path/to/file or --input '{"paths": "path/to/file"}'

@@ -99,13 +99,8 @@ export QT_QPA_PLATFORM=offscreen # for napari headless
 vistiq pipeline \
     -i "$input_file" \
     -o "$output_dir" \
-    -s DoG \
-    --step0-sigma-low 1.0 \
-    --step0-sigma-high 12.0 \
-    -s MicroSAMSegmenter \
-    --step1-model-type vit_l_lm \
-    --step1-volume-max 5000 \
-    --step1-aspect-ratio-min 0.1 \
+    -s '{"classname":"DoG","sigma_low":1.0,"sigma_high":12.0,"normalize":true}' \
+    -s '{"classname":"MicroSAMSegmenter","model_type":"vit_l_lm","volume_max":5000,"aspect_ratio_min":0.1}' \
     --threshold 0.1 \
     --method dice \
     --mode outline \
