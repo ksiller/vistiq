@@ -1,8 +1,8 @@
 name: vistiq-env-gpu
 channels:
-  - conda-forge
-  - nvidia
   - pytorch
+  - nvidia
+  - conda-forge
   - defaults
 
 dependencies:
@@ -30,8 +30,9 @@ dependencies:
   - typer
 
   # GPU torch stack
-  - pytorch
-  - torchvision
+  - pytorch::pytorch
+  - pytorch::torchvision
+  - pytorch::torchaudio
   - pytorch-cuda=12.1
 
   # Imaging / IO
