@@ -566,17 +566,13 @@ class TestRegionAnalyzer:
         region_filter = RegionFilter(
             RegionFilterConfig(
                 filters=[
-                    RangeFilter(
-                        RangeFilterConfig(
-                            attribute="cross_sectional_area-xy",
-                            range=(0.0, float("inf")),
-                        )
+                    RangeFilterConfig(
+                        attribute="cross_sectional_area-xy",
+                        range=(0.0, float("inf")),
                     ),
-                    RangeFilter(
-                        RangeFilterConfig(
-                            attribute="aspect_ratio",
-                            range=(0.0, 1.0),
-                        )
+                    RangeFilterConfig(
+                        attribute="aspect_ratio",
+                        range=(0.0, 1.0),
                     ),
                 ]
             )
@@ -888,19 +884,47 @@ class TestRegionFilterConfig:
         assert list(accepted["label"]) == [2, 4]
         assert set(removed) == {1, 3}
 
+    def test_region_filter_lookup_with_bare_configs(self):
+        """has_filter/get_filter/get_attribute_names accept bare FilterConfig entries."""
+        rf = RegionFilter(
+            RegionFilterConfig(
+                filters=[
+                    RangeFilterConfig(attribute="volume", range=(0.0, float("inf"))),
+                    RangeFilterConfig(attribute="solidity", range=(0.0, 1.0)),
+                ]
+            )
+        )
+        assert rf.has_filter("volume") is True
+        assert rf.has_filter("missing") is False
+        assert rf.get_attribute_names() == ["volume", "solidity"]
+        resolved = rf.get_filter("volume")
+        assert resolved.config.attribute == "volume"
+
+    def test_filter_ops_and_with_bare_configs(self):
+        """FilterOps combines bare filter configs."""
+        from vistiq.segment.select import FilterOps, FilterOpsConfig
+
+        values = np.array([10.0, 50.0, 90.0])
+        result = FilterOps(
+            FilterOpsConfig(
+                filters=[
+                    RangeFilterConfig(attribute=None, range=(40.0, 100.0)),
+                    RangeFilterConfig(attribute=None, range=(0.0, 60.0)),
+                ],
+                operation="and",
+            )
+        ).run(values)
+        np.testing.assert_array_equal(result, np.array([50.0]))
+
     def test_accepts_mapped_cross_sectional_area_columns(self):
         """RangeFilter may target map_axes plane columns."""
         config = RegionFilterConfig(
             filters=[
-                RangeFilter(
-                    RangeFilterConfig(
-                        attribute="cross_sectional_area-xy", range=(100.0, float("inf"))
-                    )
+                RangeFilterConfig(
+                    attribute="cross_sectional_area-xy", range=(100.0, float("inf"))
                 ),
-                RangeFilter(
-                    RangeFilterConfig(
-                        attribute="cross_sectional_area-xz", range=(50.0, float("inf"))
-                    )
+                RangeFilterConfig(
+                    attribute="cross_sectional_area-xz", range=(50.0, float("inf"))
                 ),
             ]
         )
@@ -910,12 +934,8 @@ class TestRegionFilterConfig:
         """RangeFilter may target other map_axes column names."""
         RegionFilterConfig(
             filters=[
-                RangeFilter(
-                    RangeFilterConfig(attribute="centroid-y", range=(0.0, 100.0))
-                ),
-                RangeFilter(
-                    RangeFilterConfig(attribute="bbox-end-x", range=(0.0, 512.0))
-                ),
+                RangeFilterConfig(attribute="centroid-y", range=(0.0, 100.0)),
+                RangeFilterConfig(attribute="bbox-end-x", range=(0.0, 512.0)),
             ]
         )
 
@@ -923,23 +943,32 @@ class TestRegionFilterConfig:
         """RangeFilter may target plane-specific and overall aspect_ratio columns."""
         RegionFilterConfig(
             filters=[
-                RangeFilter(
-                    RangeFilterConfig(attribute="aspect_ratio-xy", range=(0.5, 1.0))
-                ),
-                RangeFilter(
-                    RangeFilterConfig(attribute="aspect_ratio", range=(0.5, 1.0))
-                ),
+                RangeFilterConfig(attribute="aspect_ratio-xy", range=(0.5, 1.0)),
+                RangeFilterConfig(attribute="aspect_ratio", range=(0.5, 1.0)),
             ]
         )
 
-    def test_rejects_unknown_attribute(self):
-        """Invalid filter attributes still fail validation."""
-        with pytest.raises(ValueError, match="is not allowed"):
+    def test_rejects_filter_instances_in_filters(self):
+        """Filter configurables cannot be stored in RegionFilterConfig.filters."""
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="must be a FilterConfig subclass"):
             RegionFilterConfig(
                 filters=[
                     RangeFilter(
-                        RangeFilterConfig(attribute="not_a_property", range=(0.0, 1.0))
+                        RangeFilterConfig(attribute="volume", range=(0.0, float("inf")))
                     )
+                ]
+            )
+
+    def test_rejects_unknown_attribute(self):
+        """Invalid filter attributes still fail validation."""
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="is not allowed"):
+            RegionFilterConfig(
+                filters=[
+                    RangeFilterConfig(attribute="not_a_property", range=(0.0, 1.0))
                 ]
             )
 
