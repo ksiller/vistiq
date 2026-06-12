@@ -113,6 +113,41 @@ class TestOverlapCalculatorMasks:
         np.testing.assert_allclose(with_spacing.area_a, without.area_a * voxel_volume)
         np.testing.assert_allclose(with_spacing.area_b, without.area_b * voxel_volume)
 
+    def test_mask_metrics_with_signed_spacing(self):
+        masks_a, masks_b = _mask_pair()
+        positive_spacing = (2.0, 1.0, 1.0)
+        signed_spacing = (-2.0, 1.0, -1.0)
+        numpy_backend = {"preferred_input_type": "numpy"}
+        config = MaskOverlapCalculatorConfig(
+            builder=MaskStackBuilderConfig(**numpy_backend),
+            area_calculator=MaskAreaCalculatorConfig(**numpy_backend),
+            intersection_calculator=MaskIntersectionCalculatorConfig(**numpy_backend),
+            metrics_calculators=metrics_calculator_configs(
+                ("iou", "ios", "dice")
+            ),
+            return_components=True,
+        )
+        calc = OverlapCalculator(config)
+        without = calc.run(masks_a, masks_b)
+        positive = calc.run(masks_a, masks_b, spacing=positive_spacing)
+        signed = calc.run(masks_a, masks_b, spacing=signed_spacing)
+        for metric in ("iou", "ios", "dice"):
+            np.testing.assert_allclose(
+                without.metrics[metric],
+                positive.metrics[metric],
+                rtol=1e-5,
+                atol=1e-5,
+            )
+            np.testing.assert_allclose(
+                positive.metrics[metric],
+                signed.metrics[metric],
+                rtol=1e-5,
+                atol=1e-5,
+            )
+        assert np.all(signed.area_a > 0)
+        assert np.all(signed.area_b > 0)
+        assert np.all(signed.intersection >= 0)
+
 
 class TestOverlapCalculatorLabels:
     def test_labels_iou_dense_matches_coincidence(self):
@@ -150,6 +185,43 @@ class TestOverlapCalculatorLabels:
         np.testing.assert_allclose(
             with_spacing.intersection, without.intersection * voxel_volume
         )
+
+    def test_labels_metrics_with_signed_spacing(self):
+        labels, other = _label_pair()
+        positive_spacing = (2.0, 1.0, 1.0)
+        signed_spacing = (-2.0, -1.0, 1.0)
+        numpy_backend = {"preferred_input_type": "numpy"}
+        config = LabelOverlapCalculatorConfig(
+            builder=LabelMaskBuilderConfig(label_order="unique", **numpy_backend),
+            area_calculator=MaskAreaCalculatorConfig(**numpy_backend),
+            intersection_calculator=MaskIntersectionCalculatorConfig(
+                prune_bboxes=False, **numpy_backend
+            ),
+            metrics_calculators=metrics_calculator_configs(
+                ("iou", "ios", "dice")
+            ),
+            return_components=True,
+        )
+        calc = OverlapCalculator(config)
+        without = calc.run(labels, other)
+        positive = calc.run(labels, other, spacing=positive_spacing)
+        signed = calc.run(labels, other, spacing=signed_spacing)
+        for metric in ("iou", "ios", "dice"):
+            np.testing.assert_allclose(
+                without.metrics[metric],
+                positive.metrics[metric],
+                rtol=1e-5,
+                atol=1e-5,
+            )
+            np.testing.assert_allclose(
+                positive.metrics[metric],
+                signed.metrics[metric],
+                rtol=1e-5,
+                atol=1e-5,
+            )
+        assert np.all(signed.area_a > 0)
+        assert np.all(signed.area_b > 0)
+        assert np.all(signed.intersection >= 0)
 
     def test_labels_iou_pruned_matches_coincidence(self):
         labels, other = _label_pair()

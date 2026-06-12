@@ -285,8 +285,18 @@ def _spacing_tuple(
     return values[:n_dims]
 
 
+def _spacing_magnitudes(
+    spacing: SpacingLike, *, n_dims: int
+) -> Optional[tuple[float, ...]]:
+    """Per-axis physical voxel size; sign on *spacing* encodes axis direction only."""
+    sp = _spacing_tuple(spacing, n_dims=n_dims)
+    if sp is None:
+        return None
+    return tuple(abs(value) for value in sp)
+
+
 def _voxel_volume(spacing: SpacingLike, *, n_spatial: int) -> float:
-    sp = _spacing_tuple(spacing, n_dims=n_spatial)
+    sp = _spacing_magnitudes(spacing, n_dims=n_spatial)
     if sp is None:
         return 1.0
     volume = 1.0
@@ -337,7 +347,7 @@ def box_areas_numpy(
         raise ValueError(f"boxes must have shape (N, 6); got {boxes.shape}")
     if boxes.shape[0] == 0:
         return np.empty(0, dtype=np.float64)
-    sp = _spacing_tuple(spacing, n_dims=3)
+    sp = _spacing_magnitudes(spacing, n_dims=3)
     extents = np.maximum(boxes[:, 3:6] - boxes[:, 0:3], 0.0)
     if sp is not None:
         extents = extents * np.asarray(sp, dtype=np.float64)
@@ -378,7 +388,7 @@ def box_areas_torch(
     if boxes.shape[0] == 0:
         return torch.empty(0, dtype=torch.float32, device=boxes.device)
     extents = torch.clamp(boxes[:, 3:6] - boxes[:, 0:3], min=0.0).to(torch.float32)
-    sp = _spacing_tuple(spacing, n_dims=3)
+    sp = _spacing_magnitudes(spacing, n_dims=3)
     if sp is not None:
         scale = convert_array_like(
             sp, dtype="torch.Tensor", device=boxes.device
@@ -889,21 +899,14 @@ class BoxIntersectionCalculator(IntersectionCalculator):
         dtype = self.config.preferred_input_type
         boxes_a = convert_array_like(built_a, dtype=dtype, device=device)
         boxes_b = convert_array_like(built_b, dtype=dtype, device=device)
-        sp = _spacing_tuple(spacing, n_dims=3)
         if isinstance(boxes_a, torch.Tensor):
             inter = box_intersection_torch(boxes_a, boxes_b)
-            if sp is not None:
-                scale = convert_array_like(
-                    sp, dtype="torch.Tensor", device=boxes_a.device
-                ).to(dtype=inter.dtype)
-                inter = inter * scale.prod()
+            if spacing is not None:
+                inter = inter * _voxel_volume(spacing, n_spatial=3)
             return inter
         inter = box_intersection_numpy(np.asarray(boxes_a), np.asarray(boxes_b))
-        if sp is not None:
-            volume = 1.0
-            for value in sp:
-                volume *= value
-            inter = inter * volume
+        if spacing is not None:
+            inter = inter * _voxel_volume(spacing, n_spatial=3)
         return inter
 
 
@@ -1345,8 +1348,10 @@ class OverlapCalculator(Configurable[OverlapCalculatorConfig]):
                 :func:`region_map_from_dataframe`).
             spacing: Physical voxel size ``(dz, dy, dx)`` aligned with array
                 axes (same convention as ``metadata["scale"]`` from
-                :class:`RegionAnalyzer`). Scales areas and dense intersections;
-                IoU/IoS/Dice ratios are unchanged under uniform scaling.
+                :class:`RegionAnalyzer`). A negative component indicates
+                acquisition direction along that axis; magnitudes are used for
+                area and intersection scaling. IoU/IoS/Dice ratios are
+                unchanged under uniform scaling.
             annotations: Optional ``(row_labels, col_labels)`` for DataFrame
                 output when ``annotate=True``. Overrides ``object_id`` display
                 names; lengths must match region counts. Ignored when
