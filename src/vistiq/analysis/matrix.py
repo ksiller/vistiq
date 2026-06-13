@@ -78,11 +78,18 @@ class MatrixAggregator(Configurable[MatrixAggregatorConfig]):
     ) -> Union[np.ndarray, torch.Tensor]:
         """Reduce *data* along :attr:`~MatrixAggregatorConfig.axis`."""
         as_numpy = isinstance(data, np.ndarray)
-        device = resolve_torch_device(
-            device,
-            preferred_input_type=self.config.preferred_input_type,
-            preferred_device=self.config.preferred_device,
-        )
+        if (
+            device is None
+            and self.config.preferred_device is None
+            and isinstance(data, torch.Tensor)
+        ):
+            device = data.device
+        else:
+            device = resolve_torch_device(
+                device,
+                preferred_input_type=self.config.preferred_input_type,
+                preferred_device=self.config.preferred_device,
+            )
         values = convert_array_like(
             data,
             dtype=self.config.preferred_input_type,

@@ -1711,7 +1711,7 @@ class TiledSegmentationFlow(SegmentationFlow):
             #output_type="dataframe",
         )
         ol = OverlapCalculator(olcfg).run(t_proj, t_proj)
-        groups = group_matrix_indices(ol, threshold=self.config.iou_threshold)
+        groups = group_matrix_indices(ol.metric(), threshold=self.config.iou_threshold)
         logger.info(f"TiledSegmentationFlow: groups={groups}")
         # label grouped mask
         stacks = np.array([(t_proj[g].mean(axis=0)>self.config.consensus_threshold) * (i+1) for i,g in enumerate(groups)])

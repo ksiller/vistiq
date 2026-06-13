@@ -88,6 +88,30 @@ def convert_array_like(
         return _numpy_to_torch(arr, device)
     return arr
 
+
+SpacingLike = Optional[Union[dict[str, float], tuple[float, ...], Sequence[float]]]
+
+
+def abs_spacing(spacing: SpacingLike) -> Optional[tuple[float, ...]]:
+    if spacing is None:
+        return None
+    if isinstance(spacing, dict):
+        values = tuple(float(spacing[k]) for k in sorted(spacing.keys()))
+    else:
+        values = tuple(float(v) for v in spacing)
+    return tuple(abs(value) for value in values)
+
+
+def voxel_size(spacing: SpacingLike) -> float:
+    sp = abs_spacing(spacing)
+    if sp is None:
+        return 1.0
+    size = 1.0
+    for value in sp:
+        size *= value
+    return size
+
+
 def resolve_futures(value: Any) -> Any:
     """Resolve Prefect futures/states into concrete values.
 
