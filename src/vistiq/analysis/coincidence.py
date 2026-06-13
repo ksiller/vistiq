@@ -600,7 +600,7 @@ def box_iou_batch_3d_torch(
         )
     )
     result = calc.run(boxes_true, boxes_detection, device=device)
-    return np.asarray(result, dtype=np.float32)
+    return np.asarray(result.metric(), dtype=np.float32)
 
 
 def box_iou_batch_3d(
