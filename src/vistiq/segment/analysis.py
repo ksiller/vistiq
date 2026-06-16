@@ -428,6 +428,10 @@ class RegionAnalyzer(StackProcessor):
         indices from the stack iterator are attached as dataframe columns or list
         attributes. Keys use lowercase axis labels (``c``, ``z``, …).
 
+    Object naming
+        When ``metadata['channel_names']`` is set, each region also gets
+        ``channel`` and ``object_name`` (``'{channel} {label}'``).
+
     Metadata
         Optional. ``metadata['scale']`` supplies voxel spacing; ``metadata['axes']``
         (or ``axis`` / ``dim_order``) drives axis renaming. If metadata is
@@ -450,7 +454,7 @@ class RegionAnalyzer(StackProcessor):
     )
     default_properties: ClassVar[tuple[str, ...]] = mandatory_properties + ("centroid",)
     postcomputed_properties: ClassVar[frozenset[str]] = frozenset(
-        {"object_id", "slice_id", "stack_id", "slice_annotations", "channel"}
+        {"object_id", "slice_id", "stack_id", "slice_annotations", "channel", "object_name"}
     )
 
     @classmethod
@@ -1416,6 +1420,49 @@ class RegionAnalyzer(StackProcessor):
             results[channel_col] = channel_str
         return results
 
+    @staticmethod
+    def _dataframe_field_values(
+        df: pd.DataFrame, name: str
+    ) -> Optional[pd.Series]:
+        """Return a field from DataFrame columns or named index."""
+        if name in df.columns:
+            return df[name]
+        if df.index.name == name:
+            return pd.Series(df.index, index=df.index)
+        return None
+
+    def _assign_object_names(
+        self,
+        results: List[Any] | pd.DataFrame,
+    ) -> List[Any] | pd.DataFrame:
+        """Set ``object_name`` to ``'{channel} {label}'`` when channel is present."""
+
+        def _object_name(channel: str, label: Any) -> str:
+            try:
+                label_value = int(label)
+            except (TypeError, ValueError):
+                label_value = label
+            return f"{channel} {label_value}"
+
+        if isinstance(results, pd.DataFrame):
+            if not len(results) or "channel" not in results.columns:
+                return results
+            labels = self._dataframe_field_values(results, "label")
+            if labels is None:
+                return results
+            results = results.copy()
+            results["object_name"] = [
+                _object_name(channel, label)
+                for channel, label in zip(results["channel"], labels)
+            ]
+            return results
+
+        for region in results:
+            channel = getattr(region, "channel", None)
+            if channel is not None:
+                setattr(region, "object_name", _object_name(channel, region.label))
+        return results
+
     def _process_slice(
         self,
         labels: np.ndarray,
@@ -1496,8 +1543,10 @@ class RegionAnalyzer(StackProcessor):
 
         if self.config.output_type == "list":
             results = self._assign_property_names(results)
+            results = self._assign_object_names(results)
         elif isinstance(results, pd.DataFrame) and len(results):
             results = self._set_result_index(results)
+            results = self._assign_object_names(results)
 
         if isinstance(results, list):
             logger.debug(

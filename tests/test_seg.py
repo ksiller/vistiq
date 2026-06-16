@@ -412,6 +412,46 @@ class TestRegionAnalyzer:
         assert isinstance(result, pd.DataFrame)
         assert "channel" in result.columns
         assert result["channel"].tolist() == ["Scrib"] * len(result)
+        assert result.index.name == "label"
+        assert "label" not in result.columns
+        assert "object_name" in result.columns
+        assert result["object_name"].tolist() == [
+            f"Scrib {int(label)}" for label in result.index
+        ]
+
+    def test_assign_object_names_index_on_object_id(self, sample_labels_2d):
+        import pandas as pd
+
+        config = RegionAnalyzerConfig(
+            output_type="dataframe",
+            index_on="object_id",
+            properties=["label", "bbox"],
+        )
+        result = RegionAnalyzer(config)._process_slice(
+            sample_labels_2d,
+            metadata={"channel_names": ["Dpn"]},
+        )
+        assert isinstance(result, pd.DataFrame)
+        assert result.index.name == "object_id"
+        assert "label" in result.columns
+        assert "object_name" in result.columns
+        assert result["object_name"].tolist() == [
+            f"Dpn {int(label)}" for label in result["label"]
+        ]
+
+    def test_assign_object_names_list_output(self, sample_labels_3d):
+        config = RegionAnalyzerConfig(
+            output_type="list",
+            properties=["label", "bbox"],
+            iterator_config=ArrayIteratorConfig(slice_def=()),
+        )
+        result = RegionAnalyzer(config)._process_slice(
+            sample_labels_3d,
+            metadata={"channel_names": ["EdU"]},
+        )
+        assert len(result) > 0
+        for region in result:
+            assert region.object_name == f"EdU {region.label}"
 
     def test_assign_channel_names_skips_when_missing(self, sample_labels_3d):
         import pandas as pd
@@ -427,6 +467,7 @@ class TestRegionAnalyzer:
         )
         assert isinstance(result, pd.DataFrame)
         assert "channel" not in result.columns
+        assert "object_name" not in result.columns
 
     def test_channel_names_string_accepts_scalar(self):
         assert RegionAnalyzer._channel_names_string("Scrib") == "Scrib"
