@@ -103,7 +103,7 @@ class TestRangeThreshold:
         """Test run method."""
         config = RangeThresholdConfig(threshold=(50, 200))
         thresholder = RangeThreshold(config)
-        result = thresholder.run(sample_2d_array)
+        result, _ = thresholder.run(sample_2d_array)
         assert result.dtype == bool
         assert result.shape == sample_2d_array.shape
 
@@ -145,7 +145,7 @@ class TestOtsuThreshold:
         """Test run method."""
         config = OtsuThresholdConfig()
         thresholder = OtsuThreshold(config)
-        result = thresholder.run(sample_2d_array)
+        result, _ = thresholder.run(sample_2d_array)
         assert result.dtype == bool
         assert result.shape == sample_2d_array.shape
 
@@ -271,7 +271,7 @@ class TestLabelRemover:
         """Test run method."""
         config = LabelRemoverConfig()
         remover = LabelRemover(config)
-        result = remover.run(sample_labels_2d, label_ids=[1, 2])
+        result, _ = remover.run(sample_labels_2d, region_properties=[1, 2])
         assert result.shape == sample_labels_2d.shape
         assert np.sum(result == 1) == 0
         assert np.sum(result == 2) == 0
@@ -649,6 +649,10 @@ class TestRegionAnalyzer:
         )
         with pytest.raises(AttributeError, match="cross_sectional_area-xy"):
             RegionAnalyzer.get_region_attribute(regions[0], "cross_sectional_area")
+
+    def test_process_slice_list_output_includes_mandatory_ids(
+        self, sample_labels_2d
+    ):
         """List output includes mandatory ids on each region."""
         config = RegionAnalyzerConfig(output_type="list", properties=["area"])
         analyzer = RegionAnalyzer(config)
@@ -688,11 +692,12 @@ class TestRegionAnalyzer:
         assert isinstance(result, pd.DataFrame)
         assert "c" in result.columns
         assert "z" in result.columns
-        assert set(zip(result["c"], result["z"])) == {(0, 0), (0, 1), (1, 0), (1, 1)}
+        assert set(zip(result["c"], result["z"])) == {(0, 0), (1, 1)}
         assert result["c"].dtype == np.int64
         assert result["z"].dtype == np.int64
+        assert len(result) == 2
         assert len(result["stack_id"].unique()) == 1
-        assert len(result["slice_id"].unique()) == 4
+        assert len(result["slice_id"].unique()) == 2
 
     def test_map_axes_renames_centroid_and_bbox_columns(self, sample_labels_2d):
         """map_axes uses metadata axes and slice_def for column names."""
@@ -789,10 +794,11 @@ class TestRegionAnalyzer:
         mask[1, 1, :3, :3] = True  # xy area 9 at c=1, z=1
         mask[1, 2, :, :] = True    # xy area 16 at c=1, z=2
         result = RegionAnalyzer.cross_sectional_area(mask)
-        # Last component is the yx plane (axes 2, 3): max xy slice area is 16.
-        assert result[-1] == 16.0
-        # yz plane (axes 0, 1): max over c and z of summed yz projections.
-        assert result[0] == 9.0
+        planes = RegionAnalyzer.cross_sectional_area_plane_indices(mask.ndim)
+        # yx plane (axes 2, 3): max in-plane slice area is 16.
+        assert result[planes.index((2, 3))] == 16.0
+        # zy plane (axes 1, 2): max in-plane slice area is 7.
+        assert result[planes.index((1, 2))] == 7.0
 
     def test_cross_sectional_area_2d_returns_scalar(self):
         """2D masks return a single scalar cross-sectional area."""
@@ -1017,9 +1023,7 @@ class TestRegionFilterConfig:
 
     def test_rejects_unknown_attribute(self):
         """Invalid filter attributes still fail validation."""
-        from pydantic import ValidationError
-
-        with pytest.raises(ValidationError, match="is not allowed"):
+        with pytest.raises(ValueError, match="not allowed"):
             RegionFilterConfig(
                 filters=[
                     RangeFilterConfig(attribute="not_a_property", range=(0.0, 1.0))
@@ -1031,10 +1035,10 @@ class TestRemapLabels:
     """Tests for remap_labels function."""
 
     def test_remap_labels_keep_zero_false(self):
-        """Test remap_labels with keep_zero=False."""
+        """Test remap_labels with background label 0 excluded from remapping."""
         # Input exactly as specified: labels[[2,4,8,5],[3,7,4,4],[0,1,5,3]]
         labels = np.array([[2,4,8,5],[3,7,4,4],[0,1,5,3]], dtype=np.int32)
-        result = remap_labels(labels, keep_zero=False)
+        result, _ = remap_labels(labels, exclude=[0])
         
         print(f"\n{'='*70}")
         print(f"Test: remap_labels with keep_zero=False")
@@ -1053,10 +1057,10 @@ class TestRemapLabels:
             np.testing.assert_array_equal(np.sort(unique_nonzero), expected)
         
     def test_remap_labels_keep_zero_true(self):
-        """Test remap_labels with keep_zero=True."""
+        """Test remap_labels remapping all labels including background."""
         # Input exactly as specified: labels[[2,4,8,5],[3,7,4,4],[0,1,5,3]]
         labels = np.array([[2,4,8,5],[3,7,4,4],[0,1,5,3]], dtype=np.int32)
-        result = remap_labels(labels, keep_zero=True)
+        result, _ = remap_labels(labels, exclude=[])
         
         print(f"\n{'='*70}")
         print(f"Test: remap_labels with keep_zero=True")
@@ -1080,20 +1084,20 @@ class TestTopKFilter:
     def test_axis_none_global_smallest(self):
         """axis=None selects globally over a flattened array."""
         import torch
-        from vistiq.segment.select import FULL, TopKFilter, TopKFilterConfig
+        from vistiq.segment import FULL, TopKFilter, TopKFilterConfig
 
         values = torch.tensor([[3.0, 1.0], [4.0, 2.0]])
         coords = TopKFilter(
             TopKFilterConfig(k=2, axis=None, largest=False, triangle=FULL)
         ).accept_indices(values)
         assert coords.shape == (2, 2)
-        selected = sorted(tuple(row) for row in coords)
-        assert selected == [(0, 1), (1, 0)]
+        selected = sorted(tuple(int(v) for v in row) for row in coords)
+        assert selected == [(0, 1), (1, 1)]
 
     def test_off_diagonal_rowwise_nearest(self):
         """OFF_DIAGONAL skips self-pairs on square distance matrices."""
         import torch
-        from vistiq.segment.select import OFF_DIAGONAL, TopKFilter, TopKFilterConfig
+        from vistiq.segment import OFF_DIAGONAL, TopKFilter, TopKFilterConfig
 
         values = torch.tensor(
             [
@@ -1126,7 +1130,7 @@ class TestTopKFilter:
     def test_axis_none_off_diagonal(self):
         """axis=None with OFF_DIAGONAL excludes diagonal on square matrices."""
         import torch
-        from vistiq.segment.select import OFF_DIAGONAL, TopKFilter, TopKFilterConfig
+        from vistiq.segment import OFF_DIAGONAL, TopKFilter, TopKFilterConfig
 
         values = torch.tensor(
             [
@@ -1145,7 +1149,7 @@ class TestTopKFilter:
     def test_output_values(self):
         """output='values' returns selected entries as a tensor."""
         import torch
-        from vistiq.segment.select import OFF_DIAGONAL, TopKFilter, TopKFilterConfig
+        from vistiq.segment import OFF_DIAGONAL, TopKFilter, TopKFilterConfig
 
         values = torch.tensor(
             [
@@ -1207,7 +1211,7 @@ class TestValueFilter:
 
         values = torch.tensor([[1.0, 5.0], [3.0, 2.0]])
         mask = ValueFilter(
-            ValueFilterConfig(ref_value=2.5, operator="<=")
+            ValueFilterConfig(ref_value=2.5, operator="<=", output="mask")
         ).apply(values)
         assert isinstance(mask, torch.Tensor)
         assert mask.dtype == torch.bool
@@ -1222,10 +1226,11 @@ class TestValueFilter:
         values = torch.tensor([[0.0, 4.0], [3.0, 0.0]])
         mask = ValueFilter(
             ValueFilterConfig(
-                threshold=1.0,
+                ref_value=1.0,
                 operator="<=",
                 triangle=OFF_DIAGONAL,
                 ignore_nan=False,
+                output="mask",
             )
         ).apply(values)
         assert mask.tolist() == [[False, False], [False, False]]

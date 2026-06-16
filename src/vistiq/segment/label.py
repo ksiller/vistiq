@@ -1121,7 +1121,10 @@ class Labeller(StackProcessor):
             - labels: Labeled array with unique integer labels.
             - regions: List of region properties.
         """
-        labels, regions = super().run(mask, workers=workers, verbose=verbose)
+        slice_results, _ = super().run(
+            mask, workers=workers, verbose=verbose, metadata=metadata, **kwargs
+        )
+        labels, regions = slice_results
         # print (f"type(labels)={type(labels)}, type(regions)={type(regions)}")
         # if len(labels) > 1:
         #    iterator = ArrayIterator(labels, self.config.iterator_config)
