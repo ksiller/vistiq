@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 def group_matrix_indices(matrix, threshold=0.5):
     """Group row/column indices with pairwise overlap > threshold."""
+    if isinstance(matrix, torch.Tensor):
+        matrix = matrix.detach().cpu().numpy()
     m = np.asarray(matrix, dtype=float)
     n = m.shape[0]
     # Fill upper triangle from lower (self-comparison matrices are often lower-tri)

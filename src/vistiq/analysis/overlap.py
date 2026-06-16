@@ -15,6 +15,7 @@ from pydantic import Field, model_validator
 
 from vistiq.constant.matrix import FULL
 from vistiq.core import Configurable, Configuration, generate_name
+from vistiq.segment.analysis import bbox_array_from_dataframe, dataframe_to_numpy
 from vistiq.utils import (
     SpacingLike,
     convert_array_like,
@@ -27,22 +28,6 @@ from vistiq.utils import (
 logger = logging.getLogger(__name__)
 
 _LABELS_IOU_DENSE_PAIR_FRACTION = 1.01
-
-Box6 = tuple[float, float, float, float, float, float]
-
-_DEFAULT_BBOX_COLS = (
-    "bbox-start-x",
-    "bbox-start-y",
-    "bbox-start-z",
-    "bbox-end-x",
-    "bbox-end-y",
-    "bbox-end-z",
-)
-
-
-# ---------------------------------------------------------------------------
-# Primitives
-# ---------------------------------------------------------------------------
 
 
 def box_intersection_nd(
@@ -80,56 +65,63 @@ def _box_volumes(boxes: np.ndarray) -> np.ndarray:
     return np.prod(extents, axis=1)
 
 
-def box_areas_numpy(
-    boxes: np.ndarray, spacing: SpacingLike = None
-) -> np.ndarray:
-    """Per-box volumes for ``(N, 6)`` boxes ``(x_min, y_min, z_min, x_max, y_max, z_max)``."""
+def box_areas_nd(boxes: np.ndarray, spacing: SpacingLike = None) -> np.ndarray:
+    """Per-box volumes for ``(N, 2 * d)`` axis-aligned boxes in array axis order."""
     boxes = np.asarray(boxes, dtype=np.float64)
-    if boxes.ndim != 2 or boxes.shape[1] != 6:
-        raise ValueError(f"boxes must have shape (N, 6); got {boxes.shape}")
+    if boxes.ndim != 2 or boxes.shape[1] % 2:
+        raise ValueError(
+            f"boxes must have shape (N, 2 * d) with even width; got {boxes.shape}"
+        )
     if boxes.shape[0] == 0:
         return np.empty(0, dtype=np.float64)
     sp = abs_spacing(spacing)
-    extents = np.maximum(boxes[:, 3:6] - boxes[:, 0:3], 0.0)
+    half = boxes.shape[1] // 2
+    extents = np.maximum(boxes[:, half:] - boxes[:, :half], 0.0)
     if sp is not None:
         extents = extents * np.asarray(sp, dtype=np.float64)
     return np.prod(extents, axis=1)
 
 
-def box_intersection_numpy(
-    boxes_a: np.ndarray, boxes_b: np.ndarray
-) -> np.ndarray:
-    """Pairwise intersection volumes for 3D axis-aligned boxes."""
-    boxes_a = np.asarray(boxes_a, dtype=np.float32)
-    boxes_b = np.asarray(boxes_b, dtype=np.float32)
+def box_intersection_nd_torch(
+    boxes_a: torch.Tensor, boxes_b: torch.Tensor
+) -> torch.Tensor:
+    """Pairwise intersection hyper-volumes for ``(N, 2 * d)`` axis-aligned boxes."""
+    if boxes_a.ndim != 2 or boxes_b.ndim != 2:
+        raise ValueError("boxes must be 2D arrays")
+    if boxes_a.shape[1] != boxes_b.shape[1] or boxes_a.shape[1] % 2:
+        raise ValueError(
+            "boxes must have matching even width (min/max pairs per axis); "
+            f"got {boxes_a.shape[1]} and {boxes_b.shape[1]}"
+        )
     n_a, n_b = boxes_a.shape[0], boxes_b.shape[0]
     if n_a == 0 or n_b == 0:
-        return np.empty((n_a, n_b), dtype=np.float32)
+        return torch.empty((n_a, n_b), dtype=torch.float32, device=boxes_a.device)
 
-    x_min_a, y_min_a, z_min_a, x_max_a, y_max_a, z_max_a = boxes_a.T
-    x_min_b, y_min_b, z_min_b, x_max_b, y_max_b, z_max_b = boxes_b.T
-
-    x_min = np.maximum(x_min_a[:, None], x_min_b[None, :])
-    x_max = np.minimum(x_max_a[:, None], x_max_b[None, :])
-    y_min = np.maximum(y_min_a[:, None], y_min_b[None, :])
-    y_max = np.minimum(y_max_a[:, None], y_max_b[None, :])
-    z_min = np.maximum(z_min_a[:, None], z_min_b[None, :])
-    z_max = np.minimum(z_max_a[:, None], z_max_b[None, :])
-
-    dx = np.clip(x_max - x_min, 0.0, None)
-    dy = np.clip(y_max - y_min, 0.0, None)
-    dz = np.clip(z_max - z_min, 0.0, None)
-    return (dx * dy * dz).astype(np.float32, copy=False)
+    half = boxes_a.shape[1] // 2
+    mins_a = boxes_a[:, :half]
+    maxs_a = boxes_a[:, half:]
+    mins_b = boxes_b[:, :half]
+    maxs_b = boxes_b[:, half:]
+    inter_mins = torch.maximum(mins_a[:, None, :], mins_b[None, :, :])
+    inter_maxs = torch.minimum(maxs_a[:, None, :], maxs_b[None, :, :])
+    extents = torch.clamp(inter_maxs - inter_mins, min=0.0)
+    return extents.prod(dim=2).to(dtype=torch.float32)
 
 
-def box_areas_torch(
+def box_areas_nd_torch(
     boxes: torch.Tensor, spacing: SpacingLike = None
 ) -> torch.Tensor:
-    if boxes.ndim != 2 or boxes.shape[1] != 6:
-        raise ValueError(f"boxes must have shape (N, 6); got {boxes.shape}")
+    """Per-box volumes for ``(N, 2 * d)`` axis-aligned boxes in array axis order."""
+    if boxes.ndim != 2 or boxes.shape[1] % 2:
+        raise ValueError(
+            f"boxes must have shape (N, 2 * d) with even width; got {boxes.shape}"
+        )
     if boxes.shape[0] == 0:
         return torch.empty(0, dtype=torch.float32, device=boxes.device)
-    extents = torch.clamp(boxes[:, 3:6] - boxes[:, 0:3], min=0.0).to(torch.float32)
+    half = boxes.shape[1] // 2
+    extents = torch.clamp(boxes[:, half:] - boxes[:, :half], min=0.0).to(
+        torch.float32
+    )
     sp = abs_spacing(spacing)
     if sp is not None:
         scale = convert_array_like(
@@ -137,29 +129,6 @@ def box_areas_torch(
         ).to(dtype=extents.dtype)
         extents = extents * scale.unsqueeze(0)
     return extents.prod(dim=1)
-
-
-def box_intersection_torch(
-    boxes_a: torch.Tensor, boxes_b: torch.Tensor
-) -> torch.Tensor:
-    n_a, n_b = boxes_a.shape[0], boxes_b.shape[0]
-    if n_a == 0 or n_b == 0:
-        return torch.empty((n_a, n_b), dtype=torch.float32, device=boxes_a.device)
-
-    x_min_a, y_min_a, z_min_a, x_max_a, y_max_a, z_max_a = boxes_a.T
-    x_min_b, y_min_b, z_min_b, x_max_b, y_max_b, z_max_b = boxes_b.T
-
-    x_min = torch.maximum(x_min_a[:, None], x_min_b[None, :])
-    x_max = torch.minimum(x_max_a[:, None], x_max_b[None, :])
-    y_min = torch.maximum(y_min_a[:, None], y_min_b[None, :])
-    y_max = torch.minimum(y_max_a[:, None], y_max_b[None, :])
-    z_min = torch.maximum(z_min_a[:, None], z_min_b[None, :])
-    z_max = torch.minimum(z_max_a[:, None], z_max_b[None, :])
-
-    inter = torch.clamp(x_max - x_min, min=0.0)
-    inter = inter * torch.clamp(y_max - y_min, min=0.0)
-    inter = inter * torch.clamp(z_max - z_min, min=0.0)
-    return inter.to(dtype=torch.float32)
 
 
 def mask_areas_numpy(
@@ -283,11 +252,11 @@ def mask_intersection_torch(
 
 
 def _boxes_from_masks_numpy(masks: np.ndarray) -> np.ndarray:
-    """Axis-aligned boxes ``(N, 6)`` from a boolean mask stack."""
+    """Axis-aligned boxes ``(N, 2 * d)`` from a boolean mask stack."""
+    spatial_ndim = masks.ndim - 1
     n = masks.shape[0]
     if n == 0:
-        return np.empty((0, 6), dtype=np.float32)
-    spatial_ndim = masks.ndim - 1
+        return np.empty((0, 2 * spatial_ndim), dtype=np.float32)
     boxes = np.zeros((n, 2 * spatial_ndim), dtype=np.float32)
     for index in range(n):
         coords = np.argwhere(masks[index])
@@ -297,14 +266,13 @@ def _boxes_from_masks_numpy(masks: np.ndarray) -> np.ndarray:
         maxs = coords.max(axis=0) + 1
         boxes[index, :spatial_ndim] = mins
         boxes[index, spatial_ndim:] = maxs
-    if spatial_ndim == 2:
-        z_pad = np.zeros((n, 1), dtype=np.float32)
-        ones = np.ones((n, 1), dtype=np.float32)
-        boxes = np.concatenate(
-            [boxes[:, 1:2], boxes[:, 0:1], z_pad, boxes[:, 3:4], boxes[:, 2:3], ones],
-            axis=1,
-        )
     return boxes
+
+
+def _positive_label_ids(labels: np.ndarray) -> np.ndarray:
+    """Sorted positive label ids in ``np.unique`` order."""
+    ids = np.unique(np.asarray(labels))
+    return ids[ids > 0].astype(np.int64, copy=False)
 
 
 def label_areas(
@@ -657,27 +625,36 @@ def region_map_from_dataframe(
     *,
     object_id_col: str = "object_id",
     label_col: str = "label",
-    bbox_cols: Sequence[str] = _DEFAULT_BBOX_COLS,
+    bbox_cols: Optional[Sequence[str]] = None,
+    axes: Optional[Sequence[str]] = None,
 ) -> dict[str, RegionSpec]:
     """Build a RegionMap from a RegionAnalyzer table.
 
-    Expects columns ``object_id``, ``label``, and optionally the six bbox
-    columns ``bbox-start-{x,y,z}`` / ``bbox-end-{x,y,z}``. Row order becomes
-    matrix row/column order when ``annotate=True`` and no custom annotations
-    are passed.
+    Expects columns ``object_id``, ``label``, and optional bbox columns from
+    :func:`~vistiq.segment.analysis.bbox_array_from_dataframe`. Pass *axes*
+    (e.g. ``metadata["axes"]``) to order mapped ``bbox-start-{axis}`` /
+    ``bbox-end-{axis}`` columns.
 
-    After RegionFilter, call ``reset_index()`` so ``object_id`` is a column
-    rather than the index.
+    Row order becomes matrix row/column order when ``annotate=True`` and no
+    custom annotations are passed.
+
+    After RegionFilter, pass the table directly — when the index is named
+    ``label`` or ``object_id``, it is promoted to a column automatically.
 
     Args:
         df: Region property table (e.g. ``l_accepted.reset_index()``).
         object_id_col: Column holding unique object identifiers.
         label_col: Column holding integer label ids in the label volume.
-        bbox_cols: Bbox column names; omitted bboxes are stored as ``None``.
+        bbox_cols: Explicit bbox column names; overrides *axes* when set.
+        axes: Array axis names (e.g. ``["Z", "Y", "X"]`` from image metadata).
 
     Returns:
         Mapping from ``object_id`` to RegionSpec.
     """
+    index_name = df.index.name
+    if index_name is not None and index_name in {label_col, object_id_col}:
+        df = df.reset_index()
+
     if object_id_col not in df.columns:
         raise KeyError(
             f"column {object_id_col!r} not found; available: {list(df.columns)}"
@@ -686,17 +663,23 @@ def region_map_from_dataframe(
         raise KeyError(
             f"column {label_col!r} not found; available: {list(df.columns)}"
         )
-    has_bbox = all(col in df.columns for col in bbox_cols)
+
+    object_ids = dataframe_to_numpy(df, attributes=[object_id_col], reset_index=False)
+    label_ids = dataframe_to_numpy(df, attributes=[label_col], reset_index=False)
+    bboxes_arr = bbox_array_from_dataframe(
+        df, bbox_cols=bbox_cols, axes=axes, reset_index=False
+    )
+
     region_map: dict[str, RegionSpec] = {}
-    for _, row in df.iterrows():
-        object_id = str(row[object_id_col])
+    for i, object_id in enumerate(object_ids):
+        object_id = str(object_id)
         if object_id in region_map:
             raise ValueError(f"duplicate object_id {object_id!r} in dataframe")
-        bbox: Optional[Box6] = None
-        if has_bbox:
-            bbox = tuple(float(row[col]) for col in bbox_cols)  # type: ignore[assignment]
+        bbox: Optional[tuple[float, ...]] = None
+        if bboxes_arr is not None:
+            bbox = tuple(float(v) for v in bboxes_arr[i])  # type: ignore[assignment]
         region_map[object_id] = RegionSpec(
-            label_id=int(row[label_col]),
+            label_id=int(label_ids[i]),
             bbox=bbox,
         )
     return region_map
@@ -725,23 +708,14 @@ def _discover_label_boxes(labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     ).run(labels)
     if len(table) == 0:
         return np.array([], dtype=np.int64), np.empty((0, 2 * ndim), dtype=np.float32)
-    if "label" in table.columns:
-        label_ids = table["label"].astype(np.int64, copy=False).to_numpy()
-    elif table.index.name == "label":
-        label_ids = table.index.astype(np.int64, copy=False).to_numpy()
-    else:
-        raise ValueError(
-            "RegionAnalyzer table must have a 'label' column or index named 'label'"
-        )
-    bbox_cols = [f"bbox-{i}" for i in range(2 * ndim)]
-    missing = [col for col in bbox_cols if col not in table.columns]
-    if missing:
+    label_ids = dataframe_to_numpy(table, attributes=["label"])
+    boxes = bbox_array_from_dataframe(table)
+    if boxes is None:
         raise KeyError(
-            f"RegionAnalyzer table is missing bbox columns {missing}; "
+            "RegionAnalyzer table has no bbox columns; "
             f"available: {list(table.columns)}"
         )
-    boxes = table[bbox_cols].to_numpy(dtype=np.float32, copy=False)
-    return label_ids, boxes
+    return label_ids.astype(np.int64, copy=False), boxes.astype(np.float32, copy=False)
 
 
 def _select_label_boxes(
@@ -805,7 +779,7 @@ class BoxBuilderConfig(MatrixBuilderConfig):
 
 
 class BoxBuilder(MatrixBuilder):
-    """Validate and convert box arrays ``(N, 6)``."""
+    """Validate and convert box arrays ``(N, 2 * d)`` in array axis order."""
 
     def __init__(self, config: BoxBuilderConfig):
         super().__init__(config)
@@ -833,8 +807,11 @@ class BoxBuilder(MatrixBuilder):
                 )
             boxes = np.asarray(data)
         boxes = convert_array_like(boxes, dtype=dtype, device=device)
-        if boxes.ndim != 2 or boxes.shape[1] != 6:
-            raise ValueError(f"boxes must have shape (N, 6); got {getattr(boxes, 'shape', None)}")
+        if boxes.ndim != 2 or boxes.shape[1] % 2:
+            raise ValueError(
+                "boxes must have shape (N, 2 * d) with even width; "
+                f"got {getattr(boxes, 'shape', None)}"
+            )
         return boxes
 
 
@@ -917,8 +894,6 @@ class LabelBuilder(MatrixBuilder):
                 label_ids=ctx.label_ids,
                 boxes=_select_label_boxes(labels, ctx.label_ids, ctx.boxes),
             )
-        from vistiq.analysis.coincidence import _positive_label_ids
-
         label_ids = tuple(_positive_label_ids(labels))
         return LabelBuild(
             labels=labels,
@@ -983,8 +958,8 @@ class BoxAreaCalculator(AreaCalculator):
         dtype = self.config.preferred_input_type
         boxes = convert_array_like(built, dtype=dtype, device=device)
         if isinstance(boxes, torch.Tensor):
-            return box_areas_torch(boxes, spacing)
-        return box_areas_numpy(np.asarray(boxes), spacing)
+            return box_areas_nd_torch(boxes, spacing)
+        return box_areas_nd(np.asarray(boxes), spacing)
 
 
 class MaskAreaCalculatorConfig(AreaCalculatorConfig):
@@ -1109,11 +1084,11 @@ class BoxIntersectionCalculator(IntersectionCalculator):
         boxes_a = convert_array_like(built_a, dtype=dtype, device=device)
         boxes_b = convert_array_like(built_b, dtype=dtype, device=device)
         if isinstance(boxes_a, torch.Tensor):
-            inter = box_intersection_torch(boxes_a, boxes_b)
+            inter = box_intersection_nd_torch(boxes_a, boxes_b)
             if spacing is not None:
                 inter = inter * voxel_size(spacing)
             return inter
-        inter = box_intersection_numpy(np.asarray(boxes_a), np.asarray(boxes_b))
+        inter = box_intersection_nd(np.asarray(boxes_a), np.asarray(boxes_b))
         if spacing is not None:
             inter = inter * voxel_size(spacing)
         return inter
@@ -1192,7 +1167,7 @@ class MaskIntersectionCalculator(IntersectionCalculator):
             empty = np.empty((n_a, n_b), dtype=np.float32)
             return convert_array_like(empty, dtype=dtype, device=device)
 
-        bbox_inter = box_intersection_numpy(boxes_a, boxes_b)
+        bbox_inter = box_intersection_nd(boxes_a, boxes_b)
         candidates = np.argwhere(bbox_inter > 0)
         n_pairs = n_a * n_b
         if len(candidates) >= self.config.dense_pair_fraction * n_pairs:
@@ -1522,10 +1497,10 @@ class OverlapCalculatorConfig(Configuration):
 
 
 class BoxOverlapCalculatorConfig(OverlapCalculatorConfig):
-    """Preset for axis-aligned box batches ``(N, 6)`` or ``region_map`` only.
+    """Preset for axis-aligned box batches ``(N, 2 * d)`` or ``region_map`` only.
 
-    Pass ``(N, 6)`` arrays to ``run``, or supply ``region_map`` with ``bbox`` on
-    every RegionSpec and omit raw box arrays.
+    Pass ``(N, 2 * d)`` arrays to ``run`` (min/max pairs in array axis order), or
+    supply ``region_map`` with ``bbox`` on every RegionSpec and omit raw box arrays.
     """
 
     builder: BoxBuilderConfig = Field(default_factory=BoxBuilderConfig)
@@ -1626,6 +1601,7 @@ class OverlapCalculator(Configurable[OverlapCalculatorConfig]):
             return matrix
         return matrix
 
+    @task(name="OverlapCalculator.format", task_run_name=generate_name)
     def format(
         self,
         result: OverlapResult,
@@ -1657,6 +1633,15 @@ class OverlapCalculator(Configurable[OverlapCalculatorConfig]):
             for name, matrix in result.metrics.items()
         }
 
+    @task(name="OverlapCalculator.matrix", task_run_name=generate_name)
+    def matrix(
+        self,
+        result: OverlapResult,
+        metric: Optional[str] = None,
+    ) -> np.ndarray:
+        """Return the raw metric matrix as ``float64`` numpy for matrix filters."""
+        return np.asarray(result.metric(metric), dtype=np.float64)
+
     @task(name="OverlapCalculator.run", task_run_name=generate_name)
     def run(
         self,
@@ -1671,7 +1656,7 @@ class OverlapCalculator(Configurable[OverlapCalculatorConfig]):
         """Compute overlap metric(s) between two collections.
 
         Args:
-            a: First collection (boxes ``(N, 6)``, masks ``(N, *spatial)``, or
+            a: First collection (boxes ``(N, 2 * d)``, masks ``(N, *spatial)``, or
                 label volume for label overlap).
             b: Second collection, same representation as ``a``.
             region_map: Pair of maps keyed by ``object_id``. Defines which
@@ -1693,6 +1678,7 @@ class OverlapCalculator(Configurable[OverlapCalculatorConfig]):
             when ``return_components=True``. Use ``format`` to apply
             ``output_type`` and ``annotate``.
         """
+        logger.info(f"Running OverlapCalculator with config: {self.config}")
         is_label_builder = isinstance(self.config.builder, LabelBuilderConfig)
         is_box_builder = isinstance(self.config.builder, BoxBuilderConfig)
 

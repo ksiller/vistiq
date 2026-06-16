@@ -9,6 +9,7 @@ from vistiq.core import ArrayIteratorConfig
 from vistiq.preprocess import DoG, DoGConfig
 from vistiq.segment import MicroSAMSegmenter, MicroSAMSegmenterConfig, RegionFilter, RegionFilterConfig, RangeFilter, RangeFilterConfig
 from vistiq.analysis import CoincidenceDetector, CoincidenceDetectorConfig
+from vistiq.analysis.overlap import DiceMetricsCalculatorConfig, IoUMetricsCalculatorConfig
 from vistiq.utils import load_image, get_scenes
 from bioio_ome_tiff.writers import OmeTiffWriter
 
@@ -138,8 +139,12 @@ def coincidence(input_path, sigma_low, sigma_high, normalize, area_lower, area_u
         filters=[RangeFilterConfig(attribute="area", range=(area_lower, area_upper))]
     )
     volume_it_cfg = ArrayIteratorConfig(slice_def=(-3, -2, -1))
+    metric_by_name = {
+        "iou": IoUMetricsCalculatorConfig(),
+        "dice": DiceMetricsCalculatorConfig(),
+    }
     coincidence_config = CoincidenceDetectorConfig(
-        method=method,
+        method=metric_by_name[method],
         mode=mode,
         iterator_config=volume_it_cfg,
         threshold=threshold

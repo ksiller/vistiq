@@ -4,7 +4,6 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from vistiq.analysis.coincidence import box_iou_batch_3d, mask_iou_batch_3d
 from vistiq.analysis.overlap import (
     BoxAreaCalculatorConfig,
     BoxBuilderConfig,
@@ -21,12 +20,16 @@ from vistiq.analysis.overlap import (
     OverlapCalculator,
     RegionSpec,
     resolve_intersection_mode,
+    box_intersection_nd,
     label_areas,
     label_intersection_linear,
     label_intersection_sparse,
+    mask_areas_numpy,
+    mask_intersection_numpy_split,
     metrics_calculator_configs,
     region_map_from_dataframe,
     union_matrix,
+    _box_volumes,
 )
 from vistiq.analysis.overlap import IoUMetricsCalculator
 from vistiq.constant.matrix import UPPER
@@ -42,6 +45,56 @@ def _boxes_pair() -> tuple[np.ndarray, np.ndarray]:
         dtype=np.float32,
     )
     return boxes_a, boxes_b
+
+
+def _reference_box_overlap(
+    boxes_a: np.ndarray,
+    boxes_b: np.ndarray,
+    overlap_metric: str = "iou",
+) -> np.ndarray:
+    inter = box_intersection_nd(boxes_a, boxes_b)
+    area_a = _box_volumes(boxes_a)
+    area_b = _box_volumes(boxes_b)
+    metric = overlap_metric.lower()
+    if metric == "iou":
+        numer = inter
+        denom = area_a[:, None] + area_b[None, :] - inter
+    elif metric == "ios":
+        numer = inter
+        denom = np.minimum(area_a[:, None], area_b[None, :])
+    elif metric == "dice":
+        numer = 2 * inter
+        denom = area_a[:, None] + area_b[None, :]
+    else:
+        raise ValueError(f"unsupported metric {overlap_metric!r}")
+    out = np.zeros_like(inter, dtype=np.float32)
+    np.divide(numer, denom, out=out, where=denom > 0)
+    return out
+
+
+def _reference_mask_overlap(
+    masks_a: np.ndarray,
+    masks_b: np.ndarray,
+    overlap_metric: str = "iou",
+) -> np.ndarray:
+    inter = mask_intersection_numpy_split(masks_a, masks_b)
+    area_a = mask_areas_numpy(masks_a)
+    area_b = mask_areas_numpy(masks_b)
+    metric = overlap_metric.lower()
+    if metric == "iou":
+        numer = inter
+        denom = area_a[:, None] + area_b[None, :] - inter
+    elif metric == "ios":
+        numer = inter
+        denom = np.minimum(area_a[:, None], area_b[None, :])
+    elif metric == "dice":
+        numer = 2 * inter
+        denom = area_a[:, None] + area_b[None, :]
+    else:
+        raise ValueError(f"unsupported metric {overlap_metric!r}")
+    out = np.zeros_like(inter, dtype=np.float32)
+    np.divide(numer, denom, out=out, where=denom > 0)
+    return out
 
 
 def _mask_pair() -> tuple[np.ndarray, np.ndarray]:
@@ -112,7 +165,7 @@ def _reference_label_intersection(
 class TestOverlapCalculatorBoxes:
     def test_box_iou_matches_coincidence(self):
         boxes_a, boxes_b = _boxes_pair()
-        expected = box_iou_batch_3d(boxes_a, boxes_b, overlap_metric="iou")
+        expected = _reference_box_overlap(boxes_a, boxes_b, overlap_metric="iou")
         calc = OverlapCalculator(BoxOverlapCalculatorConfig())
         result = calc.run(boxes_a, boxes_b)
         np.testing.assert_allclose(calc.format(result), expected, rtol=1e-5, atol=1e-5)
@@ -134,9 +187,9 @@ class TestOverlapCalculatorBoxes:
 
 
 class TestOverlapCalculatorMasks:
-    def test_mask_iou_matches_coincidence(self):
+    def test_mask_iou_matches_reference(self):
         masks_a, masks_b = _mask_pair()
-        expected = mask_iou_batch_3d(masks_a, masks_b, overlap_metric="iou")
+        expected = _reference_mask_overlap(masks_a, masks_b, overlap_metric="iou")
         calc = OverlapCalculator(MaskOverlapCalculatorConfig())
         result = calc.run(masks_a, masks_b)
         np.testing.assert_allclose(calc.format(result), expected, rtol=1e-5, atol=1e-5)
@@ -343,14 +396,14 @@ class TestOverlapCalculatorExtras:
     def test_torch_backend_default(self):
         pytest.importorskip("torch")
         boxes_a, boxes_b = _boxes_pair()
-        expected = box_iou_batch_3d(boxes_a, boxes_b, overlap_metric="iou")
+        expected = _reference_box_overlap(boxes_a, boxes_b, overlap_metric="iou")
         calc = OverlapCalculator(BoxOverlapCalculatorConfig())
         result = calc.run(boxes_a, boxes_b)
         np.testing.assert_allclose(calc.format(result), expected, rtol=1e-5, atol=1e-5)
 
     def test_numpy_backend_requires_child_reconfiguration(self):
         boxes_a, boxes_b = _boxes_pair()
-        expected = box_iou_batch_3d(boxes_a, boxes_b, overlap_metric="iou")
+        expected = _reference_box_overlap(boxes_a, boxes_b, overlap_metric="iou")
         numpy_backend = {"preferred_input_type": "numpy"}
         calc = OverlapCalculator(
             BoxOverlapCalculatorConfig(
@@ -387,7 +440,7 @@ class TestRegionMap:
     def test_box_region_map_auto_annotations(self):
         map_a, map_b = self._box_region_maps()
         boxes_a, boxes_b = _boxes_pair()
-        expected = box_iou_batch_3d(boxes_a, boxes_b, overlap_metric="iou")
+        expected = _reference_box_overlap(boxes_a, boxes_b, overlap_metric="iou")
         calc = OverlapCalculator(
             BoxOverlapCalculatorConfig(
                 output_type="dataframe",
@@ -478,6 +531,114 @@ class TestRegionMap:
         assert tuple(region_map.keys()) == ("obj-1", "obj-2")
         assert region_map["obj-1"].label_id == 1
         assert region_map["obj-1"].bbox == (0.0, 0.0, 0.0, 4.0, 4.0, 4.0)
+
+    def test_region_map_from_dataframe_axis_named_bbox_cols(self):
+        df = pd.DataFrame(
+            {
+                "object_id": ["obj-1"],
+                "label": [1],
+                "bbox-start-z": [0.0],
+                "bbox-start-y": [1.0],
+                "bbox-start-x": [2.0],
+                "bbox-end-z": [3.0],
+                "bbox-end-y": [4.0],
+                "bbox-end-x": [5.0],
+            }
+        )
+        region_map = region_map_from_dataframe(df)
+        assert region_map["obj-1"].bbox == (0.0, 1.0, 2.0, 3.0, 4.0, 5.0)
+
+    def test_region_map_from_dataframe_axes_reorders_bbox_cols(self):
+        df = pd.DataFrame(
+            {
+                "object_id": ["obj-1"],
+                "label": [1],
+                "bbox-start-x": [2.0],
+                "bbox-end-X": [5.0],
+                "bbox-start-Z": [0.0],
+                "bbox-end-z": [3.0],
+                "bbox-start-y": [1.0],
+                "bbox-end-y": [4.0],
+            }
+        )
+        region_map = region_map_from_dataframe(df, axes=["Z", "Y", "X"])
+        assert region_map["obj-1"].bbox == (0.0, 1.0, 2.0, 3.0, 4.0, 5.0)
+
+    def test_region_map_from_dataframe_2d_bbox_cols(self):
+        df = pd.DataFrame(
+            {
+                "object_id": ["obj-1"],
+                "label": [1],
+                "bbox-start-y": [1.0],
+                "bbox-start-x": [2.0],
+                "bbox-end-y": [4.0],
+                "bbox-end-x": [5.0],
+            }
+        )
+        region_map = region_map_from_dataframe(df, axes=["Y", "X"])
+        assert region_map["obj-1"].bbox == (1.0, 2.0, 4.0, 5.0)
+
+    def test_region_map_from_dataframe_single_axis_bbox(self):
+        df = pd.DataFrame(
+            {
+                "object_id": ["obj-1"],
+                "label": [1],
+                "bbox-start-x": [2.0],
+                "bbox-end-x": [5.0],
+            }
+        )
+        region_map = region_map_from_dataframe(df)
+        assert region_map["obj-1"].bbox == (2.0, 5.0)
+
+    def test_region_map_from_dataframe_label_in_index(self):
+        df = pd.DataFrame(
+            {
+                "object_id": ["obj-1", "obj-2"],
+                "bbox-start-z": [0.0, 10.0],
+                "bbox-start-y": [0.0, 10.0],
+                "bbox-start-x": [0.0, 10.0],
+                "bbox-end-z": [4.0, 14.0],
+                "bbox-end-y": [4.0, 14.0],
+                "bbox-end-x": [4.0, 14.0],
+            },
+            index=pd.Index([1, 2], name="label"),
+        )
+        region_map = region_map_from_dataframe(df, axes=["Z", "Y", "X"])
+        assert region_map["obj-1"].label_id == 1
+        assert region_map["obj-2"].label_id == 2
+
+    def test_region_map_from_dataframe_named_range_index(self):
+        df = pd.DataFrame(
+            {
+                "object_id": ["obj-1", "obj-2"],
+                "bbox-start-z": [0.0, 10.0],
+                "bbox-start-y": [0.0, 10.0],
+                "bbox-start-x": [0.0, 10.0],
+                "bbox-end-z": [4.0, 14.0],
+                "bbox-end-y": [4.0, 14.0],
+                "bbox-end-x": [4.0, 14.0],
+            },
+            index=pd.RangeIndex(start=1, stop=3, name="label"),
+        )
+        region_map = region_map_from_dataframe(df, axes=["Z", "Y", "X"])
+        assert region_map["obj-1"].label_id == 1
+        assert region_map["obj-2"].label_id == 2
+
+    def test_region_map_from_dataframe_unmapped_bbox_cols(self):
+        df = pd.DataFrame(
+            {
+                "object_id": ["obj-1"],
+                "label": [1],
+                "bbox-0": [0.0],
+                "bbox-1": [1.0],
+                "bbox-2": [2.0],
+                "bbox-3": [3.0],
+                "bbox-4": [4.0],
+                "bbox-5": [5.0],
+            }
+        )
+        region_map = region_map_from_dataframe(df)
+        assert region_map["obj-1"].bbox == (0.0, 1.0, 2.0, 3.0, 4.0, 5.0)
 
 
 class TestLabelOverlapPrimitives:

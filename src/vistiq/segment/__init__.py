@@ -23,6 +23,7 @@ from vistiq.segment.postprocess import (
 from vistiq.segment.analysis import (
     RegionAnalyzer,
     RegionAnalyzerConfig,
+    bbox_array_from_dataframe,
     dataframe_to_numpy,
     region_column_names,
     region_to_numpy,
@@ -140,6 +141,7 @@ __all__ = [
     "TopKFilter",
     "TopKFilterConfig",
     "dataframe_to_numpy",
+    "bbox_array_from_dataframe",
     "DIAGONAL",
     "FULL",
     "LOWER",

@@ -332,6 +332,7 @@ class TestRegionAnalyzerConfig:
         """Test default RegionAnalyzerConfig."""
         config = RegionAnalyzerConfig()
         assert config.output_type in ["list", "dataframe"]
+        assert config.index_on == "label"
         assert isinstance(config.properties, list)
         for name in RegionAnalyzer.mandatory_properties:
             assert name in config.properties
@@ -395,6 +396,42 @@ class TestRegionAnalyzer:
         result = analyzer._process_slice(sample_labels_2d)
         assert isinstance(result, list)
         assert len(result) > 0
+
+    def test_assign_channel_names_from_metadata(self, sample_labels_3d):
+        import pandas as pd
+
+        config = RegionAnalyzerConfig(
+            output_type="dataframe",
+            properties=["label", "bbox"],
+            iterator_config=ArrayIteratorConfig(slice_def=()),
+        )
+        result = RegionAnalyzer(config)._process_slice(
+            sample_labels_3d,
+            metadata={"channel_names": ["Scrib"]},
+        )
+        assert isinstance(result, pd.DataFrame)
+        assert "channel" in result.columns
+        assert result["channel"].tolist() == ["Scrib"] * len(result)
+
+    def test_assign_channel_names_skips_when_missing(self, sample_labels_3d):
+        import pandas as pd
+
+        config = RegionAnalyzerConfig(
+            output_type="dataframe",
+            properties=["label", "bbox"],
+            iterator_config=ArrayIteratorConfig(slice_def=()),
+        )
+        result = RegionAnalyzer(config)._process_slice(
+            sample_labels_3d,
+            metadata=None,
+        )
+        assert isinstance(result, pd.DataFrame)
+        assert "channel" not in result.columns
+
+    def test_channel_names_string_accepts_scalar(self):
+        assert RegionAnalyzer._channel_names_string("Scrib") == "Scrib"
+        assert RegionAnalyzer._channel_names_string(["Scrib", "EdU"]) == "Scrib,EdU"
+        assert RegionAnalyzer._channel_names_string(None) is None
 
     def test_area_relabeled_as_volume_for_3d(self, sample_labels_3d):
         """regionprops area on 3D label slices is exposed as volume."""
@@ -487,12 +524,29 @@ class TestRegionAnalyzer:
         # regionprops_table returns a dict-like object that can be converted to DataFrame
         assert isinstance(result, (dict, pd.DataFrame)) or hasattr(result, 'keys')
         if isinstance(result, pd.DataFrame):
+            assert result.index.name == "label"
+            assert "label" not in result.columns
             assert "object_id" in result.columns
             assert "slice_id" in result.columns
             assert "stack_id" in result.columns
             assert len(result["object_id"].unique()) == len(result)
             assert len(result["slice_id"].unique()) == 1
             assert len(result["stack_id"].unique()) == 1
+
+    def test_process_slice_dataframe_index_on_object_id(self, sample_labels_2d):
+        """DataFrame output can be indexed by object_id instead of label."""
+        import pandas as pd
+
+        config = RegionAnalyzerConfig(
+            output_type="dataframe",
+            index_on="object_id",
+        )
+        result = RegionAnalyzer(config)._process_slice(sample_labels_2d)
+        assert isinstance(result, pd.DataFrame)
+        assert result.index.name == "object_id"
+        assert "object_id" not in result.columns
+        assert "label" in result.columns
+        assert len(result.index.unique()) == len(result)
 
     def test_process_slice_dataframe_includes_slice_annotations(self, sample_labels_2d):
         """Slice annotation axis columns are replicated per region row."""

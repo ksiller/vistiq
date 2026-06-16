@@ -1,13 +1,45 @@
-"""Tests for coincidence / overlap utilities."""
+"""Tests for coincidence detection."""
 
 import numpy as np
 import pytest
 
-from vistiq.analysis.coincidence import labels_iou_batch_3d
+from vistiq.analysis.overlap import (
+    DiceMetricsCalculatorConfig,
+    IoUMetricsCalculatorConfig,
+    LabelAreaCalculatorConfig,
+    LabelBuilderConfig,
+    LabelIntersectionCalculatorConfig,
+    LabelOverlapCalculatorConfig,
+    OverlapCalculator,
+    metrics_calculator_configs,
+)
 
 
-def test_labels_iou_pruned_matches_dense():
-    """Bbox-pruned path should match dense mask batch on small 3D volumes."""
+def _label_overlap(
+    labels_a: np.ndarray,
+    labels_b: np.ndarray,
+    *,
+    intersection_mode: str = "auto",
+    preferred_input_type: str = "numpy",
+) -> np.ndarray:
+    backend = {"preferred_input_type": preferred_input_type}
+    calc = OverlapCalculator(
+        LabelOverlapCalculatorConfig(
+            builder=LabelBuilderConfig(**backend),
+            area_calculator=LabelAreaCalculatorConfig(**backend),
+            intersection_calculator=LabelIntersectionCalculatorConfig(
+                mode=intersection_mode,
+                **backend,
+            ),
+            metrics_calculators=metrics_calculator_configs(("iou",)),
+        )
+    )
+    result = calc.run(labels_a, labels_b)
+    return calc.format(result)
+
+
+def test_label_overlap_sparse_matches_linear():
+    """Sparse and linear label paths should agree on small 3D volumes."""
     labels = np.zeros((8, 16, 16), dtype=np.int32)
     labels[1:4, 2:6, 2:6] = 1
     labels[4:7, 10:14, 10:14] = 2
@@ -16,30 +48,26 @@ def test_labels_iou_pruned_matches_dense():
     other[2:5, 3:7, 3:7] = 1
     other[5:8, 11:15, 11:15] = 2
 
-    dense = labels_iou_batch_3d(labels, other, prune_bboxes=False)
-    pruned = labels_iou_batch_3d(
-        labels, other, prune_bboxes=True, dense_pair_fraction=1.0
-    )
-    np.testing.assert_allclose(dense, pruned, rtol=1e-5, atol=1e-5)
+    linear = _label_overlap(labels, other, intersection_mode="linear")
+    sparse = _label_overlap(labels, other, intersection_mode="sparse")
+    np.testing.assert_allclose(linear, sparse, rtol=1e-5, atol=1e-5)
 
 
-def test_labels_iou_bbox_prune_skips_disjoint():
-    """Disjoint regions should yield zero overlap without relying on dense masks."""
+def test_label_overlap_sparse_skips_disjoint():
+    """Disjoint regions should yield zero overlap."""
     labels = np.zeros((4, 8, 8), dtype=np.int32)
     labels[0:2, 0:2, 0:2] = 1
 
     other = np.zeros_like(labels)
     other[2:4, 6:8, 6:8] = 1
 
-    out = labels_iou_batch_3d(labels, other, prune_bboxes=True)
+    out = _label_overlap(labels, other, intersection_mode="sparse")
     assert out.shape == (1, 1)
     assert out[0, 0] == 0.0
 
 
-def test_labels_iou_torch_matches_cpu():
+def test_label_overlap_torch_matches_numpy():
     pytest.importorskip("torch")
-    from vistiq.analysis.coincidence import labels_iou_batch_3d_torch
-
     labels = np.zeros((8, 16, 16), dtype=np.int32)
     labels[1:4, 2:6, 2:6] = 1
     labels[4:7, 10:14, 10:14] = 2
@@ -48,11 +76,11 @@ def test_labels_iou_torch_matches_cpu():
     other[2:5, 3:7, 3:7] = 1
     other[5:8, 11:15, 11:15] = 2
 
-    cpu = labels_iou_batch_3d(labels, other, prune_bboxes=False)
-    torch_out = labels_iou_batch_3d_torch(
-        labels, other, prune_bboxes=False, device="cpu"
+    numpy_out = _label_overlap(labels, other, intersection_mode="linear")
+    torch_out = _label_overlap(
+        labels, other, intersection_mode="linear", preferred_input_type="torch.Tensor"
     )
-    np.testing.assert_allclose(cpu, torch_out, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(numpy_out, torch_out, rtol=1e-5, atol=1e-5)
 
 
 def test_coincidence_detector_process_slice_outline_iou():
@@ -66,8 +94,9 @@ def test_coincidence_detector_process_slice_outline_iou():
 
     det = CoincidenceDetector(
         CoincidenceDetectorConfig(
-            method="iou",
+            method=IoUMetricsCalculatorConfig(),
             mode="outline",
+            threshold=0.2,
             iterator_config=ArrayIteratorConfig(slice_def=()),
         )
     )
@@ -90,7 +119,7 @@ def test_coincidence_detector_accepts_list_stack_names():
 
     det = CoincidenceDetector(
         CoincidenceDetectorConfig(
-            method="iou",
+            method=IoUMetricsCalculatorConfig(),
             mode="outline",
             iterator_config=ArrayIteratorConfig(slice_def=()),
         )
@@ -112,7 +141,7 @@ def test_coincidence_detector_process_slice_bounding_box():
 
     det = CoincidenceDetector(
         CoincidenceDetectorConfig(
-            method="iou",
+            method=IoUMetricsCalculatorConfig(),
             mode="bounding_box",
             iterator_config=ArrayIteratorConfig(slice_def=()),
         )
@@ -133,7 +162,7 @@ def test_coincidence_detector_process_slice_outline_dice():
 
     det = CoincidenceDetector(
         CoincidenceDetectorConfig(
-            method="dice",
+            method=DiceMetricsCalculatorConfig(),
             mode="outline",
             iterator_config=ArrayIteratorConfig(slice_def=()),
         )

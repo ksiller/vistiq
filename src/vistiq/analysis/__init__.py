@@ -3,11 +3,6 @@ from vistiq.segment.analysis import RegionAnalyzer, RegionAnalyzerConfig
 from .coincidence import (
     CoincidenceDetector,
     CoincidenceDetectorConfig,
-    box_iou_batch_3d,
-    labels_iou_batch_3d,
-    labels_iou_batch_3d_torch,
-    mask_iou_batch_3d,
-    mask_iou_batch_3d_torch,
 )
 from .distance import (
     DistanceCalculator,
@@ -132,11 +127,6 @@ __all__ = [
     "region_map_from_dataframe",
     "RegionAnalyzer",
     "RegionAnalyzerConfig",
-    "box_iou_batch_3d",
-    "labels_iou_batch_3d",
-    "labels_iou_batch_3d_torch",
-    "mask_iou_batch_3d",
-    "mask_iou_batch_3d_torch",
     "GridDensityFeaturesConfig",
     "NeighborFeaturesConfig",
     "RegionDataFrameEnricher",
