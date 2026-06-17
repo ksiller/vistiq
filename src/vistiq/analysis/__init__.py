@@ -10,7 +10,12 @@ from .distance import (
     MatrixCalculator,
     MatrixCalculatorConfig,
 )
-from .matrix import MatrixAggregator, MatrixAggregatorConfig
+from .matrix import (
+    MatrixAggregator,
+    MatrixAggregatorConfig,
+    MatrixCombiner,
+    MatrixCombinerConfig,
+)
 from .overlap import (
     AreaCalculator,
     AreaCalculatorConfig,
@@ -80,6 +85,8 @@ __all__ = [
     "MatrixCalculatorConfig",
     "MatrixAggregator",
     "MatrixAggregatorConfig",
+    "MatrixCombiner",
+    "MatrixCombinerConfig",
     "AreaCalculator",
     "AreaCalculatorConfig",
     "BoxAreaCalculator",

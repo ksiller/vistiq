@@ -5,8 +5,13 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from vistiq.analysis.matrix import MatrixAggregator, MatrixAggregatorConfig
-from vistiq.constant.matrix import OFF_DIAGONAL
+from vistiq.analysis.matrix import (
+    MatrixAggregator,
+    MatrixAggregatorConfig,
+    MatrixCombiner,
+    MatrixCombinerConfig,
+)
+from vistiq.constant.matrix import FULL, OFF_DIAGONAL, UPPER
 
 
 class TestMatrixAggregator:
@@ -55,3 +60,41 @@ class TestMatrixAggregator:
         ).run(data)
         assert isinstance(result, np.ndarray)
         np.testing.assert_allclose(result, [4.0, 6.0])
+
+
+class TestMatrixCombiner:
+    def test_combine_blocks(self):
+        import pandas as pd
+
+        a = pd.DataFrame([[1.0, 2.0]], index=["x"], columns=["y", "z"])
+        b = pd.DataFrame([[3.0]], index=["y"], columns=["x"])
+        result = MatrixCombiner(
+            MatrixCombinerConfig(fill_value=0.0, symmetrize=False, triangle=FULL)
+        ).run([a, b])
+        assert result.loc["x", "y"] == 1.0
+        assert result.loc["y", "x"] == 3.0
+
+    def test_upper_triangle_mask(self):
+        import pandas as pd
+
+        a = pd.DataFrame([[1.0]], index=["x"], columns=["y"])
+        b = pd.DataFrame([[2.0]], index=["y"], columns=["x"])
+        result = MatrixCombiner(
+            MatrixCombinerConfig(
+                fill_value=0.0,
+                symmetrize=True,
+                triangle=UPPER,
+            )
+        ).run([a, b])
+        assert result.loc["x", "y"] == 2.0
+        assert result.loc["y", "x"] == 0.0
+        assert result.loc["x", "x"] == 0.0
+
+    def test_off_diagonal_excludes_self_pairs(self):
+        import pandas as pd
+
+        block = pd.DataFrame([[0.5]], index=["a"], columns=["a"])
+        result = MatrixCombiner(
+            MatrixCombinerConfig(fill_value=0.0, symmetrize=True, triangle=OFF_DIAGONAL)
+        ).run([block])
+        assert result.loc["a", "a"] == 0.0
