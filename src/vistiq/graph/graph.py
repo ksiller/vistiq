@@ -1,7 +1,7 @@
 """Build containment graphs from overlap weight matrices and region metrics.
 
 GraphBuilder turns a labeled overlap matrix plus region properties into a
-containment graph (directed or undirected). GraphSummary collects structural
+containment graph (directed or undirected). GraphQuery collects structural
 statistics from that graph into a plain dictionary.
 """
 
@@ -23,69 +23,6 @@ from vistiq.core import Configurable, Configuration, generate_name
 logger = logging.getLogger(__name__)
 
 ORPHAN_GROUP_UNKNOWN = "unknown"
-
-
-def parents_from_graph(graph, attr_key:str=None, attr_value:Any=None, index="object_id", include=[]):
-    """Get the parents of selected nodes in a graph.
-
-    Args:
-        graph: Networkx graph.
-        attr_key: Attribute key to filter nodes by.
-        attr_value: Attribute value to filter nodes by.
-        index: Index column name.
-        include: List of additional column names to include.
-
-    Returns:
-        DataFrame with the parents of the selected nodes.
-    """
-    if attr_key is not None and attr_value is not None:
-        nodes = [n for n, attr in graph.nodes(data=True) if attr.get(attr_key) == attr_value]
-    else:
-        nodes = [n for n, attr in graph.nodes(data=True)]
-    data = []
-    for node in nodes:
-        base_keys = list(set(["object_id"] + include))
-        parents = {k:graph.nodes[node].get(k) for k in base_keys}
-
-        ancestors = list(nx.ancestors(graph, node))
-        sorted_ancestors = sorted_ancestors = [n for n in nx.topological_sort(graph) if n in ancestors]
-        for ancestor in sorted_ancestors:
-            pkey = graph.nodes[ancestor].get(attr_key)
-            parents[f"parent {pkey}"] = int(graph.nodes[ancestor].get("label"))
-        data.append(parents)
-    return pd.DataFrame(data).set_index(index)
-
-
-def graph_count(graph, attr_key:str=None, attr_value:Any=None, index="object_id", include=[]):
-    """Count the number of counts for a given attribute in the descendants of selected nodes in a graph.
-
-    Args:
-        graph: Networkx graph.
-        attr_key: Attribute key to filter nodes by.
-        attr_value: Attribute value to filter nodes by.
-        index: Index column name.
-        include: List of additional column names to include.
-
-    Returns:
-        DataFrame with the count of the given attribute in the descendants of the selected nodes.
-    """
-    if attr_key is not None and attr_value is not None:
-        nodes = [n for n, attr in graph.nodes(data=True) if attr.get(attr_key) == attr_value]
-    else:
-        nodes = [n for n, attr in graph.nodes(data=True)]
-    data = []
-    for node in nodes:
-        base_keys = list(set(["object_id"] + include))
-        count = {k:graph.nodes[node].get(k) for k in base_keys}
-        for desc in nx.descendants(graph, node):
-            ch = graph.nodes[desc].get(attr_key, None)
-            key = f"count {ch}"
-            if key in count:
-                count[key]=count[key]+1
-            else:
-                count[key] = 1
-        data.append(count)
-    return pd.DataFrame(data).set_index(index)
 
 
 def _pairwise_weight(matrix: pd.DataFrame, left: Any, right: Any) -> float:
@@ -496,15 +433,16 @@ class NXGraphBuilder(GraphBuilder):
             graph.add_edge(node1, node2)
 
 
-class GraphSummary(Configurable["GraphSummaryConfig"]):
-    """Summarize a directed acyclic graph such as a containment DAG.
+class GraphQuery(Configurable["GraphQueryConfig"]):
+    """Query a directed graph such as a containment DAG.
 
-    Summary keys are registered in _ATTRIBUTE_METHODS and computed by
+    Query keys are registered in _ATTRIBUTE_METHODS and computed by
     matching _summary_* methods on concrete subclasses. Use
     allowed_attributes() to see every key that may be requested in config;
     default_attributes lists keys computed when config.attributes is left
-    empty. origin_attributes lists depth and descendant keys that require
-    run(node=...) when the graph has more than one root.
+    empty. origin_attributes lists depth, descendant, and origin-scoped
+    subgraph network metrics that require run(node=...) when the graph
+    has more than one root.
     """
 
     default_attributes: ClassVar[tuple[str, ...]] = (
@@ -521,11 +459,19 @@ class GraphSummary(Configurable["GraphSummaryConfig"]):
 
     origin_attributes: ClassVar[tuple[str, ...]] = (
         "origin",
-        "descendants",
-        "n_descendants",
         "max_depth",
         "mean_depth",
         "depths",
+        "subgraph_nodes",
+        "subgraph_n_nodes",
+        "subgraph_n_edges",
+        "subgraph_longest_path",
+        "subgraph_longest_path_length",
+        "subgraph_diameter",
+        "subgraph_average_shortest_path",
+        "subgraph_density",
+        "subgraph_average_degree",
+        "subgraph_global_efficiency",
     )
 
     _ATTRIBUTE_METHODS: ClassVar[dict[str, str]] = {
@@ -536,22 +482,32 @@ class GraphSummary(Configurable["GraphSummaryConfig"]):
         "origin": "_summary_origin",
         "roots": "_summary_roots",
         "leaves": "_summary_leaves",
-        "descendants": "_summary_descendants",
-        "n_descendants": "_summary_n_descendants",
         "max_depth": "_summary_max_depth",
         "mean_depth": "_summary_mean_depth",
         "depths": "_summary_depths",
+        "subgraph_nodes": "_summary_subgraph_nodes",
+        "subgraph_n_nodes": "_summary_subgraph_n_nodes",
+        "subgraph_n_edges": "_summary_subgraph_n_edges",
+        "subgraph_longest_path": "_summary_subgraph_longest_path",
+        "subgraph_longest_path_length": "_summary_subgraph_longest_path_length",
+        "subgraph_diameter": "_summary_subgraph_diameter",
+        "subgraph_average_shortest_path": "_summary_subgraph_average_shortest_path",
+        "subgraph_density": "_summary_subgraph_density",
+        "subgraph_average_degree": "_summary_subgraph_average_degree",
+        "subgraph_global_efficiency": "_summary_subgraph_global_efficiency",
         "parent_of": "_summary_parent_of",
         "children_of": "_summary_children_of",
         "node_attributes": "_summary_node_attributes",
         "edges": "_summary_edges",
         "node_labels": "_summary_node_labels",
-        "nodes_by_channel": "_summary_nodes_by_channel",
+        "nodes_by_attribute": "_summary_nodes_by_attribute",
+        "descendant_counts": "_descendant_counts",
+        "ancestor_lineage": "_ancestor_lineage",
     }
 
     @classmethod
     def allowed_attributes(cls) -> List[str]:
-        """Return summary keys that may be listed in GraphSummaryConfig.attributes."""
+        """Return summary keys that may be listed in GraphQueryConfig.attributes."""
         return list(cls._attribute_methods().keys())
 
     @classmethod
@@ -564,27 +520,75 @@ class GraphSummary(Configurable["GraphSummaryConfig"]):
         return {}
 
     @classmethod
-    def from_config(cls, config: "GraphSummaryConfig") -> "GraphSummary":
+    def from_config(cls, config: "GraphQueryConfig") -> "GraphQuery":
         return cls(config)
 
-    @task(name="GraphSummary.run", task_run_name=generate_name)
-    def run(self, graph: Any, *, node: Any = None) -> dict[str, Any]:
-        """Summarize graph and return a plain dictionary of graph statistics.
+    @task(name="GraphQuery.format", task_run_name=generate_name)
+    def format(
+        self,
+        output: list[dict[str, Any]] | dict[str, Any],
+        attribute: Optional[str] = None,
+    ) -> Any:
+        """Format query rows or one attribute from a :meth:`run` result.
+
+        Args:
+            output: Tabular query rows, or the dictionary returned by
+                :meth:`run` when ``attribute`` is set.
+            attribute: Name of the key to format from a :meth:`run` result
+                (for example ``"descendant_counts"``).
+        """
+        if attribute is not None:
+            if not isinstance(output, dict):
+                raise TypeError(
+                    "attribute requires output from GraphQuery.run (a dict)"
+                )
+            rows = output.get(attribute)
+            if rows is None:
+                if self.config.output_type == "dataframe":
+                    return pd.DataFrame()
+                return []
+            output = rows
+
+        if self.config.output_type == "dataframe":
+            rows = output if isinstance(output, list) else [output]
+            return self._to_dataframe(rows)
+        if isinstance(output, dict):
+            return output
+        return list(output)
+
+    def _to_dataframe(self, output: list[dict[str, Any]]) -> pd.DataFrame:
+        raise NotImplementedError("Subclasses must implement _to_dataframe")
+
+    @task(name="GraphQuery.run", task_run_name=generate_name)
+    def run(
+        self,
+        graph: Any,
+        *,
+        node: Any = None,
+        filter_value: Any = None,
+    ) -> dict[str, Any]:
+        """Query a graph and return a plain dictionary of results.
 
         Args:
             graph: Backend-specific graph (e.g. networkx DiGraph or Graph).
-            node: Origin for depth and descendant statistics. Required when
-                config.attributes includes any origin_attributes and the
-                graph has more than one root (in-degree zero). When omitted
-                and the graph has exactly one root, that root is used.
+            node: Origin that defines the subgraph for depth and network
+                statistics. Required when config.attributes includes any
+                origin_attributes and the graph has more than one root.
+            filter_value: Optional override for config.filter_value, useful
+                when calling :meth:`run` via ``run.map`` per channel.
 
         Returns:
             Dictionary whose keys are the configured attributes.
         """
-        logger.info(f"Summarizing graph with config: {self.config}")
+        query = self
+        if filter_value is not None:
+            query = self.__class__(
+                self.config.model_copy(update={"filter_value": filter_value})
+            )
+        logger.info(f"Summarizing graph with config: {query.config}")
         logger.info(f"Node: {node}")
-        attributes = self.config.attributes
-        return self._summarize(graph, node=node, attributes=attributes)
+        attributes = query.config.attributes
+        return query._summarize(graph, node=node, attributes=attributes)
 
     def _summarize(
         self,
@@ -620,12 +624,6 @@ class GraphSummary(Configurable["GraphSummaryConfig"]):
     def _summary_leaves(self, graph: Any, node: Any) -> list[Any]:
         raise NotImplementedError("Subclasses must implement _summary_leaves")
 
-    def _summary_descendants(self, graph: Any, node: Any) -> list[Any]:
-        raise NotImplementedError("Subclasses must implement _summary_descendants")
-
-    def _summary_n_descendants(self, graph: Any, node: Any) -> int:
-        raise NotImplementedError("Subclasses must implement _summary_n_descendants")
-
     def _summary_max_depth(self, graph: Any, node: Any) -> int:
         raise NotImplementedError("Subclasses must implement _summary_max_depth")
 
@@ -634,6 +632,50 @@ class GraphSummary(Configurable["GraphSummaryConfig"]):
 
     def _summary_depths(self, graph: Any, node: Any) -> dict[Any, int]:
         raise NotImplementedError("Subclasses must implement _summary_depths")
+
+    def _summary_subgraph_nodes(self, graph: Any, node: Any) -> list[Any]:
+        raise NotImplementedError("Subclasses must implement _summary_subgraph_nodes")
+
+    def _summary_subgraph_n_nodes(self, graph: Any, node: Any) -> int:
+        raise NotImplementedError("Subclasses must implement _summary_subgraph_n_nodes")
+
+    def _summary_subgraph_n_edges(self, graph: Any, node: Any) -> int:
+        raise NotImplementedError("Subclasses must implement _summary_subgraph_n_edges")
+
+    def _summary_subgraph_longest_path(self, graph: Any, node: Any) -> list[Any]:
+        raise NotImplementedError(
+            "Subclasses must implement _summary_subgraph_longest_path"
+        )
+
+    def _summary_subgraph_longest_path_length(self, graph: Any, node: Any) -> int:
+        raise NotImplementedError(
+            "Subclasses must implement _summary_subgraph_longest_path_length"
+        )
+
+    def _summary_subgraph_diameter(self, graph: Any, node: Any) -> int:
+        raise NotImplementedError(
+            "Subclasses must implement _summary_subgraph_diameter"
+        )
+
+    def _summary_subgraph_average_shortest_path(
+        self, graph: Any, node: Any
+    ) -> float:
+        raise NotImplementedError(
+            "Subclasses must implement _summary_subgraph_average_shortest_path"
+        )
+
+    def _summary_subgraph_density(self, graph: Any, node: Any) -> float:
+        raise NotImplementedError("Subclasses must implement _summary_subgraph_density")
+
+    def _summary_subgraph_average_degree(self, graph: Any, node: Any) -> float:
+        raise NotImplementedError(
+            "Subclasses must implement _summary_subgraph_average_degree"
+        )
+
+    def _summary_subgraph_global_efficiency(self, graph: Any, node: Any) -> float:
+        raise NotImplementedError(
+            "Subclasses must implement _summary_subgraph_global_efficiency"
+        )
 
     def _summary_parent_of(self, graph: Any, node: Any) -> dict[Any, Any | None]:
         raise NotImplementedError("Subclasses must implement _summary_parent_of")
@@ -650,48 +692,77 @@ class GraphSummary(Configurable["GraphSummaryConfig"]):
     def _summary_node_labels(self, graph: Any, node: Any) -> dict[Any, str]:
         raise NotImplementedError("Subclasses must implement _summary_node_labels")
 
-    def _summary_nodes_by_channel(self, graph: Any, node: Any) -> dict[str, int]:
-        raise NotImplementedError("Subclasses must implement _summary_nodes_by_channel")
+    def _summary_nodes_by_attribute(self, graph: Any, node: Any) -> dict[str, int]:
+        return self._nodes_by_attribute(graph, self.config.group_attribute)
+
+    def _nodes_by_attribute(self, graph: Any, attribute: str) -> dict[str, int]:
+        raise NotImplementedError("Subclasses must implement _nodes_by_attribute")
+
+    def _descendant_counts(
+        self, graph: Any, node: Any
+    ) -> list[dict[str, Any]]:
+        raise NotImplementedError("Subclasses must implement _descendant_counts")
+
+    def _ancestor_lineage(
+        self, graph: Any, node: Any
+    ) -> list[dict[str, Any]]:
+        raise NotImplementedError("Subclasses must implement _ancestor_lineage")
 
 
-class GraphSummaryConfig(Configuration):
-    """Configuration for GraphSummary.
+class GraphQueryConfig(Configuration):
+    """Configuration for GraphQuery.
 
     Attributes:
         label_attribute: Node attribute read when node_labels is requested.
             Set to None to skip label collection.
-        attributes: Summary keys to compute. Each name must appear in
-            GraphSummary.allowed_attributes(). When omitted, defaults to
-            GraphSummary.default_attributes.
+        group_attribute: Node attribute used when nodes_by_attribute is requested.
+        filter_attribute: Node attribute used to select seed nodes and to
+            classify descendants or ancestors in descendant_counts and
+            ancestor_lineage. Pair with filter_value for seed selection.
+        filter_value: Node attribute value used with filter_attribute.
+        include_attributes: Extra node attributes to include in each row of
+            descendant_counts and ancestor_lineage.
+        lineage_value_attribute: Node attribute stored in each lineage column
+            of ancestor_lineage (for example label).
+        attributes: Query keys to compute. Each name must appear in
+            GraphQuery.allowed_attributes(). When omitted, defaults to
+            GraphQuery.default_attributes.
     """
 
     label_attribute: Optional[str] = "object_name"
+    group_attribute: str = "channel"
+    filter_attribute: Optional[str] = None
+    filter_value: Any = None
+    include_attributes: List[str] = Field(default_factory=list)
+    lineage_value_attribute: str = "label"
     attributes: List[str] = Field(
-        default_factory=lambda: list(GraphSummary.default_attributes)
+        default_factory=lambda: list(GraphQuery.default_attributes)
     )
+    output_type: Literal["dataframe", "list"] = "list"
+    output_index: str = "object_id"
 
     @field_validator("attributes")
     @classmethod
     def validate_attributes(cls, value: List[str]) -> List[str]:
-        allowed = set(GraphSummary.allowed_attributes())
+        allowed = set(GraphQuery.allowed_attributes())
         invalid = [name for name in value if name not in allowed]
         if invalid:
             raise ValueError(
                 f"One or more invalid attributes: {invalid}. "
-                f"Use names from {GraphSummary.allowed_attributes()}."
+                f"Use names from {GraphQuery.allowed_attributes()}."
             )
         return list(dict.fromkeys(value))
 
 
-class NXGraphSummaryConfig(GraphSummaryConfig):
-    """Configuration for NXGraphSummary."""
+class NXGraphQueryConfig(GraphQueryConfig):
+    """Configuration for NXGraphQuery."""
 
 
-class NXGraphSummary(GraphSummary):
-    """GraphSummary implementation for networkx.DiGraph."""
+class NXGraphQuery(GraphQuery):
+    """GraphQuery implementation for networkx DiGraph and Graph."""
 
     @classmethod
-    def from_config(cls, config: NXGraphSummaryConfig) -> "NXGraphSummary":
+    def from_config(cls, config: NXGraphQueryConfig) -> "NXGraphQuery":
         return cls(config)
 
     @staticmethod
@@ -708,7 +779,7 @@ class NXGraphSummary(GraphSummary):
             if node not in graph:
                 raise KeyError(f"node {node!r} not found in graph")
             return node
-        roots = NXGraphSummary._roots(graph)
+        roots = NXGraphQuery._roots(graph)
         if len(roots) == 1:
             return roots[0]
         nodes = list(graph.nodes)
@@ -720,12 +791,49 @@ class NXGraphSummary(GraphSummary):
 
     @staticmethod
     def _depths(graph: Any, node: Any) -> dict[Any, int]:
-        import networkx as nx
-
-        origin = NXGraphSummary._resolve_origin(graph, node)
+        origin = NXGraphQuery._resolve_origin(graph, node)
         if origin is None:
             return {}
         return dict(nx.single_source_shortest_path_length(graph, origin))
+
+    @staticmethod
+    def _origin_subgraph(graph: Any, node: Any) -> Any:
+        origin = NXGraphQuery._resolve_origin(graph, node)
+        if origin is None:
+            return graph.subgraph([]).copy()
+        scope = {origin, *nx.descendants(graph, origin)}
+        return graph.subgraph(scope).copy()
+
+    @staticmethod
+    def _largest_connected_undirected(graph: Any) -> Any:
+        undirected = graph.to_undirected()
+        if undirected.number_of_nodes() == 0:
+            return undirected
+        largest = max(nx.connected_components(undirected), key=len)
+        return undirected.subgraph(largest).copy()
+
+    @staticmethod
+    def _subgraph_longest_path(subgraph: Any) -> list[Any]:
+        if subgraph.number_of_nodes() == 0:
+            return []
+        if isinstance(subgraph, nx.DiGraph) and nx.is_directed_acyclic_graph(
+            subgraph
+        ):
+            return list(nx.dag_longest_path(subgraph))
+        undirected = NXGraphQuery._largest_connected_undirected(subgraph)
+        if undirected.number_of_nodes() <= 1:
+            return list(undirected.nodes)
+        lengths = dict(nx.all_pairs_shortest_path_length(undirected))
+        best_path: list[Any] = []
+        best_length = -1
+        nodes = list(undirected.nodes)
+        for i, source in enumerate(nodes):
+            for target in nodes[i + 1 :]:
+                length = lengths[source][target]
+                if length > best_length:
+                    best_length = length
+                    best_path = nx.shortest_path(undirected, source, target)
+        return best_path
 
     def _summarize(
         self,
@@ -734,11 +842,10 @@ class NXGraphSummary(GraphSummary):
         node: Any,
         attributes: list[str],
     ) -> dict[str, Any]:
-        import networkx as nx
-
-        if not isinstance(graph, nx.DiGraph):
+        if not isinstance(graph, (nx.DiGraph, nx.Graph)):
             raise TypeError(
-                f"NXGraphSummary expects a networkx.DiGraph; got {type(graph).__name__}"
+                "NXGraphQuery expects a networkx DiGraph or Graph; "
+                f"got {type(graph).__name__}"
             )
         return super()._summarize(graph, node=node, attributes=attributes)
 
@@ -763,12 +870,6 @@ class NXGraphSummary(GraphSummary):
     def _summary_leaves(self, graph: Any, node: Any) -> list[Any]:
         return self._leaves(graph)
 
-    def _summary_descendants(self, graph: Any, node: Any) -> list[Any]:
-        return list(self._depths(graph, node).keys())
-
-    def _summary_n_descendants(self, graph: Any, node: Any) -> int:
-        return len(self._depths(graph, node))
-
     def _summary_max_depth(self, graph: Any, node: Any) -> int:
         values = list(self._depths(graph, node).values())
         return max(values) if values else 0
@@ -779,6 +880,57 @@ class NXGraphSummary(GraphSummary):
 
     def _summary_depths(self, graph: Any, node: Any) -> dict[Any, int]:
         return self._depths(graph, node)
+
+    def _summary_subgraph_nodes(self, graph: Any, node: Any) -> list[Any]:
+        return sorted(self._origin_subgraph(graph, node).nodes, key=str)
+
+    def _summary_subgraph_n_nodes(self, graph: Any, node: Any) -> int:
+        return self._origin_subgraph(graph, node).number_of_nodes()
+
+    def _summary_subgraph_n_edges(self, graph: Any, node: Any) -> int:
+        return self._origin_subgraph(graph, node).number_of_edges()
+
+    def _summary_subgraph_longest_path(self, graph: Any, node: Any) -> list[Any]:
+        return self._subgraph_longest_path(self._origin_subgraph(graph, node))
+
+    def _summary_subgraph_longest_path_length(self, graph: Any, node: Any) -> int:
+        path = self._summary_subgraph_longest_path(graph, node)
+        return max(len(path) - 1, 0)
+
+    def _summary_subgraph_diameter(self, graph: Any, node: Any) -> int:
+        subgraph = self._largest_connected_undirected(
+            self._origin_subgraph(graph, node)
+        )
+        if subgraph.number_of_nodes() <= 1:
+            return 0
+        return int(nx.diameter(subgraph))
+
+    def _summary_subgraph_average_shortest_path(
+        self, graph: Any, node: Any
+    ) -> float:
+        subgraph = self._largest_connected_undirected(
+            self._origin_subgraph(graph, node)
+        )
+        if subgraph.number_of_nodes() <= 1:
+            return 0.0
+        return float(nx.average_shortest_path_length(subgraph))
+
+    def _summary_subgraph_density(self, graph: Any, node: Any) -> float:
+        return float(nx.density(self._origin_subgraph(graph, node)))
+
+    def _summary_subgraph_average_degree(self, graph: Any, node: Any) -> float:
+        subgraph = self._origin_subgraph(graph, node)
+        n = subgraph.number_of_nodes()
+        if n == 0:
+            return 0.0
+        degree_sum = sum(degree for _, degree in subgraph.degree())
+        return float(degree_sum / n)
+
+    def _summary_subgraph_global_efficiency(self, graph: Any, node: Any) -> float:
+        subgraph = self._origin_subgraph(graph, node).to_undirected()
+        if subgraph.number_of_nodes() <= 1:
+            return 0.0
+        return float(nx.global_efficiency(subgraph))
 
     def _summary_parent_of(self, graph: Any, node: Any) -> dict[Any, Any | None]:
         parent_of = {node_id: None for node_id in graph.nodes}
@@ -810,11 +962,85 @@ class NXGraphSummary(GraphSummary):
             if (value := graph.nodes[node_id].get(label_attribute)) is not None
         }
 
-    def _summary_nodes_by_channel(self, graph: Any, node: Any) -> dict[str, int]:
-        channels: dict[str, int] = {}
+    def _nodes_by_attribute(self, graph: Any, attribute: str) -> dict[str, int]:
+        counts: dict[str, int] = {}
         for node_id in graph.nodes:
-            channel = graph.nodes[node_id].get("channel")
-            if channel is not None:
-                key = str(channel)
-                channels[key] = channels.get(key, 0) + 1
-        return channels
+            value = graph.nodes[node_id].get(attribute)
+            if value is not None:
+                key = str(value)
+                counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    def _seed_nodes(
+        self,
+        graph: Any,
+        node: Any,
+        attr_key: Optional[str],
+        attr_value: Any,
+    ) -> list[Any]:
+        if node is not None:
+            if node not in graph:
+                raise KeyError(f"node {node!r} not found in graph")
+            scope = {node, *nx.descendants(graph, node)}
+            nodes_to_search = [
+                (node_id, dict(graph.nodes[node_id])) for node_id in scope
+            ]
+        else:
+            nodes_to_search = list(graph.nodes(data=True))
+
+        if attr_key is not None and attr_value is not None:
+            return [
+                node_id
+                for node_id, attrs in nodes_to_search
+                if attrs.get(attr_key) == attr_value
+            ]
+        return [node_id for node_id, _attrs in nodes_to_search]
+
+    def _descendant_counts(
+        self, graph: Any, node: Any
+    ) -> list[dict[str, Any]]:
+        classify_attribute = self.config.filter_attribute
+        include = list(self.config.include_attributes)
+        nodes = self._seed_nodes(
+            graph, node, classify_attribute, self.config.filter_value
+        )
+
+        data = []
+        for node_id in nodes:
+            base_keys = list(set(["object_id", self.config.output_index, *include]))
+            row = {key: graph.nodes[node_id].get(key) for key in base_keys}
+            for desc in nx.descendants(graph, node_id):
+                bucket = graph.nodes[desc].get(classify_attribute, None)
+                key = f"count {bucket}"
+                row[key] = row.get(key, 0) + 1
+            data.append(row)
+        return data
+
+    def _ancestor_lineage(
+        self, graph: Any, node: Any
+    ) -> list[dict[str, Any]]:
+        classify_attribute = self.config.filter_attribute
+        include = list(self.config.include_attributes)
+        value_attribute = self.config.lineage_value_attribute
+        nodes = self._seed_nodes(
+            graph, node, classify_attribute, self.config.filter_value
+        )
+
+        data = []
+        for node_id in nodes:
+            base_keys = list(set(["object_id", self.config.output_index, *include]))
+            row = {key: graph.nodes[node_id].get(key) for key in base_keys}
+            ancestors = set(nx.ancestors(graph, node_id))
+            for ancestor in nx.topological_sort(graph):
+                if ancestor not in ancestors:
+                    continue
+                group = graph.nodes[ancestor].get(classify_attribute)
+                value = graph.nodes[ancestor].get(value_attribute)
+                row[f"lineage {group}"] = (
+                    int(value) if value is not None else None
+                )
+            data.append(row)
+        return data
+
+    def _to_dataframe(self, output: list[dict[str, Any]]) -> pd.DataFrame:
+        return pd.DataFrame(output).set_index(self.config.output_index)

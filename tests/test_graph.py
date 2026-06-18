@@ -8,12 +8,12 @@ networkx = pytest.importorskip("networkx")
 from vistiq.graph import (
     GraphBuilder,
     GraphBuilderConfig,
-    GraphSummary,
-    GraphSummaryConfig,
+    GraphQuery,
+    GraphQueryConfig,
     NXGraphBuilder,
     NXGraphBuilderConfig,
-    NXGraphSummary,
-    NXGraphSummaryConfig,
+    NXGraphQuery,
+    NXGraphQueryConfig,
 )
 
 
@@ -79,24 +79,24 @@ class TestNXGraphBuilder:
             )
 
 
-class TestNXGraphSummary:
+class TestNXGraphQuery:
     def test_allowed_attributes(self):
-        allowed = GraphSummary.allowed_attributes()
+        allowed = GraphQuery.allowed_attributes()
         assert "n_nodes" in allowed
         assert "edges" in allowed
-        assert set(GraphSummary.default_attributes).issubset(set(allowed))
+        assert set(GraphQuery.default_attributes).issubset(set(allowed))
 
     def test_summary_dict(self):
         dag = NXGraphBuilder(NXGraphBuilderConfig(threshold=0.5)).run(
             matrix=_sample_matrix(),
             regions=_sample_regions(),
         )
-        summary = NXGraphSummary(
-            NXGraphSummaryConfig(
+        summary = NXGraphQuery(
+            NXGraphQueryConfig(
                 attributes=[
-                    *GraphSummary.default_attributes,
-                    *GraphSummary.origin_attributes,
-                    "nodes_by_channel",
+                    *GraphQuery.default_attributes,
+                    *GraphQuery.origin_attributes,
+                    "nodes_by_attribute",
                 ]
             )
         ).run(dag, node="p")
@@ -113,8 +113,8 @@ class TestNXGraphSummary:
         assert len(summary["edges"]) == 2
         ios_values = sorted(edge["ios"] for edge in summary["edges"])
         assert ios_values == pytest.approx([0.8, 0.9])
-        assert summary["nodes_by_channel"]["Brain"] == 1
-        assert summary["nodes_by_channel"]["Lobe"] == 2
+        assert summary["nodes_by_attribute"]["Brain"] == 1
+        assert summary["nodes_by_attribute"]["Lobe"] == 2
         assert summary["origin"] == "p"
 
     def test_summary_requires_node_for_multiple_roots(self):
@@ -123,8 +123,8 @@ class TestNXGraphSummary:
             regions=_sample_regions(),
         )
         with pytest.raises(ValueError, match="root nodes"):
-            NXGraphSummary(
-                NXGraphSummaryConfig(attributes=["origin"])
+            NXGraphQuery(
+                NXGraphQueryConfig(attributes=["origin"])
             ).run(dag)
 
     def test_summary_selective_attributes(self):
@@ -132,8 +132,8 @@ class TestNXGraphSummary:
             matrix=_sample_matrix(),
             regions=_sample_regions(),
         )
-        summary = NXGraphSummary(
-            NXGraphSummaryConfig(attributes=["n_nodes", "n_edges", "roots"])
+        summary = NXGraphQuery(
+            NXGraphQueryConfig(attributes=["n_nodes", "n_edges", "roots"])
         ).run(dag)
         assert set(summary.keys()) == {"n_nodes", "n_edges", "roots"}
         assert summary["n_nodes"] == 4
@@ -144,29 +144,99 @@ class TestNXGraphSummary:
             matrix=_sample_matrix(),
             regions=_sample_regions(),
         )
-        summary = NXGraphSummary(
-            NXGraphSummaryConfig(
+        summary = NXGraphQuery(
+            NXGraphQueryConfig(
                 attributes=[
-                    *GraphSummary.default_attributes,
-                    *GraphSummary.origin_attributes,
+                    *GraphQuery.default_attributes,
+                    *GraphQuery.origin_attributes,
                 ]
             )
         ).run(dag, node="p")
         assert summary["origin"] == "p"
-        assert summary["n_descendants"] == 3
-        assert set(summary["descendants"]) == {"p", "a", "b"}
+        assert summary["subgraph_n_nodes"] == 3
+        assert set(summary["subgraph_nodes"]) == {"p", "a", "b"}
 
-        orphan_summary = NXGraphSummary(
-            NXGraphSummaryConfig(attributes=[*GraphSummary.origin_attributes])
+        orphan_summary = NXGraphQuery(
+            NXGraphQueryConfig(attributes=[*GraphQuery.origin_attributes])
         ).run(dag, node="c")
         assert orphan_summary["origin"] == "c"
         assert orphan_summary["depths"] == {"c": 0}
         assert orphan_summary["max_depth"] == 0
-        assert orphan_summary["n_descendants"] == 1
+        assert orphan_summary["subgraph_n_nodes"] == 1
+
+    def test_origin_subgraph_metrics(self):
+        dag = NXGraphBuilder(NXGraphBuilderConfig(threshold=0.5)).run(
+            matrix=_sample_matrix(),
+            regions=_sample_regions(),
+        )
+        metrics = NXGraphQuery(
+            NXGraphQueryConfig(
+                attributes=[
+                    "subgraph_n_nodes",
+                    "subgraph_n_edges",
+                    "subgraph_longest_path",
+                    "subgraph_longest_path_length",
+                    "subgraph_diameter",
+                    "subgraph_average_shortest_path",
+                    "subgraph_density",
+                    "subgraph_average_degree",
+                    "subgraph_global_efficiency",
+                ]
+            )
+        ).run(dag, node="p")
+        assert metrics["subgraph_n_nodes"] == 3
+        assert metrics["subgraph_n_edges"] == 2
+        assert metrics["subgraph_longest_path"][0] == "p"
+        assert metrics["subgraph_longest_path_length"] == 1
+        assert metrics["subgraph_diameter"] == 2
+        assert metrics["subgraph_average_shortest_path"] == pytest.approx(4 / 3)
+        assert metrics["subgraph_density"] == pytest.approx(1 / 3)
+        assert metrics["subgraph_average_degree"] == pytest.approx(4 / 3)
+        assert 0.0 < metrics["subgraph_global_efficiency"] <= 1.0
+
+    def test_descendant_counts_and_ancestor_lineage(self):
+        dag = NXGraphBuilder(NXGraphBuilderConfig(threshold=0.5)).run(
+            matrix=_sample_matrix(),
+            regions=_sample_regions(),
+        )
+        labels = {"p": 1, "a": 2, "b": 3, "c": 4}
+        for node_id, label in labels.items():
+            dag.nodes[node_id]["label"] = label
+
+        scoped = NXGraphQuery(
+            NXGraphQueryConfig(
+                attributes=["descendant_counts"],
+                filter_attribute="channel",
+                filter_value="Brain",
+            )
+        ).run(dag, node="p")
+        assert scoped["descendant_counts"][0]["count Lobe"] == 2
+
+        lineage = NXGraphQuery(
+            NXGraphQueryConfig(
+                attributes=["ancestor_lineage"],
+                filter_attribute="channel",
+                filter_value="Lobe",
+            )
+        ).run(dag)["ancestor_lineage"]
+        assert len(lineage) == 2
+        assert lineage[0]["lineage Brain"] == 1
+
+        df = NXGraphQuery(
+            NXGraphQueryConfig(
+                attributes=["ancestor_lineage"],
+                filter_attribute="channel",
+                filter_value="Lobe",
+                include_attributes=["volume"],
+                output_type="dataframe",
+            )
+        ).format(lineage)
+        assert len(df) == 2
+        assert "lineage Brain" in df.columns
 
     def test_invalid_attribute_raises(self):
         with pytest.raises(ValueError, match="invalid attributes"):
-            NXGraphSummaryConfig(attributes=["not_a_real_key"])
+            NXGraphQueryConfig(attributes=["not_a_real_key"])
 
     def test_abstract_summary_raises(self):
         dag = NXGraphBuilder(NXGraphBuilderConfig(threshold=0.5)).run(
@@ -174,7 +244,7 @@ class TestNXGraphSummary:
             regions=_sample_regions(),
         )
         with pytest.raises(NotImplementedError):
-            GraphSummary(GraphSummaryConfig()).run(dag, node="p")
+            GraphQuery(GraphQueryConfig()).run(dag, node="p")
 
     def test_abstract_builder_raises(self):
         with pytest.raises(NotImplementedError):
@@ -210,7 +280,7 @@ class TestOrphanHandling:
         ).run(matrix=_sample_matrix(), regions=_sample_regions())
         assert set(dag.nodes) == {"p", "a", "b"}
         assert dag.in_degree("p") == 0
-        summary = NXGraphSummary(NXGraphSummaryConfig(attributes=["n_roots"])).run(
+        summary = NXGraphQuery(NXGraphQueryConfig(attributes=["n_roots"])).run(
             dag
         )
         assert summary["n_roots"] == 1
@@ -234,7 +304,7 @@ class TestOrphanHandling:
             NXGraphBuilderConfig(threshold=0.5, orphan_strategy="drop")
         ).run(matrix=matrix, regions=regions)
         assert set(dag.nodes) == {"r"}
-        summary = NXGraphSummary(NXGraphSummaryConfig(attributes=["n_roots"])).run(
+        summary = NXGraphQuery(NXGraphQueryConfig(attributes=["n_roots"])).run(
             dag
         )
         assert summary["n_roots"] == 1

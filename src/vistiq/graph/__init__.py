@@ -1,25 +1,21 @@
 from .graph import (
     GraphBuilder,
     GraphBuilderConfig,
-    GraphSummary,
-    GraphSummaryConfig,
+    GraphQuery,
+    GraphQueryConfig,
     NXGraphBuilder,
     NXGraphBuilderConfig,
-    NXGraphSummary,
-    NXGraphSummaryConfig,
-    parents_from_graph,
-    graph_count,
+    NXGraphQuery,
+    NXGraphQueryConfig,
 )
 
 __all__ = [
     "GraphBuilder",
     "GraphBuilderConfig",
-    "GraphSummary",
-    "GraphSummaryConfig",
+    "GraphQuery",
+    "GraphQueryConfig",
     "NXGraphBuilder",
     "NXGraphBuilderConfig",
-    "NXGraphSummary",
-    "NXGraphSummaryConfig",
-    "parents_from_graph",
-    "graph_count",
+    "NXGraphQuery",
+    "NXGraphQueryConfig",
 ]

@@ -4,12 +4,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from vistiq.analysis.matrix import MatrixAggregatorConfig
+from vistiq.analysis.matrix import MatrixAggregatorConfig, MatrixCombinerConfig
 from vistiq.analysis.overlap import (
     LabelOverlapCalculatorConfig,
     metrics_calculator_configs,
 )
 from vistiq.analysis.workflow import AnalysisFlow, AnalysisFlowConfig
+from vistiq.constant.matrix import UPPER
+from vistiq.graph import NXGraphBuilderConfig, NXGraphQueryConfig
 from vistiq.segment import ValueFilterConfig
 from vistiq.segment.analysis import RegionAnalyzerConfig
 from vistiq.utils import ArrayIteratorConfig as UtilsArrayIteratorConfig
@@ -82,7 +84,12 @@ def _overlap_calculator_config(**updates) -> LabelOverlapCalculatorConfig:
 
 def _flow_config(**updates) -> AnalysisFlowConfig:
     """Build flow config; default to combinations for single-pair tests."""
-    defaults: dict = {"pairing_mode": "combinations"}
+    defaults: dict = {
+        "pairing_mode": "combinations",
+        "matrix_combiner": None,
+        "graph_builder": None,
+        "graph_query": None,
+    }
     defaults.update(updates)
     return AnalysisFlowConfig(**defaults)
 
@@ -382,3 +389,42 @@ def test_analysis_flow_region_analyzer_all_concatenates_stacks(overlapping_label
     assert len(combined) == len(per_stack_a) + len(per_stack_b)
     assert combined.index.name == "object_id"
     assert len(combined.index.unique()) == len(combined)
+
+
+def test_analysis_flow_hierarchical_analysis(overlapping_label_pair):
+    cfg = _flow_config(
+        region_analyzer=_region_analyzer_config(),
+        overlap_calculator=_overlap_calculator_config(),
+        overlap_filter=ValueFilterConfig(
+            ref_value=0.0,
+            operator=">",
+            output="masked_values",
+        ),
+        matrix_combiner=MatrixCombinerConfig(
+            fill_value=float("nan"),
+            symmetrize=True,
+            triangle=UPPER,
+        ),
+        graph_builder=NXGraphBuilderConfig(
+            orphan_strategy="as_roots",
+            rank_attribute="volume",
+        ),
+        graph_query=NXGraphQueryConfig(
+            attributes=["descendant_counts", "ancestor_lineage"],
+            filter_attribute="channel",
+            include_attributes=["label", "channel"],
+            lineage_value_attribute="label",
+            output_type="dataframe",
+        ),
+    )
+    measurements = _run_flow(cfg, overlapping_label_pair)
+
+    assert "ios_global" in measurements
+    assert "containment_graph" in measurements
+    assert measurements["ios_global"].shape[0] == measurements["ios_global"].shape[1]
+    assert len(measurements["region_analyzer_all"]) >= len(measurements["ios_global"])
+    if "hierarchical_analysis" in measurements:
+        combined = measurements["region_analyzer_all"]
+        assert list(combined.columns).count("label") == 1
+        assert list(combined.columns).count("channel") == 1
+        assert "label" in measurements["hierarchical_analysis"].columns

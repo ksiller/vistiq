@@ -12,9 +12,20 @@ from prefect import task, unmapped
 from vistiq.analysis import OverlapResult
 from vistiq.analysis.coincidence import CoincidenceDetectorConfig
 from vistiq.analysis.distance import DistanceCalculatorConfig
-from vistiq.analysis.matrix import MatrixAggregatorConfig
+from vistiq.analysis.matrix import (
+    MatrixAggregatorConfig,
+    MatrixCombiner,
+    MatrixCombinerConfig,
+)
 from vistiq.analysis.overlap import OverlapCalculatorConfig, region_map_from_dataframe
+from vistiq.constant.matrix import UPPER
 from vistiq.core import ArrayIteratorConfig, Configurable, generate_name
+from vistiq.graph import (
+    GraphBuilderConfig,
+    NXGraphBuilderConfig,
+    NXGraphQuery,
+    NXGraphQueryConfig,
+)
 from vistiq.segment import MatrixFilterConfig
 from vistiq.segment.analysis import RegionAnalyzer, RegionAnalyzerConfig
 from vistiq.utils import resolve_futures
@@ -84,6 +95,25 @@ class AnalysisFlowConfig(WorkflowConfig):
     overlap_calculator: Optional[OverlapCalculatorConfig] = None
     overlap_filter: Optional[MatrixFilterConfig] = None
     overlap_aggregator: Optional[MatrixAggregatorConfig] = None
+    matrix_combiner: Optional[MatrixCombinerConfig] = Field(
+        default_factory=lambda: MatrixCombinerConfig(
+            fill_value=float("nan"),
+            symmetrize=True,
+            triangle=UPPER,
+        )
+    )
+    graph_builder: Optional[GraphBuilderConfig] = Field(
+        default_factory=lambda: NXGraphBuilderConfig(orphan_strategy="drop")
+    )
+    graph_query: Optional[NXGraphQueryConfig] = Field(
+        default_factory=lambda: NXGraphQueryConfig(
+            attributes=["descendant_counts", "ancestor_lineage"],
+            filter_attribute="channel",
+            include_attributes=["label", "channel"],
+            lineage_value_attribute="label",
+            output_type="dataframe",
+        )
+    )
     auto_join: Optional[bool] = True
     pairing_mode: Literal["combinations", "permutations", "product"] = "permutations"
 
@@ -108,6 +138,8 @@ class AnalysisFlow(Workflow):
         required_properties = ["label", "object_id", "centroid"]
         if self.config.overlap_calculator is not None:
             required_properties.append("bbox")
+        if self.config.graph_builder is not None:
+            required_properties.append(self.config.graph_builder.rank_attribute)
 
         output_type = "dataframe"
         index_on = "object_id"
@@ -161,6 +193,128 @@ class AnalysisFlow(Workflow):
                 )
             return pd.Series(values, index=index, name=series_name)
         return result
+
+    def _concat_region_analyzer_all(
+        self, measurements: dict[str, Any]
+    ) -> Optional[pd.DataFrame]:
+        ra_keys = sorted(key for key in measurements if key.startswith("region_analyzer:"))
+        if not ra_keys:
+            return None
+        frames: list[pd.DataFrame] = []
+        for key in ra_keys:
+            frame = measurements[key]
+            if "channel" not in frame.columns:
+                frame = frame.assign(channel=key.removeprefix("region_analyzer:").strip())
+            frames.append(frame)
+        return pd.concat(frames, ignore_index=False)
+
+    def _run_hierarchical_analysis(
+        self,
+        measurements: dict[str, Any],
+        stack_names: list[str],
+    ) -> dict[str, Any]:
+        ios_matrices = [
+            matrix
+            for key, matrix in measurements.items()
+            if key.startswith("overlap_filtered:")
+        ]
+        if not ios_matrices:
+            return measurements
+        if self.config.matrix_combiner is None or self.config.graph_builder is None:
+            return measurements
+
+        all_objects = measurements.get("region_analyzer_all")
+        if all_objects is None:
+            return measurements
+
+        ios_global = MatrixCombiner(self.config.matrix_combiner).run(ios_matrices)
+        measurements["ios_global"] = ios_global
+
+        builder = Configurable.create_from_config(self.config.graph_builder)
+        dag = builder.run(ios_global, all_objects, annotations=None)
+        measurements["containment_graph"] = dag
+
+        gqcfg = self.config.graph_query
+        if gqcfg is None:
+            return measurements
+
+        if gqcfg.filter_value is not None:
+            query_configs = [gqcfg]
+        elif "channel" in all_objects.columns:
+            query_configs = [
+                gqcfg.model_copy(update={"filter_value": channel})
+                for channel in sorted(all_objects["channel"].dropna().unique())
+            ]
+        else:
+            query_configs = [
+                gqcfg.model_copy(update={"filter_value": name})
+                for name in stack_names
+            ]
+
+        filter_values = [cfg.filter_value for cfg in query_configs]
+        logger.info(f"Running graph query for filter values: {filter_values}")
+        gq = NXGraphQuery(gqcfg.model_copy(update={"filter_value": None}))
+        gq_results = list(
+            gq.run.map(unmapped(dag), node=None, filter_value=filter_values)
+        )
+        counts_frames = [
+            frame
+            for frame in resolve_futures(
+                list(gq.format.map(gq_results, unmapped("descendant_counts")))
+            )
+            if isinstance(frame, pd.DataFrame) and not frame.empty
+        ]
+        lineage_frames = [
+            frame
+            for frame in resolve_futures(
+                list(gq.format.map(gq_results, unmapped("ancestor_lineage")))
+            )
+            if isinstance(frame, pd.DataFrame) and not frame.empty
+        ]
+
+        graph_parts = [
+            frame
+            for frame in (
+                pd.concat(counts_frames, axis=0) if counts_frames else None,
+                pd.concat(lineage_frames, axis=0) if lineage_frames else None,
+            )
+            if frame is not None and not frame.empty
+        ]
+        if not graph_parts:
+            return measurements
+
+        graph_df = pd.concat(graph_parts, axis=1)
+        graph_df = graph_df.loc[:, ~graph_df.columns.duplicated()]
+        measurements["hierarchical_analysis"] = graph_df
+        new_cols = graph_df.columns.difference(
+            measurements["region_analyzer_all"].columns
+        )
+        measurements["region_analyzer_all"] = measurements["region_analyzer_all"].join(
+            graph_df[new_cols],
+            how="left",
+        )
+        return measurements
+
+
+    def _spatial_analysis(self, measurements: dict[str, Any], spatial_graph, stack_names: list[str], metadata: Optional[list[dict[str, Any]]] = None) -> dict[str, Any]:
+        # run distance matrix and knn analysis on region_analyzer_all
+        # homotypic knn analysis (within same channel): 
+        # - configurable parameters:k, grouping_attribute (default "channel"), subtree_attribute (default None)
+        # - results: mean_distance, local knn_density, closest neighbor distance, knn-dag-homotypic
+        # heterotypic knn analysis (between different channels, all pairwise combinations):
+        # - configurable parameters:k, grouping_attribute (default "channel"), subtree_attribute (default None)
+        # - results: mean_distance, local knn_density, closest neighbor distance, knn-dag-heterotypic
+        # homotypic radial nearest neighbors (rnn) analysis (within same channel):
+        # - configurable parameters:radius, grouping_attribute (default "channel"), subtree_attribute (default None)
+        # - results: mean_distance, local rnn_density, closest neighbor distance, radial-dag-homotypic
+        # heterotypic radial neighbors analysis (between different channels, all pairwise combinations):
+        # - configurable parameters:radius, grouping_attribute (default "channel"), subtree_attribute (default None)
+        # - results: mean_distance, local knn_density, closest neighbor distance, radial-dag-heterotypic
+        # distance to parent: based on centroid-to-centroid distance
+        # - configurable parameters:grouping_attribute (default "channel")
+        # - results: mean_distance, local knn_density, closest neighbor distance, distance-from-parent
+        return measurements
+
 
     def _run(
         self,
@@ -264,19 +418,34 @@ class AnalysisFlow(Workflow):
             for stack_name, c_result in zip(stack_names, c_results):
                 results[_pair_key("coincidence", stack_name)] = c_result
 
-        resolved = resolve_futures(results)
+        measurements = resolve_futures(results)
 
-        ra_keys = sorted(key for key in resolved if key.startswith("region_analyzer:"))
-        if ra_keys:
-            resolved["region_analyzer_all"] = pd.concat(
-                [resolved[key] for key in ra_keys],
-                ignore_index=False, # keep object_id as index
-            )
+        region_analyzer_all = self._concat_region_analyzer_all(measurements)
+        if region_analyzer_all is not None:
+            measurements["region_analyzer_all"] = region_analyzer_all
+            stack_names = [
+                _stack_name(metadata, index) for index in range(len(labels))
+            ]
+            measurements = self._run_hierarchical_analysis(measurements, stack_names)
+            measurements = self._spatial_analysis(measurements, stack_names)
 
         if self.config.auto_join:
-            resolved = self._auto_join(resolved)
-        return resolved
+            measurements = self._auto_join(measurements)
 
-    def _auto_join(self, resolved: dict[str, Any]) -> dict[str, Any]:
+        return measurements
+
+
+    def _auto_join(self, results: dict[str, Any]) -> dict[str, Any]:
         """Auto-join the resolved results."""
-        return resolved
+        # merge region_analyzer_all with hierarchical_analysis
+        # make sure columns don't overlap
+        new_cols = results["hierarchical_analysis"].columns.difference(
+            results["region_analyzer_all"].columns
+        )
+        results["region_analyzer_all"] = results["region_analyzer_all"].join(
+            results["hierarchical_analysis"][new_cols],
+            how="left",
+        )
+        # drop hierarchical_analysis
+        results.pop("hierarchical_analysis")
+        return results
