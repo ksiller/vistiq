@@ -5,15 +5,19 @@ import pytest
 
 networkx = pytest.importorskip("networkx")
 
+from vistiq.analysis.matrix import HierarchicalMatrix, HierarchicalMatrixConfig
 from vistiq.graph import (
     GraphBuilder,
     GraphBuilderConfig,
+    GraphExporter,
+    GraphExporterConfig,
     GraphQuery,
     GraphQueryConfig,
     NXGraphBuilder,
     NXGraphBuilderConfig,
     NXGraphQuery,
     NXGraphQueryConfig,
+    graph_to_dataframe,
 )
 
 
@@ -42,12 +46,58 @@ def _sample_regions() -> pd.DataFrame:
     ).set_index("object_id")
 
 
+def _build_containment_dag(
+    matrix: pd.DataFrame,
+    regions: pd.DataFrame,
+    **hierarchical_kwargs,
+):
+    hm_cfg = HierarchicalMatrixConfig(**hierarchical_kwargs)
+    result = HierarchicalMatrix(hm_cfg).run(matrix, regions)
+    return NXGraphBuilder(NXGraphBuilderConfig()).run(result.matrix, result.regions)
+
+
 class TestNXGraphBuilder:
-    def test_smallest_enclosing_parent(self):
-        dag = NXGraphBuilder(NXGraphBuilderConfig(threshold=0.5)).run(
-            matrix=_sample_matrix(),
-            regions=_sample_regions(),
+    def test_graph_to_dataframe(self):
+        dag = _build_containment_dag(_sample_matrix(), _sample_regions())
+        frame = graph_to_dataframe(dag)
+        assert frame.index.name == "object_id"
+        assert set(frame.index) == set(dag.nodes)
+        assert frame.loc["a", "volume"] == 10.0
+        assert frame.loc["a", "channel"] == "Lobe"
+
+    def test_graph_exporter_dropna_rows(self):
+        dag = _build_containment_dag(_sample_matrix(), _sample_regions())
+        for node in ["p", "a", "b", "c"]:
+            dag.nodes[node]["synthetic"] = False
+            dag.nodes[node]["name"] = str(node)
+        dag.add_node(
+            "synthetic",
+            name="Orphans",
+            synthetic=True,
         )
+        frame = GraphExporter(GraphExporterConfig(dropna_rows=True)).run(dag)
+        assert "synthetic" not in frame.index
+        assert set(frame.index) == {"p", "a", "b", "c"}
+
+    def test_graph_exporter_dropna_cols(self):
+        dag = _build_containment_dag(_sample_matrix(), _sample_regions())
+        dag.nodes["a"]["unused"] = float("nan")
+        frame = GraphExporter(GraphExporterConfig(dropna_cols=True)).run(dag)
+        assert "unused" not in frame.columns
+
+    def test_graph_exporter_exclude_synthetic(self):
+        dag = _build_containment_dag(_sample_matrix(), _sample_regions())
+        dag.add_node(
+            "synthetic",
+            name="Orphans",
+            synthetic=True,
+        )
+        frame = GraphExporter(GraphExporterConfig(exclude_synthetic=True)).run(dag)
+        assert "synthetic" not in frame.index
+        assert set(frame.index) == {"p", "a", "b", "c"}
+
+    def test_smallest_enclosing_parent(self):
+        dag = _build_containment_dag(_sample_matrix(), _sample_regions())
         assert isinstance(dag, networkx.DiGraph)
         assert set(dag.successors("p")) == {"a", "b"}
         assert "c" not in dag.successors("p")
@@ -56,15 +106,21 @@ class TestNXGraphBuilder:
 
     def test_regions_indexed_by_object_id(self):
         regions = _sample_regions()
+        result = HierarchicalMatrix(HierarchicalMatrixConfig()).run(
+            _sample_matrix(), regions
+        )
         dag = NXGraphBuilder(NXGraphBuilderConfig()).run(
-            matrix=_sample_matrix(), regions=regions
+            result.matrix, result.regions
         )
         assert dag.number_of_nodes() == 4
 
     def test_regions_object_id_column(self):
         regions = _sample_regions().reset_index()
+        result = HierarchicalMatrix(HierarchicalMatrixConfig()).run(
+            _sample_matrix(), regions
+        )
         dag = NXGraphBuilder(NXGraphBuilderConfig()).run(
-            matrix=_sample_matrix(), regions=regions
+            result.matrix, result.regions
         )
         assert dag.number_of_nodes() == 4
 
@@ -87,10 +143,7 @@ class TestNXGraphQuery:
         assert set(GraphQuery.default_attributes).issubset(set(allowed))
 
     def test_summary_dict(self):
-        dag = NXGraphBuilder(NXGraphBuilderConfig(threshold=0.5)).run(
-            matrix=_sample_matrix(),
-            regions=_sample_regions(),
-        )
+        dag = _build_containment_dag(_sample_matrix(), _sample_regions())
         summary = NXGraphQuery(
             NXGraphQueryConfig(
                 attributes=[
@@ -118,20 +171,14 @@ class TestNXGraphQuery:
         assert summary["origin"] == "p"
 
     def test_summary_requires_node_for_multiple_roots(self):
-        dag = NXGraphBuilder(NXGraphBuilderConfig(threshold=0.5)).run(
-            matrix=_sample_matrix(),
-            regions=_sample_regions(),
-        )
+        dag = _build_containment_dag(_sample_matrix(), _sample_regions())
         with pytest.raises(ValueError, match="root nodes"):
             NXGraphQuery(
                 NXGraphQueryConfig(attributes=["origin"])
             ).run(dag)
 
     def test_summary_selective_attributes(self):
-        dag = NXGraphBuilder(NXGraphBuilderConfig(threshold=0.5)).run(
-            matrix=_sample_matrix(),
-            regions=_sample_regions(),
-        )
+        dag = _build_containment_dag(_sample_matrix(), _sample_regions())
         summary = NXGraphQuery(
             NXGraphQueryConfig(attributes=["n_nodes", "n_edges", "roots"])
         ).run(dag)
@@ -140,10 +187,7 @@ class TestNXGraphQuery:
         assert set(summary["roots"]) == {"p", "c"}
 
     def test_summary_from_custom_node(self):
-        dag = NXGraphBuilder(NXGraphBuilderConfig(threshold=0.5)).run(
-            matrix=_sample_matrix(),
-            regions=_sample_regions(),
-        )
+        dag = _build_containment_dag(_sample_matrix(), _sample_regions())
         summary = NXGraphQuery(
             NXGraphQueryConfig(
                 attributes=[
@@ -165,10 +209,7 @@ class TestNXGraphQuery:
         assert orphan_summary["subgraph_n_nodes"] == 1
 
     def test_origin_subgraph_metrics(self):
-        dag = NXGraphBuilder(NXGraphBuilderConfig(threshold=0.5)).run(
-            matrix=_sample_matrix(),
-            regions=_sample_regions(),
-        )
+        dag = _build_containment_dag(_sample_matrix(), _sample_regions())
         metrics = NXGraphQuery(
             NXGraphQueryConfig(
                 attributes=[
@@ -195,10 +236,7 @@ class TestNXGraphQuery:
         assert 0.0 < metrics["subgraph_global_efficiency"] <= 1.0
 
     def test_descendant_counts_and_ancestor_lineage(self):
-        dag = NXGraphBuilder(NXGraphBuilderConfig(threshold=0.5)).run(
-            matrix=_sample_matrix(),
-            regions=_sample_regions(),
-        )
+        dag = _build_containment_dag(_sample_matrix(), _sample_regions())
         labels = {"p": 1, "a": 2, "b": 3, "c": 4}
         for node_id, label in labels.items():
             dag.nodes[node_id]["label"] = label
@@ -239,10 +277,7 @@ class TestNXGraphQuery:
             NXGraphQueryConfig(attributes=["not_a_real_key"])
 
     def test_abstract_summary_raises(self):
-        dag = NXGraphBuilder(NXGraphBuilderConfig(threshold=0.5)).run(
-            matrix=_sample_matrix(),
-            regions=_sample_regions(),
-        )
+        dag = _build_containment_dag(_sample_matrix(), _sample_regions())
         with pytest.raises(NotImplementedError):
             GraphQuery(GraphQueryConfig()).run(dag, node="p")
 
@@ -255,10 +290,9 @@ class TestNXGraphQuery:
 
 
 class TestOrphanHandling:
-    def _orphan_roots(self, config: NXGraphBuilderConfig) -> set[str]:
-        dag = NXGraphBuilder(config).run(
-            matrix=_sample_matrix(),
-            regions=_sample_regions(),
+    def _orphan_roots(self, **hierarchical_kwargs) -> set[str]:
+        dag = _build_containment_dag(
+            _sample_matrix(), _sample_regions(), **hierarchical_kwargs
         )
         return {
             node
@@ -267,17 +301,14 @@ class TestOrphanHandling:
         }
 
     def test_as_roots_default(self):
-        dag = NXGraphBuilder(NXGraphBuilderConfig(threshold=0.5)).run(
-            matrix=_sample_matrix(),
-            regions=_sample_regions(),
-        )
+        dag = _build_containment_dag(_sample_matrix(), _sample_regions())
         assert set(dag.nodes) == {"p", "a", "b", "c"}
-        assert self._orphan_roots(NXGraphBuilderConfig(threshold=0.5)) == {"p", "c"}
+        assert self._orphan_roots(threshold=0.5) == {"p", "c"}
 
     def test_drop_orphans(self):
-        dag = NXGraphBuilder(
-            NXGraphBuilderConfig(threshold=0.5, orphan_strategy="drop")
-        ).run(matrix=_sample_matrix(), regions=_sample_regions())
+        dag = _build_containment_dag(
+            _sample_matrix(), _sample_regions(), threshold=0.5, orphan_strategy="drop"
+        )
         assert set(dag.nodes) == {"p", "a", "b"}
         assert dag.in_degree("p") == 0
         summary = NXGraphQuery(NXGraphQueryConfig(attributes=["n_roots"])).run(
@@ -300,9 +331,9 @@ class TestOrphanHandling:
         regions = pd.DataFrame(
             {"object_id": ["r", "o", "c"], "volume": [100.0, 50.0, 5.0]}
         ).set_index("object_id")
-        dag = NXGraphBuilder(
-            NXGraphBuilderConfig(threshold=0.5, orphan_strategy="drop")
-        ).run(matrix=matrix, regions=regions)
+        dag = _build_containment_dag(
+            matrix, regions, threshold=0.5, orphan_strategy="drop"
+        )
         assert set(dag.nodes) == {"r"}
         summary = NXGraphQuery(NXGraphQueryConfig(attributes=["n_roots"])).run(
             dag
@@ -310,13 +341,12 @@ class TestOrphanHandling:
         assert summary["n_roots"] == 1
 
     def test_group_orphans_flat(self):
-        config = NXGraphBuilderConfig(
+        dag = _build_containment_dag(
+            _sample_matrix(),
+            _sample_regions(),
             threshold=0.5,
             orphan_strategy="group",
             orphan_attach="separate_root",
-        )
-        dag = NXGraphBuilder(config).run(
-            matrix=_sample_matrix(), regions=_sample_regions()
         )
         synthetic_roots = [
             node
@@ -327,16 +357,19 @@ class TestOrphanHandling:
         orphan_root = synthetic_roots[0]
         assert dag.nodes[orphan_root]["name"] == "Orphans"
         assert dag.has_edge(orphan_root, "c")
-        assert self._orphan_roots(config) == {"p"}
+        assert self._orphan_roots(
+            threshold=0.5,
+            orphan_strategy="group",
+            orphan_attach="separate_root",
+        ) == {"p"}
 
     def test_group_orphans_by_channel(self):
-        config = NXGraphBuilderConfig(
+        dag = _build_containment_dag(
+            _sample_matrix(),
+            _sample_regions(),
             threshold=0.5,
             orphan_strategy="group",
             orphan_groupby="channel",
-        )
-        dag = NXGraphBuilder(config).run(
-            matrix=_sample_matrix(), regions=_sample_regions()
         )
         group_nodes = [
             node
@@ -348,13 +381,12 @@ class TestOrphanHandling:
         assert dag.has_edge(group_id, "c")
 
     def test_unify_attach(self):
-        config = NXGraphBuilderConfig(
+        dag = _build_containment_dag(
+            _sample_matrix(),
+            _sample_regions(),
             threshold=0.5,
             orphan_strategy="group",
             orphan_attach="unify",
-        )
-        dag = NXGraphBuilder(config).run(
-            matrix=_sample_matrix(), regions=_sample_regions()
         )
         all_roots = [node for node in dag.nodes if dag.in_degree(node) == 0]
         assert len(all_roots) == 1

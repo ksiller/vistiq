@@ -13,6 +13,8 @@ from vistiq.analysis import OverlapResult
 from vistiq.analysis.coincidence import CoincidenceDetectorConfig
 from vistiq.analysis.distance import DistanceCalculatorConfig
 from vistiq.analysis.matrix import (
+    HierarchicalMatrix,
+    HierarchicalMatrixConfig,
     MatrixAggregatorConfig,
     MatrixCombiner,
     MatrixCombinerConfig,
@@ -22,9 +24,12 @@ from vistiq.constant.matrix import UPPER
 from vistiq.core import ArrayIteratorConfig, Configurable, generate_name
 from vistiq.graph import (
     GraphBuilderConfig,
+    GraphExporter,
+    GraphExporterConfig,
     NXGraphBuilderConfig,
     NXGraphQuery,
     NXGraphQueryConfig,
+    graph_to_dataframe,
 )
 from vistiq.segment import MatrixFilterConfig
 from vistiq.segment.analysis import RegionAnalyzer, RegionAnalyzerConfig
@@ -102,8 +107,11 @@ class AnalysisFlowConfig(WorkflowConfig):
             triangle=UPPER,
         )
     )
+    hierarchical_matrix: Optional[HierarchicalMatrixConfig] = Field(
+        default_factory=lambda: HierarchicalMatrixConfig(orphan_strategy="drop")
+    )
     graph_builder: Optional[GraphBuilderConfig] = Field(
-        default_factory=lambda: NXGraphBuilderConfig(orphan_strategy="drop")
+        default_factory=NXGraphBuilderConfig
     )
     graph_query: Optional[NXGraphQueryConfig] = Field(
         default_factory=lambda: NXGraphQueryConfig(
@@ -113,6 +121,9 @@ class AnalysisFlowConfig(WorkflowConfig):
             lineage_value_attribute="label",
             output_type="dataframe",
         )
+    )
+    graph_exporter: Optional[GraphExporterConfig] = Field(
+        default_factory=GraphExporterConfig
     )
     auto_join: Optional[bool] = True
     pairing_mode: Literal["combinations", "permutations", "product"] = "permutations"
@@ -138,8 +149,8 @@ class AnalysisFlow(Workflow):
         required_properties = ["label", "object_id", "centroid"]
         if self.config.overlap_calculator is not None:
             required_properties.append("bbox")
-        if self.config.graph_builder is not None:
-            required_properties.append(self.config.graph_builder.rank_attribute)
+        if self.config.hierarchical_matrix is not None:
+            required_properties.append(self.config.hierarchical_matrix.rank_attribute)
 
         output_type = "dataframe"
         index_on = "object_id"
@@ -194,7 +205,7 @@ class AnalysisFlow(Workflow):
             return pd.Series(values, index=index, name=series_name)
         return result
 
-    def _concat_region_analyzer_all(
+    def _concat_region_tables(
         self, measurements: dict[str, Any]
     ) -> Optional[pd.DataFrame]:
         ra_keys = sorted(key for key in measurements if key.startswith("region_analyzer:"))
@@ -208,6 +219,27 @@ class AnalysisFlow(Workflow):
             frames.append(frame)
         return pd.concat(frames, ignore_index=False)
 
+    def _build_region_analyzer_all(
+        self, measurements: dict[str, Any]
+    ) -> Optional[pd.DataFrame]:
+        graph = measurements.get("containment_graph")
+        if graph is not None and self.config.graph_exporter is not None:
+            return GraphExporter(self.config.graph_exporter).run(graph)
+        if graph is not None:
+            return graph_to_dataframe(graph)
+        return self._concat_region_tables(measurements)
+
+    @staticmethod
+    def _join_derived_columns(
+        base: pd.DataFrame, derived: list[pd.DataFrame]
+    ) -> pd.DataFrame:
+        result = base
+        for frame in derived:
+            new_cols = frame.columns.difference(result.columns)
+            if len(new_cols):
+                result = result.join(frame[new_cols], how="left")
+        return result
+
     def _run_hierarchical_analysis(
         self,
         measurements: dict[str, Any],
@@ -220,18 +252,25 @@ class AnalysisFlow(Workflow):
         ]
         if not ios_matrices:
             return measurements
-        if self.config.matrix_combiner is None or self.config.graph_builder is None:
+        if (
+            self.config.matrix_combiner is None
+            or self.config.hierarchical_matrix is None
+            or self.config.graph_builder is None
+        ):
             return measurements
 
-        all_objects = measurements.get("region_analyzer_all")
-        if all_objects is None:
+        regions = self._concat_region_tables(measurements)
+        if regions is None:
             return measurements
 
         ios_global = MatrixCombiner(self.config.matrix_combiner).run(ios_matrices)
         measurements["ios_global"] = ios_global
 
+        hm = HierarchicalMatrix(self.config.hierarchical_matrix).run(
+            ios_global, regions
+        )
         builder = Configurable.create_from_config(self.config.graph_builder)
-        dag = builder.run(ios_global, all_objects, annotations=None)
+        dag = builder.run(hm.matrix, hm.regions, annotations=None)
         measurements["containment_graph"] = dag
 
         gqcfg = self.config.graph_query
@@ -240,10 +279,10 @@ class AnalysisFlow(Workflow):
 
         if gqcfg.filter_value is not None:
             query_configs = [gqcfg]
-        elif "channel" in all_objects.columns:
+        elif "channel" in regions.columns:
             query_configs = [
                 gqcfg.model_copy(update={"filter_value": channel})
-                for channel in sorted(all_objects["channel"].dropna().unique())
+                for channel in sorted(regions["channel"].dropna().unique())
             ]
         else:
             query_configs = [
@@ -286,18 +325,16 @@ class AnalysisFlow(Workflow):
         graph_df = pd.concat(graph_parts, axis=1)
         graph_df = graph_df.loc[:, ~graph_df.columns.duplicated()]
         measurements["hierarchical_analysis"] = graph_df
-        new_cols = graph_df.columns.difference(
-            measurements["region_analyzer_all"].columns
-        )
-        measurements["region_analyzer_all"] = measurements["region_analyzer_all"].join(
-            graph_df[new_cols],
-            how="left",
-        )
         return measurements
 
-
-    def _spatial_analysis(self, measurements: dict[str, Any], spatial_graph, stack_names: list[str], metadata: Optional[list[dict[str, Any]]] = None) -> dict[str, Any]:
-        # run distance matrix and knn analysis on region_analyzer_all
+    def _spatial_analysis(
+        self,
+        measurements: dict[str, Any],
+        containment_graph: Any,
+        stack_names: list[str],
+        metadata: Optional[list[dict[str, Any]]] = None,
+    ) -> dict[str, Any]:
+        # run distance matrix and knn analysis on containment_graph
         # homotypic knn analysis (within same channel): 
         # - configurable parameters:k, grouping_attribute (default "channel"), subtree_attribute (default None)
         # - results: mean_distance, local knn_density, closest neighbor distance, knn-dag-homotypic
@@ -420,32 +457,34 @@ class AnalysisFlow(Workflow):
 
         measurements = resolve_futures(results)
 
-        region_analyzer_all = self._concat_region_analyzer_all(measurements)
-        if region_analyzer_all is not None:
-            measurements["region_analyzer_all"] = region_analyzer_all
-            stack_names = [
-                _stack_name(metadata, index) for index in range(len(labels))
-            ]
+        stack_names = [_stack_name(metadata, index) for index in range(len(labels))]
+        if self._concat_region_tables(measurements) is not None:
             measurements = self._run_hierarchical_analysis(measurements, stack_names)
-            measurements = self._spatial_analysis(measurements, stack_names)
+            measurements = self._spatial_analysis(
+                measurements,
+                measurements.get("containment_graph"),
+                stack_names,
+                metadata,
+            )
 
         if self.config.auto_join:
             measurements = self._auto_join(measurements)
 
         return measurements
 
-
     def _auto_join(self, results: dict[str, Any]) -> dict[str, Any]:
-        """Auto-join the resolved results."""
-        # merge region_analyzer_all with hierarchical_analysis
-        # make sure columns don't overlap
-        new_cols = results["hierarchical_analysis"].columns.difference(
-            results["region_analyzer_all"].columns
-        )
-        results["region_analyzer_all"] = results["region_analyzer_all"].join(
-            results["hierarchical_analysis"][new_cols],
-            how="left",
-        )
-        # drop hierarchical_analysis
-        results.pop("hierarchical_analysis")
+        """Build region_analyzer_all and merge derived analysis tables."""
+        base = self._build_region_analyzer_all(results)
+        if base is None:
+            return results
+
+        derived: list[pd.DataFrame] = []
+        for key in ("hierarchical_analysis", "spatial_analysis"):
+            frame = results.get(key)
+            if isinstance(frame, pd.DataFrame) and not frame.empty:
+                derived.append(frame)
+
+        results["region_analyzer_all"] = self._join_derived_columns(base, derived)
+        results.pop("hierarchical_analysis", None)
+        results.pop("spatial_analysis", None)
         return results

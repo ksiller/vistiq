@@ -1,14 +1,13 @@
-"""Build containment graphs from overlap weight matrices and region metrics.
+"""Build graphs from labeled matrices and region metrics.
 
-GraphBuilder turns a labeled overlap matrix plus region properties into a
-containment graph (directed or undirected). GraphQuery collects structural
-statistics from that graph into a plain dictionary.
+GraphBuilder materializes each non-NaN matrix cell as a directed edge and
+attaches region properties to nodes. Hierarchy shaping belongs upstream in
+:class:`~vistiq.analysis.matrix.HierarchicalMatrix`.
 """
 
 from __future__ import annotations
 
 import logging
-import uuid
 from typing import Any, ClassVar, List, Literal, Optional
 
 import networkx as nx
@@ -21,20 +20,6 @@ from vistiq.analysis.matrix import _square_dataframe
 from vistiq.core import Configurable, Configuration, generate_name
 
 logger = logging.getLogger(__name__)
-
-ORPHAN_GROUP_UNKNOWN = "unknown"
-
-
-def _pairwise_weight(matrix: pd.DataFrame, left: Any, right: Any) -> float:
-    """Return the symmetric matrix weight between left and right."""
-    values: list[float] = []
-    if left in matrix.index and right in matrix.columns:
-        values.append(float(matrix.loc[left, right]))
-    if right in matrix.index and left in matrix.columns:
-        values.append(float(matrix.loc[right, left]))
-    if not values:
-        return float("nan")
-    return float(np.nanmax(values))
 
 
 def _normalize_regions_index(regions: pd.DataFrame) -> pd.DataFrame:
@@ -52,6 +37,84 @@ def _normalize_regions_index(regions: pd.DataFrame) -> pd.DataFrame:
         "regions must be indexed by object_id or include an object_id column; "
         f"index={regions.index.name!r}, columns={list(regions.columns)}"
     )
+
+
+def graph_to_dataframe(graph: Any, *, index: str = "object_id") -> pd.DataFrame:
+    """Build a region property table from graph node attributes.
+
+    Args:
+        graph: Backend graph with ``nodes(data=True)`` (e.g. networkx).
+        index: Index name and column to use for object identifiers.
+
+    Returns:
+        DataFrame indexed by ``index`` with one row per node.
+    """
+    nodes = list(graph.nodes(data=True))
+    if not nodes:
+        return pd.DataFrame()
+    frame = pd.DataFrame(
+        [dict(attrs) for _, attrs in nodes],
+        index=pd.Index([node_id for node_id, _ in nodes], name=index),
+    )
+    if index in frame.columns:
+        frame = frame.drop(columns=[index])
+    return frame
+
+
+class GraphExporterConfig(Configuration):
+    """Configuration for :class:`GraphExporter`.
+
+    Attributes:
+        index: Index name for exported object identifiers.
+        columns: Optional subset of node attributes to include. When omitted,
+            all node attributes are exported.
+        dropna_cols: When ``True``, drop columns that are entirely NA.
+        dropna_rows: When ``True``, drop rows with any NA value.
+        exclude_synthetic: When ``True``, omit nodes whose ``synthetic``
+            attribute is truthy (structural DAG nodes from
+            :class:`GraphBuilder`).
+    """
+
+    index: str = "object_id"
+    columns: Optional[List[str]] = None
+    dropna_cols: bool = False
+    dropna_rows: bool = False
+    exclude_synthetic: bool = False
+
+
+class GraphExporter(Configurable[GraphExporterConfig]):
+    """Export graph node attributes to a region property table."""
+
+    def __init__(self, config: GraphExporterConfig):
+        super().__init__(config)
+
+    @classmethod
+    def from_config(cls, config: GraphExporterConfig) -> "GraphExporter":
+        return cls(config)
+
+    @task(name="GraphExporter.run", task_run_name=generate_name)
+    def run(self, graph: Any) -> pd.DataFrame:
+        """Build a DataFrame from graph node attributes."""
+        frame = graph_to_dataframe(graph, index=self.config.index)
+        if frame.empty:
+            return frame
+        if self.config.columns is not None:
+            frame = frame[list(self.config.columns)]
+        if self.config.exclude_synthetic:
+            if "synthetic" in frame.columns:
+                frame = frame[~frame["synthetic"].fillna(False).astype(bool)]
+            else:
+                synthetic_ids = [
+                    node_id
+                    for node_id, attrs in graph.nodes(data=True)
+                    if attrs.get("synthetic")
+                ]
+                frame = frame.drop(index=synthetic_ids, errors="ignore")
+        if self.config.dropna_cols:
+            frame = frame.dropna(axis=1, how="all")
+        if self.config.dropna_rows:
+            frame = frame.dropna(axis=0, how="any")
+        return frame
 
 
 def _regions_for_nodes(regions: pd.DataFrame, nodes: list[Any]) -> pd.DataFrame:
@@ -83,54 +146,18 @@ class GraphBuilderConfig(Configuration):
     """Configuration for GraphBuilder.
 
     Attributes:
-        rank_attribute: Region column used to rank objects when assigning
-            parents (for example volume or area).
-        threshold: Minimum matrix weight required to link a child to a parent.
-        parent_strategy: How to choose among eligible parents.
-            smallest_enclosing selects the smallest enclosing object;
-            max_weight selects the highest matrix weight.
-        weight_attribute: Edge attribute key used when storing the matrix
-            weight on containment edges (for example ios).
+        weight_attribute: Edge attribute key used when storing matrix weights.
         graph_type: Whether to build a directed or undirected graph.
-        orphan_strategy: How to handle objects with no assigned parent.
-            drop removes orphans and any objects assigned beneath them.
-        orphan_groupby: Region column for grouping orphans when
-            orphan_strategy is group. None attaches orphans directly to
-            orphan_node. Orphans missing this attribute are grouped under
-            orphan subgroup "unknown".
-        orphan_node: Node attributes for the synthetic orphan root created
-            when orphan_strategy is group. object_id is assigned at build
-            time; do not set it in config.
-        orphan_attach: How grouped orphans connect to the main hierarchy.
-            separate_root keeps orphan_node as a second top-level root;
-            unify creates an all_node above both the containment primary
-            root and orphan_node.
-        all_node: Node attributes for the synthetic unify root when
-            orphan_attach is unify. object_id is assigned at build time.
     """
 
-    rank_attribute: str = "volume"
-    threshold: float = 0.5
-    graph_type: Literal["directed", "undirected"] = "directed"
-    parent_strategy: Literal["smallest_enclosing", "max_weight"] = "smallest_enclosing"
     weight_attribute: str = "ios"
-    orphan_strategy: Literal["drop", "as_roots", "group"] = "as_roots"
-    orphan_groupby: Optional[str] = None
-    orphan_attach: Literal["separate_root", "unify"] = "separate_root"
-    orphan_node: dict[str, Any] = Field(
-        default_factory=lambda: {"name": "Orphans", "synthetic": True}
-    )
-    all_node: dict[str, Any] = Field(
-        default_factory=lambda: {"name": "all", "synthetic": True}
-    )
+    graph_type: Literal["directed", "undirected"] = "directed"
 
 
 class GraphBuilder(Configurable[GraphBuilderConfig]):
-    """Build a containment graph from an overlap matrix and region metrics.
+    """Materialize a labeled matrix into a graph with region node attributes.
 
-    Parent assignment is always hierarchical. The output graph type is
-    controlled by config.graph_type (directed or undirected). Subclasses
-    implement backend hooks (_add_node, _create_edge, _new_*_graph).
+    Subclasses implement backend hooks (_add_node, _create_edge, _new_*_graph).
     """
 
     def __init__(self, config: GraphBuilderConfig):
@@ -147,15 +174,13 @@ class GraphBuilder(Configurable[GraphBuilderConfig]):
         regions: pd.DataFrame,
         annotations: Any = None,
     ) -> Any:
-        """Build a containment graph from overlap weights and region metrics.
+        """Build a graph from matrix weights and region metrics.
 
-        Each non-root node is assigned a single parent among larger objects with
-        matrix weight at or above the configured threshold. The primary root is
-        the highest-ranked object by rank_attribute. Orphan handling follows
-        config.orphan_strategy.
+        Each non-NaN matrix cell becomes an edge from the row node to the
+        column node. Node attributes come from ``regions``.
 
         Args:
-            matrix: Labeled square overlap matrix (e.g. from MatrixCombiner).
+            matrix: Labeled square matrix (e.g. from :class:`HierarchicalMatrix`).
             regions: Region metrics for all objects, indexed by object_id.
             annotations: Reserved for future use (ignored).
 
@@ -183,28 +208,6 @@ class GraphBuilder(Configurable[GraphBuilderConfig]):
         else:
             raise ValueError(f"Invalid graph type: {self.config.graph_type}")
 
-    def _create_node(
-        self,
-        graph: Any,
-        attributes: dict[str, Any],
-        *,
-        node_id: Optional[Any] = None,
-    ) -> Any:
-        if node_id is None:
-            attrs = {
-                key: value
-                for key, value in attributes.items()
-                if key != "object_id"
-            }
-            node_id = uuid.uuid4().hex
-            attrs["object_id"] = node_id
-        else:
-            attrs = dict(attributes)
-            if "object_id" not in attrs:
-                attrs["object_id"] = node_id
-        self._add_node(graph, node_id, attrs)
-        return node_id
-
     def _add_node(self, graph: Any, node_id: Any, attributes: dict[str, Any]) -> None:
         raise NotImplementedError("Subclasses must implement _add_node")
 
@@ -218,130 +221,6 @@ class GraphBuilder(Configurable[GraphBuilderConfig]):
     ) -> None:
         raise NotImplementedError("Subclasses must implement _create_edge")
 
-    def _assign_parents(
-        self,
-        weight_matrix: pd.DataFrame,
-        region_table: pd.DataFrame,
-    ) -> tuple[dict[Any, Optional[Any]], Any]:
-        rank_attribute = self.config.rank_attribute
-        if rank_attribute not in region_table.columns:
-            raise KeyError(
-                f"rank_attribute {rank_attribute!r} not in regions; "
-                f"available: {list(region_table.columns)}"
-            )
-
-        ranks = region_table[rank_attribute].astype(float)
-        ordered = ranks.sort_values(ascending=False).index.tolist()
-        primary_root = ordered[0]
-
-        parents: dict[Any, Optional[Any]] = {primary_root: None}
-        for child in ordered[1:]:
-            child_rank = float(ranks[child])
-            candidates = [
-                parent
-                for parent in ordered
-                if float(ranks[parent]) > child_rank
-            ]
-            candidates = [
-                parent
-                for parent in candidates
-                if _pairwise_weight(weight_matrix, parent, child) >= self.config.threshold
-            ]
-            if not candidates:
-                parents[child] = None
-                continue
-            if self.config.parent_strategy == "max_weight":
-                parent = max(
-                    candidates,
-                    key=lambda candidate: _pairwise_weight(
-                        weight_matrix, candidate, child
-                    ),
-                )
-            else:
-                parent = min(
-                    candidates, key=lambda candidate: float(ranks[candidate])
-                )
-            parents[child] = parent
-
-        return parents, primary_root
-
-    def _orphan_group_key(
-        self, orphan: Any, region_table: pd.DataFrame, groupby: str
-    ) -> str:
-        if groupby not in region_table.columns:
-            return ORPHAN_GROUP_UNKNOWN
-        value = region_table.loc[orphan, groupby]
-        if pd.isna(value):
-            return ORPHAN_GROUP_UNKNOWN
-        return str(value)
-
-    def _drop_orphan_subtrees(
-        self,
-        nodes: list[Any],
-        parents: dict[Any, Optional[Any]],
-        orphans: list[Any],
-    ) -> set[Any]:
-        drop = set(orphans)
-        while True:
-            added = {
-                child
-                for child, parent in parents.items()
-                if child not in drop and parent in drop
-            }
-            if not added:
-                break
-            drop |= added
-        return {node for node in nodes if node not in drop}
-
-    def _add_orphans(
-        self,
-        graph: Any,
-        *,
-        orphans: list[Any],
-        primary_root: Any,
-        parents: dict[Any, Optional[Any]],
-        region_table: pd.DataFrame,
-    ) -> None:
-        if not orphans:
-            return
-
-        orphan_id = self._create_node(graph, self.config.orphan_node)
-        parents[orphan_id] = None
-
-        if self.config.orphan_groupby is None:
-            for orphan in orphans:
-                parents[orphan] = orphan_id
-                self._create_edge(graph, orphan_id, orphan)
-        else:
-            groups: dict[str, list[Any]] = {}
-            for orphan in orphans:
-                key = self._orphan_group_key(
-                    orphan, region_table, self.config.orphan_groupby
-                )
-                groups.setdefault(key, []).append(orphan)
-
-            for group_key, group_orphans in groups.items():
-                group_id = self._create_node(
-                    graph,
-                    {
-                        "name": f"orphans:{group_key}",
-                        "synthetic": True,
-                        "orphan_group": group_key,
-                    },
-                )
-                self._create_edge(graph, orphan_id, group_id)
-                for orphan in group_orphans:
-                    parents[orphan] = group_id
-                    self._create_edge(graph, group_id, orphan)
-
-        if self.config.orphan_attach == "unify":
-            all_id = self._create_node(graph, self.config.all_node)
-            parents[all_id] = None
-            parents[orphan_id] = all_id
-            parents[primary_root] = all_id
-            self._create_edge(graph, all_id, orphan_id)
-            self._create_edge(graph, all_id, primary_root)
-
     def _build(
         self,
         matrix: pd.DataFrame,
@@ -350,44 +229,29 @@ class GraphBuilder(Configurable[GraphBuilderConfig]):
         weight_matrix = _square_dataframe(matrix)
         nodes = list(weight_matrix.index)
         region_table = _regions_for_nodes(regions, nodes)
-        parents, primary_root = self._assign_parents(weight_matrix, region_table)
-
-        orphans = [
-            node
-            for node in nodes
-            if parents.get(node) is None and node != primary_root
-        ]
 
         graph = self._new_graph()
+        weight_attr = self.config.weight_attribute
 
-        if self.config.orphan_strategy == "drop":
-            keep_nodes = self._drop_orphan_subtrees(nodes, parents, orphans)
-        else:
-            keep_nodes = set(nodes)
-            if self.config.orphan_strategy == "group":
-                self._add_orphans(
+        for node in nodes:
+            raw = region_table.loc[node].to_dict()
+            attrs = {key: value for key, value in raw.items() if pd.notna(value)}
+            attrs["object_id"] = node
+            self._add_node(graph, node, attrs)
+
+        for parent in nodes:
+            for child in nodes:
+                if parent == child:
+                    continue
+                weight = weight_matrix.loc[parent, child]
+                if pd.isna(weight):
+                    continue
+                self._create_edge(
                     graph,
-                    orphans=orphans,
-                    primary_root=primary_root,
-                    parents=parents,
-                    region_table=region_table,
+                    parent,
+                    child,
+                    attributes={weight_attr: float(weight)},
                 )
-
-        for node in keep_nodes:
-            self._create_node(
-                graph, region_table.loc[node].to_dict(), node_id=node
-            )
-
-        for child, parent in parents.items():
-            if parent is None or child not in keep_nodes or parent not in keep_nodes:
-                continue
-            weight = _pairwise_weight(weight_matrix, parent, child)
-            self._create_edge(
-                graph,
-                parent,
-                child,
-                attributes={self.config.weight_attribute: weight},
-            )
 
         return graph
 
