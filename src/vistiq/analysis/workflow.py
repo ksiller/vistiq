@@ -10,6 +10,7 @@ from pydantic import Field
 from prefect import task, unmapped
 
 from vistiq.analysis import OverlapResult
+from vistiq.analysis.overlap import OverlapCalculatorConfig, region_map_from_dataframe
 from vistiq.analysis.coincidence import CoincidenceDetectorConfig
 from vistiq.analysis.distance import DistanceCalculatorConfig
 from vistiq.analysis.matrix import (
@@ -19,7 +20,13 @@ from vistiq.analysis.matrix import (
     MatrixCombiner,
     MatrixCombinerConfig,
 )
-from vistiq.analysis.overlap import OverlapCalculatorConfig, region_map_from_dataframe
+from vistiq.analysis.spatial import (
+    KnnAnalysis,
+    KnnAnalysisConfig,
+    RnnAnalysis,
+    RnnAnalysisConfig,
+    SpatialScopeConfig,
+)
 from vistiq.constant.matrix import UPPER
 from vistiq.core import ArrayIteratorConfig, Configurable, generate_name
 from vistiq.graph import (
@@ -30,6 +37,8 @@ from vistiq.graph import (
     NXGraphQuery,
     NXGraphQueryConfig,
     graph_to_dataframe,
+    resolve_subtree_origins,
+    subtree_origin_key,
 )
 from vistiq.segment import MatrixFilterConfig
 from vistiq.segment.analysis import RegionAnalyzer, RegionAnalyzerConfig
@@ -125,6 +134,17 @@ class AnalysisFlowConfig(WorkflowConfig):
     graph_exporter: Optional[GraphExporterConfig] = Field(
         default_factory=GraphExporterConfig
     )
+    spatial_graph_query: Optional[NXGraphQueryConfig] = Field(
+        default_factory=lambda: NXGraphQueryConfig(
+            attributes=["neighbor_summary"],
+            include_attributes=[],
+            weight_attribute="distance",
+            output_type="dataframe",
+        )
+    )
+    knn_analysis: Optional[KnnAnalysisConfig] = None
+    rnn_analysis: Optional[RnnAnalysisConfig] = None
+    spatial_scope: SpatialScopeConfig = Field(default_factory=SpatialScopeConfig)
     auto_join: Optional[bool] = True
     pairing_mode: Literal["combinations", "permutations", "product"] = "permutations"
 
@@ -151,6 +171,8 @@ class AnalysisFlow(Workflow):
             required_properties.append("bbox")
         if self.config.hierarchical_matrix is not None:
             required_properties.append(self.config.hierarchical_matrix.rank_attribute)
+        if self.config.knn_analysis is not None:
+            required_properties.append("centroid")
 
         output_type = "dataframe"
         index_on = "object_id"
@@ -240,42 +262,50 @@ class AnalysisFlow(Workflow):
                 result = result.join(frame[new_cols], how="left")
         return result
 
-    def _run_hierarchical_analysis(
+    @staticmethod
+    def _finalize_region_analyzer_all(frame: pd.DataFrame) -> pd.DataFrame:
+        """Drop non-region rows and normalize ``channel`` for downstream grouping."""
+        if "channel" not in frame.columns:
+            return frame
+        present = frame["channel"].notna()
+        if not present.all():
+            frame = frame.loc[present].copy()
+        elif not frame["channel"].map(type).eq(str).all():
+            frame = frame.copy()
+        else:
+            return frame
+        frame["channel"] = frame["channel"].map(str)
+        return frame
+
+    def _hierarchical_analysis(
         self,
-        measurements: dict[str, Any],
+        ios_matrices: list[Any],
+        regions: pd.DataFrame,
         stack_names: list[str],
     ) -> dict[str, Any]:
-        ios_matrices = [
-            matrix
-            for key, matrix in measurements.items()
-            if key.startswith("overlap_filtered:")
-        ]
         if not ios_matrices:
-            return measurements
+            return {}
         if (
             self.config.matrix_combiner is None
             or self.config.hierarchical_matrix is None
             or self.config.graph_builder is None
         ):
-            return measurements
-
-        regions = self._concat_region_tables(measurements)
-        if regions is None:
-            return measurements
+            return {}
 
         ios_global = MatrixCombiner(self.config.matrix_combiner).run(ios_matrices)
-        measurements["ios_global"] = ios_global
-
         hm = HierarchicalMatrix(self.config.hierarchical_matrix).run(
             ios_global, regions
         )
         builder = Configurable.create_from_config(self.config.graph_builder)
         dag = builder.run(hm.matrix, hm.regions, annotations=None)
-        measurements["containment_graph"] = dag
+        output: dict[str, Any] = {
+            "ios_global": ios_global,
+            "containment_graph": dag,
+        }
 
         gqcfg = self.config.graph_query
         if gqcfg is None:
-            return measurements
+            return output
 
         if gqcfg.filter_value is not None:
             query_configs = [gqcfg]
@@ -320,37 +350,140 @@ class AnalysisFlow(Workflow):
             if frame is not None and not frame.empty
         ]
         if not graph_parts:
-            return measurements
+            return output
 
         graph_df = pd.concat(graph_parts, axis=1)
         graph_df = graph_df.loc[:, ~graph_df.columns.duplicated()]
-        measurements["hierarchical_analysis"] = graph_df
-        return measurements
+        output["hierarchical_analysis"] = graph_df
+        return output
 
     def _spatial_analysis(
         self,
-        measurements: dict[str, Any],
         containment_graph: Any,
-        stack_names: list[str],
         metadata: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
-        # run distance matrix and knn analysis on containment_graph
-        # homotypic knn analysis (within same channel): 
-        # - configurable parameters:k, grouping_attribute (default "channel"), subtree_attribute (default None)
-        # - results: mean_distance, local knn_density, closest neighbor distance, knn-dag-homotypic
-        # heterotypic knn analysis (between different channels, all pairwise combinations):
-        # - configurable parameters:k, grouping_attribute (default "channel"), subtree_attribute (default None)
-        # - results: mean_distance, local knn_density, closest neighbor distance, knn-dag-heterotypic
-        # homotypic radial nearest neighbors (rnn) analysis (within same channel):
-        # - configurable parameters:radius, grouping_attribute (default "channel"), subtree_attribute (default None)
-        # - results: mean_distance, local rnn_density, closest neighbor distance, radial-dag-homotypic
-        # heterotypic radial neighbors analysis (between different channels, all pairwise combinations):
-        # - configurable parameters:radius, grouping_attribute (default "channel"), subtree_attribute (default None)
-        # - results: mean_distance, local knn_density, closest neighbor distance, radial-dag-heterotypic
-        # distance to parent: based on centroid-to-centroid distance
-        # - configurable parameters:grouping_attribute (default "channel")
-        # - results: mean_distance, local knn_density, closest neighbor distance, distance-from-parent
-        return measurements
+        if containment_graph is None:
+            return {}
+        if self.config.knn_analysis is None and self.config.rnn_analysis is None:
+            return {}
+
+        scope = self.config.spatial_scope
+        origins = resolve_subtree_origins(
+            containment_graph,
+            match=scope.match,
+            exclude=scope.exclude,
+            auto_root=scope.auto_root,
+        )
+        axes = tuple(metadata[0].get("axes", ())) if metadata else None
+        gqcfg = self.config.spatial_graph_query
+        index = (self.config.graph_exporter or GraphExporterConfig()).index
+        output: dict[str, Any] = {}
+        knn_mapped: Optional[list[Any]] = None
+        knn_results: Optional[list[Any]] = None
+
+        if self.config.knn_analysis is not None:
+            knn = KnnAnalysis(self.config.knn_analysis)
+            knn_mapped = list(
+                knn.run.map(
+                    unmapped(containment_graph),
+                    node=origins,
+                    axes=unmapped(axes),
+                )
+            )
+            if len(origins) > 1:
+                output["knn_analysis"] = {
+                    subtree_origin_key(origin): result
+                    for origin, result in zip(origins, knn_mapped)
+                }
+            else:
+                output["knn_analysis"] = knn_mapped[0]
+
+            if gqcfg is not None:
+                knn_results = resolve_futures(knn_mapped)
+                gq = NXGraphQuery(
+                    gqcfg.model_copy(
+                        update={
+                            "output_index": index,
+                            "group_attribute": self.config.knn_analysis.grouping_attribute,
+                            "neighbor_analysis": "knn",
+                            "neighbor_k": self.config.knn_analysis.k,
+                        }
+                    )
+                )
+                gq_results = list(
+                    gq.run.map([result.graph for result in knn_results])
+                )
+                frames = [
+                    frame
+                    for frame in resolve_futures(
+                        list(gq.format.map(gq_results, unmapped("neighbor_summary")))
+                    )
+                    if isinstance(frame, pd.DataFrame) and not frame.empty
+                ]
+                if len(origins) > 1:
+                    frames = [
+                        frame.assign(spatial_origin=subtree_origin_key(origin))
+                        for frame, origin in zip(frames, origins)
+                    ]
+                if frames:
+                    output["spatial_analysis"] = pd.concat(frames, axis=0)
+
+        if self.config.rnn_analysis is not None:
+            rnn = RnnAnalysis(self.config.rnn_analysis)
+            if knn_mapped is not None:
+                knn_results = knn_results or resolve_futures(knn_mapped)
+                distance_inputs = [
+                    result.distance_matrix for result in knn_results
+                ]
+            else:
+                distance_inputs = [None] * len(origins)
+            rnn_mapped = list(
+                rnn.run.map(
+                    unmapped(containment_graph),
+                    node=origins,
+                    distance_matrix=distance_inputs,
+                    axes=unmapped(axes),
+                )
+            )
+            if len(origins) > 1:
+                output["rnn_analysis"] = {
+                    subtree_origin_key(origin): result
+                    for origin, result in zip(origins, rnn_mapped)
+                }
+            else:
+                output["rnn_analysis"] = rnn_mapped[0]
+
+            if gqcfg is not None:
+                rnn_results = resolve_futures(rnn_mapped)
+                gq = NXGraphQuery(
+                    gqcfg.model_copy(
+                        update={
+                            "output_index": index,
+                            "group_attribute": self.config.rnn_analysis.grouping_attribute,
+                            "neighbor_analysis": "rnn",
+                            "neighbor_radius": self.config.rnn_analysis.radius,
+                        }
+                    )
+                )
+                gq_results = list(
+                    gq.run.map([result.graph for result in rnn_results])
+                )
+                frames = [
+                    frame
+                    for frame in resolve_futures(
+                        list(gq.format.map(gq_results, unmapped("neighbor_summary")))
+                    )
+                    if isinstance(frame, pd.DataFrame) and not frame.empty
+                ]
+                if len(origins) > 1:
+                    frames = [
+                        frame.assign(spatial_origin=subtree_origin_key(origin))
+                        for frame, origin in zip(frames, origins)
+                    ]
+                if frames:
+                    output["rnn_spatial_analysis"] = pd.concat(frames, axis=0)
+
+        return output
 
 
     def _run(
@@ -359,6 +492,8 @@ class AnalysisFlow(Workflow):
         metadata: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         """Run analysis on labeled image stacks of equal shape."""
+        logger.info(f"Running analysis flow with config: {self.config}")
+        logger.info(f"Number of labels: {len(labels)}")
         if len(labels) == 0:
             raise ValueError("No labels provided")
         if any(label.shape != labels[0].shape for label in labels):
@@ -458,33 +593,58 @@ class AnalysisFlow(Workflow):
         measurements = resolve_futures(results)
 
         stack_names = [_stack_name(metadata, index) for index in range(len(labels))]
-        if self._concat_region_tables(measurements) is not None:
-            measurements = self._run_hierarchical_analysis(measurements, stack_names)
-            measurements = self._spatial_analysis(
-                measurements,
-                measurements.get("containment_graph"),
-                stack_names,
-                metadata,
-            )
+        regions = self._concat_region_tables(measurements)
+        if regions is not None:
+            ios_matrices = [
+                matrix
+                for key, matrix in measurements.items()
+                if key.startswith("overlap_filtered:")
+            ]
+            measurements = {
+                **measurements,
+                **self._hierarchical_analysis(
+                    ios_matrices, regions, stack_names
+                ),
+            }
+            measurements = {
+                **measurements,
+                **self._spatial_analysis(
+                    measurements.get("containment_graph"),
+                    metadata,
+                ),
+            }
 
         if self.config.auto_join:
-            measurements = self._auto_join(measurements)
+            measurements = self._auto_join(resolve_futures(measurements))
 
-        return measurements
+        return resolve_futures(measurements)
 
-    def _auto_join(self, results: dict[str, Any]) -> dict[str, Any]:
-        """Build region_analyzer_all and merge derived analysis tables."""
-        base = self._build_region_analyzer_all(results)
+    def _auto_join(self, measurements: dict[str, Any]) -> dict[str, Any]:
+        """Build region_analyzer_all and return a new measurements dict."""
+        base = self._build_region_analyzer_all(measurements)
         if base is None:
-            return results
+            return measurements
 
         derived: list[pd.DataFrame] = []
-        for key in ("hierarchical_analysis", "spatial_analysis"):
-            frame = results.get(key)
+        for key in (
+            "hierarchical_analysis",
+            "spatial_analysis",
+            "rnn_spatial_analysis",
+        ):
+            frame = measurements.get(key)
             if isinstance(frame, pd.DataFrame) and not frame.empty:
                 derived.append(frame)
 
-        results["region_analyzer_all"] = self._join_derived_columns(base, derived)
-        results.pop("hierarchical_analysis", None)
-        results.pop("spatial_analysis", None)
-        return results
+        drop_keys = {
+            "hierarchical_analysis",
+            "spatial_analysis",
+            "rnn_spatial_analysis",
+        }
+        joined = self._join_derived_columns(base, derived)
+        return {
+            **{key: value for key, value in measurements.items() if key not in drop_keys},
+            "region_analyzer_all": self._finalize_region_analyzer_all(joined),
+        }
+
+
+AnalysisFlowConfig.model_rebuild()

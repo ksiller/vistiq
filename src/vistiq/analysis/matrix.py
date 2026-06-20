@@ -555,7 +555,7 @@ def _parents_to_matrix(
     weight_matrix: pd.DataFrame,
     nodes: list[Any],
     *,
-    structural_weight: float,
+    synthetic_weight: float,
 ) -> pd.DataFrame:
     matrix = pd.DataFrame(float("nan"), index=nodes, columns=nodes, dtype=float)
     for child, parent in parents.items():
@@ -563,7 +563,7 @@ def _parents_to_matrix(
             continue
         weight = _pairwise_weight(weight_matrix, parent, child)
         if pd.isna(weight):
-            weight = structural_weight
+            weight = synthetic_weight
         matrix.loc[parent, child] = weight
     return matrix
 
@@ -612,7 +612,14 @@ class HierarchicalMatrixConfig(MatrixTransformerConfig):
     orphan_strategy: Literal["drop", "as_roots", "group"] = "as_roots"
     orphan_groupby: Optional[str] = None
     orphan_attach: Literal["separate_root", "unify"] = "separate_root"
-    structural_weight: float = 1.0
+    synthetic_weight: float = Field(
+        default=1.0,
+        description=(
+            "Fallback matrix weight when a hierarchical edge has no IoS value "
+            "(orphan/synthetic links). GraphBuilder marks those edges synthetic=True "
+            "when either endpoint is a synthetic node."
+        ),
+    )
     orphan_node: dict[str, Any] = Field(
         default_factory=lambda: {"name": "Orphans", "synthetic": True}
     )
@@ -688,7 +695,7 @@ class HierarchicalMatrix(MatrixTransformer):
             parents,
             weight_matrix,
             keep_nodes,
-            structural_weight=self.config.structural_weight,
+            synthetic_weight=self.config.synthetic_weight,
         )
         region_table = _finalize_region_table(region_table)
         return MatrixTransformResult(matrix=hierarchical, regions=region_table)

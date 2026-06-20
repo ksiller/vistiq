@@ -13,6 +13,7 @@ from vistiq.analysis.workflow import AnalysisFlow, AnalysisFlowConfig
 from vistiq.constant.matrix import UPPER
 from vistiq.analysis.matrix import HierarchicalMatrixConfig, MatrixCombinerConfig
 from vistiq.graph import NXGraphBuilderConfig, NXGraphQueryConfig
+from vistiq.analysis.spatial import KnnAnalysisConfig
 from vistiq.segment import ValueFilterConfig
 from vistiq.segment.analysis import RegionAnalyzerConfig
 from vistiq.utils import ArrayIteratorConfig as UtilsArrayIteratorConfig
@@ -105,6 +106,8 @@ def _flow_config(**updates) -> AnalysisFlowConfig:
         "hierarchical_matrix": None,
         "graph_builder": None,
         "graph_query": None,
+        "knn_analysis": None,
+        "rnn_analysis": None,
     }
     defaults.update(updates)
     return AnalysisFlowConfig(**defaults)
@@ -444,4 +447,45 @@ def test_analysis_flow_hierarchical_analysis(hierarchical_label_pair):
     assert len(combined) == measurements["ios_global"].shape[0]
     assert list(combined.columns).count("label") == 1
     assert list(combined.columns).count("channel") == 1
+    assert combined["channel"].map(type).eq(str).all()
+    assert len(np.unique(combined["channel"])) >= 1
     assert any(col.startswith("count ") or col.startswith("lineage ") for col in combined.columns)
+
+
+def test_analysis_flow_knn_analysis(multi_object_label_pair):
+    cfg = _flow_config(
+        region_analyzer=_region_analyzer_config(),
+        overlap_calculator=_overlap_calculator_config(),
+        overlap_filter=ValueFilterConfig(
+            ref_value=0.0,
+            operator=">",
+            output="masked_values",
+        ),
+        matrix_combiner=MatrixCombinerConfig(
+            fill_value=float("nan"),
+            symmetrize=True,
+            triangle=UPPER,
+        ),
+        hierarchical_matrix=HierarchicalMatrixConfig(
+            orphan_strategy="as_roots",
+            rank_attribute="volume",
+            threshold=0.2,
+        ),
+        graph_builder=NXGraphBuilderConfig(),
+        graph_query=None,
+        knn_analysis=KnnAnalysisConfig(
+            k=1,
+            mode="homotypic",
+            grouping_attribute="channel",
+        ),
+    )
+    measurements = _run_flow(cfg, multi_object_label_pair)
+
+    assert "containment_graph" in measurements
+    knn = measurements["knn_analysis"]
+    assert hasattr(knn, "distance_matrix")
+    assert hasattr(knn, "matrix")
+    assert hasattr(knn, "graph")
+    combined = measurements["region_analyzer_all"]
+    assert "knn_nearest_neighbor_distance_A_(k=1)" in combined.columns
+    assert "knn_mean_distance_A_(k=1)" in combined.columns

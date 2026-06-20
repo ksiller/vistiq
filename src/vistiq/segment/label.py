@@ -39,6 +39,8 @@ from vistiq.utils import (
 from vistiq.preprocess import (
     Resize, 
     ResizeConfig, 
+    UpsampleConfig,
+    Upsample,
 )
 
 from vistiq.workflow import Workflow, WorkflowConfig
@@ -1726,8 +1728,10 @@ class TiledSegmentationFlow(SegmentationFlow):
         cropped_width = labels.shape[-1]-self.config.pad_width[-1][1]
         cropped_labels = labels[..., 0:cropped_height, 0:cropped_width]
 
-        ecfg = ResizeConfig(width=orig_width, height=orig_height, anti_aliasing=False, order=0, preserve_range=True, normalize=False, dtype=np.uint16)
-        resized_labels, _ = Resize(ecfg).run(cropped_labels, metadata=r_metadata,  **kwargs)
+        #ecfg = ResizeConfig(width=orig_width, height=orig_height, anti_aliasing=False, order=0, preserve_range=True, normalize=False, dtype=np.uint16)
+        #resized_labels, _ = Resize(ecfg).run(cropped_labels, metadata=r_metadata,  **kwargs)
+        ecfg = UpsampleConfig(width=orig_width, height=orig_height, sigma=3.0)
+        resized_labels, _ = Upsample(ecfg).run(cropped_labels, metadata=r_metadata, **kwargs)
 
         if resized_labels.shape != stack.shape:
             logging.error(f"resized_labels.shape: {resized_labels.shape} != stack.shape: {stack.shape}")

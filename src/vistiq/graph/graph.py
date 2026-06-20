@@ -22,6 +22,35 @@ from vistiq.core import Configurable, Configuration, generate_name
 logger = logging.getLogger(__name__)
 
 
+def _sanitize_neighbor_column_part(value: Any) -> str:
+    return str(value).replace(" ", "_")
+
+
+def spatial_neighbor_column(
+    analysis: str,
+    metric: str,
+    group: Any,
+    *,
+    k: Optional[int] = None,
+    radius: Optional[float] = None,
+) -> str:
+    """Build ``{analysis}_{metric}_{group}_(k=…)`` or ``…_(radius=…)``."""
+    if analysis == "knn":
+        if k is None:
+            raise ValueError("k is required for knn neighbor column names")
+        param = f"k={k}"
+    elif analysis == "rnn":
+        if radius is None:
+            raise ValueError("radius is required for rnn neighbor column names")
+        radius_value = int(radius) if float(radius).is_integer() else radius
+        param = f"radius={radius_value}"
+    else:
+        raise ValueError(f"unsupported neighbor analysis {analysis!r}")
+    return (
+        f"{analysis}_{metric}_{_sanitize_neighbor_column_part(group)}_({param})"
+    )
+
+
 def _normalize_regions_index(regions: pd.DataFrame) -> pd.DataFrame:
     """Return a copy of regions indexed by object_id.
 
@@ -59,6 +88,83 @@ def graph_to_dataframe(graph: Any, *, index: str = "object_id") -> pd.DataFrame:
     if index in frame.columns:
         frame = frame.drop(columns=[index])
     return frame
+
+
+def _attrs_match(attrs: dict[str, Any], criteria: dict[str, Any]) -> bool:
+    return all(attrs.get(key) == value for key, value in criteria.items())
+
+
+def subtree_origin_key(origin: Any) -> str:
+    """String key for a spatial subtree root (``None`` → ``"all"``)."""
+    return "all" if origin is None else str(origin)
+
+
+def resolve_subtree_origins(
+    graph: Any,
+    *,
+    node: Optional[Any] = None,
+    match: Optional[dict[str, Any]] = None,
+    exclude: Optional[dict[str, Any]] = None,
+    auto_root: bool = False,
+) -> list[Optional[Any]]:
+    """Resolve spatial-analysis subtree root(s) at runtime.
+
+    Returns ``[None]`` when no scoping is requested (analyze the full graph).
+    *exclude* removes candidates that match; it wins over *match* when both apply.
+    """
+    if node is not None:
+        if node not in graph:
+            raise KeyError(f"node {node!r} not found in graph")
+        attrs = graph.nodes[node]
+        if exclude and _attrs_match(attrs, exclude):
+            raise KeyError(f"node {node!r} matches exclude criteria {exclude!r}")
+        return [node]
+    if match:
+        origins = sorted(
+            (
+                node_id
+                for node_id, attrs in graph.nodes(data=True)
+                if _attrs_match(attrs, match)
+                and not (exclude and _attrs_match(attrs, exclude))
+            ),
+            key=str,
+        )
+        if not origins:
+            raise KeyError(f"no node matching {match!r} after exclude {exclude!r}")
+        return origins
+    if auto_root:
+        origin = NXGraphQuery._resolve_origin(graph, None)
+        attrs = graph.nodes[origin]
+        if exclude and _attrs_match(attrs, exclude):
+            raise KeyError(
+                f"auto_root node {origin!r} matches exclude criteria {exclude!r}"
+            )
+        return [origin]
+    return [None]
+
+
+def resolve_subtree_origin(
+    graph: Any,
+    *,
+    node: Optional[Any] = None,
+    match: Optional[dict[str, Any]] = None,
+    exclude: Optional[dict[str, Any]] = None,
+    auto_root: bool = False,
+) -> Optional[Any]:
+    """Resolve a single subtree root; raises when multiple nodes match *match*."""
+    origins = resolve_subtree_origins(
+        graph,
+        node=node,
+        match=match,
+        exclude=exclude,
+        auto_root=auto_root,
+    )
+    if len(origins) > 1:
+        raise ValueError(
+            f"spatial scope matched {len(origins)} subtree roots: {origins[:5]}; "
+            "use AnalysisFlow spatial_scope mapping or pass node="
+        )
+    return origins[0]
 
 
 class GraphExporterConfig(Configuration):
@@ -147,10 +253,13 @@ class GraphBuilderConfig(Configuration):
 
     Attributes:
         weight_attribute: Edge attribute key used when storing matrix weights.
+        synthetic_attribute: Edge attribute key set to ``True`` when either
+            endpoint is a synthetic node (for example orphan-group roots).
         graph_type: Whether to build a directed or undirected graph.
     """
 
     weight_attribute: str = "ios"
+    synthetic_attribute: str = "synthetic"
     graph_type: Literal["directed", "undirected"] = "directed"
 
 
@@ -232,6 +341,12 @@ class GraphBuilder(Configurable[GraphBuilderConfig]):
 
         graph = self._new_graph()
         weight_attr = self.config.weight_attribute
+        synthetic_attr = self.config.synthetic_attribute
+        synthetic_nodes = {
+            node
+            for node in nodes
+            if bool(region_table.loc[node].get("synthetic", False))
+        }
 
         for node in nodes:
             raw = region_table.loc[node].to_dict()
@@ -246,11 +361,14 @@ class GraphBuilder(Configurable[GraphBuilderConfig]):
                 weight = weight_matrix.loc[parent, child]
                 if pd.isna(weight):
                     continue
+                edge_attrs: dict[str, Any] = {weight_attr: float(weight)}
+                if parent in synthetic_nodes or child in synthetic_nodes:
+                    edge_attrs[synthetic_attr] = True
                 self._create_edge(
                     graph,
                     parent,
                     child,
-                    attributes={weight_attr: float(weight)},
+                    attributes=edge_attrs,
                 )
 
         return graph
@@ -367,6 +485,7 @@ class GraphQuery(Configurable["GraphQueryConfig"]):
         "nodes_by_attribute": "_summary_nodes_by_attribute",
         "descendant_counts": "_descendant_counts",
         "ancestor_lineage": "_ancestor_lineage",
+        "neighbor_summary": "_neighbor_summary",
     }
 
     @classmethod
@@ -415,6 +534,8 @@ class GraphQuery(Configurable["GraphQueryConfig"]):
 
         if self.config.output_type == "dataframe":
             rows = output if isinstance(output, list) else [output]
+            if not rows:
+                return pd.DataFrame()
             return self._to_dataframe(rows)
         if isinstance(output, dict):
             return output
@@ -572,6 +693,11 @@ class GraphQuery(Configurable["GraphQueryConfig"]):
     ) -> list[dict[str, Any]]:
         raise NotImplementedError("Subclasses must implement _ancestor_lineage")
 
+    def _neighbor_summary(
+        self, graph: Any, node: Any
+    ) -> list[dict[str, Any]]:
+        raise NotImplementedError("Subclasses must implement _neighbor_summary")
+
 
 class GraphQueryConfig(Configuration):
     """Configuration for GraphQuery.
@@ -588,6 +714,7 @@ class GraphQueryConfig(Configuration):
             descendant_counts and ancestor_lineage.
         lineage_value_attribute: Node attribute stored in each lineage column
             of ancestor_lineage (for example label).
+        weight_attribute: Edge attribute read for neighbor_summary distances.
         attributes: Query keys to compute. Each name must appear in
             GraphQuery.allowed_attributes(). When omitted, defaults to
             GraphQuery.default_attributes.
@@ -599,6 +726,10 @@ class GraphQueryConfig(Configuration):
     filter_value: Any = None
     include_attributes: List[str] = Field(default_factory=list)
     lineage_value_attribute: str = "label"
+    weight_attribute: str = "ios"
+    neighbor_analysis: Optional[Literal["knn", "rnn"]] = None
+    neighbor_k: Optional[int] = None
+    neighbor_radius: Optional[float] = None
     attributes: List[str] = Field(
         default_factory=lambda: list(GraphQuery.default_attributes)
     )
@@ -903,6 +1034,90 @@ class NXGraphQuery(GraphQuery):
                 row[f"lineage {group}"] = (
                     int(value) if value is not None else None
                 )
+            data.append(row)
+        return data
+
+    def _neighbor_summary(
+        self, graph: Any, node: Any
+    ) -> list[dict[str, Any]]:
+        del node
+        weight_key = self.config.weight_attribute
+        group_attr = self.config.group_attribute
+        analysis = self.config.neighbor_analysis
+        neighbor_k = self.config.neighbor_k
+        neighbor_radius = self.config.neighbor_radius
+        include = list(self.config.include_attributes)
+        data: list[dict[str, Any]] = []
+        for node_id in graph.nodes:
+            row: dict[str, Any] = {self.config.output_index: node_id}
+            if analysis is None:
+                for key in set(include):
+                    row[key] = graph.nodes[node_id].get(key)
+
+            by_group: dict[Any, list[tuple[float, Any]]] = {}
+            for _, child, edge_data in graph.out_edges(node_id, data=True):
+                weight = edge_data.get(weight_key)
+                if weight is None or pd.isna(weight):
+                    continue
+                weight = float(weight)
+                group_val = graph.nodes[child].get(group_attr, "__none__")
+                by_group.setdefault(group_val, []).append((weight, child))
+
+            if analysis is not None and (
+                (analysis == "knn" and neighbor_k is not None)
+                or (analysis == "rnn" and neighbor_radius is not None)
+            ):
+                for group_val in sorted(by_group, key=str):
+                    entries = by_group[group_val]
+                    if not entries:
+                        continue
+                    weights = [entry[0] for entry in entries]
+                    nearest_distance, nearest_id = min(entries, key=lambda item: item[0])
+                    column_kwargs = {"k": neighbor_k, "radius": neighbor_radius}
+                    row[
+                        spatial_neighbor_column(
+                            analysis, "count", group_val, **column_kwargs
+                        )
+                    ] = len(weights)
+                    row[
+                        spatial_neighbor_column(
+                            analysis, "mean_distance", group_val, **column_kwargs
+                        )
+                    ] = float(sum(weights) / len(weights))
+                    row[
+                        spatial_neighbor_column(
+                            analysis,
+                            "nearest_neighbor_distance",
+                            group_val,
+                            **column_kwargs,
+                        )
+                    ] = nearest_distance
+                    row[
+                        spatial_neighbor_column(
+                            analysis,
+                            "nearest_neighbor_id",
+                            group_val,
+                            **column_kwargs,
+                        )
+                    ] = nearest_id
+                data.append(row)
+                continue
+
+            weights: list[float] = []
+            nearest_id: Any = None
+            nearest_distance: Optional[float] = None
+            for grouped in by_group.values():
+                for weight, child in grouped:
+                    weights.append(weight)
+                    if nearest_distance is None or weight < nearest_distance:
+                        nearest_distance = weight
+                        nearest_id = child
+
+            row["knn_count"] = len(weights)
+            if weights:
+                row["nearest_neighbor_distance"] = nearest_distance
+                row["knn_mean_distance"] = float(sum(weights) / len(weights))
+                row["nearest_neighbor_id"] = nearest_id
             data.append(row)
         return data
 

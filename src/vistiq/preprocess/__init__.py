@@ -15,6 +15,8 @@ from vistiq.preprocess.preprocess import (
     RescaleConfig,
     Resize,
     ResizeConfig,
+    Upsample,
+    UpsampleConfig,
 )
 
 __all__ = [
@@ -28,6 +30,10 @@ __all__ = [
     "PreprocessFlowConfig",
     "Preprocessor",
     "PreprocessorConfig",
+    "Rescale",
+    "RescaleConfig",
     "Resize",
     "ResizeConfig",
+    "Upsample",
+    "UpsampleConfig",
 ]

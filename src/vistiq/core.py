@@ -733,12 +733,13 @@ class StackProcessor(Configurable):
                 )
                 if "axes" in new_metadata and new_metadata["axes"]:
                     if self.config.output_axes is not None:
-                        axes = self.config.output_axes
+                        axes = list(self.config.output_axes)
                     else:
                         axes = [
                             chr(ord("A") + i)
                             for i in range(len(new_shape) - len(orig_shape))
-                        ] + new_metadata["axes"]
+                        ] + list(new_metadata["axes"])
+                    new_metadata["axes"] = axes
                     logger.info(f"Adding axes. New axes: {axes}")
 
         change = orig / new

@@ -103,6 +103,7 @@ class TestNXGraphBuilder:
         assert "c" not in dag.successors("p")
         assert dag.nodes["a"]["volume"] == 10.0
         assert dag.edges["p", "a"]["ios"] == pytest.approx(0.9)
+        assert dag.edges["p", "a"].get("synthetic") is not True
 
     def test_regions_indexed_by_object_id(self):
         regions = _sample_regions()
@@ -272,6 +273,23 @@ class TestNXGraphQuery:
         assert len(df) == 2
         assert "lineage Brain" in df.columns
 
+    def test_format_empty_rows_returns_empty_dataframe(self):
+        dag = _build_containment_dag(_sample_matrix(), _sample_regions())
+        gq = NXGraphQuery(
+            NXGraphQueryConfig(
+                attributes=["descendant_counts"],
+                filter_attribute="channel",
+                filter_value="Dpn",
+                output_type="dataframe",
+            )
+        )
+        result = gq.run(dag)
+        assert result["descendant_counts"] == []
+        frame = gq.format(result, attribute="descendant_counts")
+        assert isinstance(frame, pd.DataFrame)
+        assert frame.empty
+        assert gq.format([]).empty
+
     def test_invalid_attribute_raises(self):
         with pytest.raises(ValueError, match="invalid attributes"):
             NXGraphQueryConfig(attributes=["not_a_real_key"])
@@ -357,6 +375,8 @@ class TestOrphanHandling:
         orphan_root = synthetic_roots[0]
         assert dag.nodes[orphan_root]["name"] == "Orphans"
         assert dag.has_edge(orphan_root, "c")
+        assert dag.edges[orphan_root, "c"]["synthetic"] is True
+        assert dag.edges["p", "a"].get("synthetic") is not True
         assert self._orphan_roots(
             threshold=0.5,
             orphan_strategy="group",
@@ -379,6 +399,7 @@ class TestOrphanHandling:
         assert len(group_nodes) == 1
         group_id = group_nodes[0]
         assert dag.has_edge(group_id, "c")
+        assert dag.edges[group_id, "c"]["synthetic"] is True
 
     def test_unify_attach(self):
         dag = _build_containment_dag(
@@ -393,3 +414,5 @@ class TestOrphanHandling:
         all_root = all_roots[0]
         assert dag.nodes[all_root]["name"] == "all"
         assert dag.out_degree(all_root) == 2
+        for _parent, _child in dag.out_edges(all_root):
+            assert dag.edges[_parent, _child]["synthetic"] is True

@@ -10,7 +10,11 @@ from .graph import (
     NXGraphQuery,
     NXGraphQueryConfig,
     graph_to_dataframe,
+    resolve_subtree_origin,
+    resolve_subtree_origins,
+    subtree_origin_key,
 )
+from .viz import graph_to_layers
 
 __all__ = [
     "GraphBuilder",
@@ -24,4 +28,8 @@ __all__ = [
     "NXGraphQuery",
     "NXGraphQueryConfig",
     "graph_to_dataframe",
+    "graph_to_layers",
+    "resolve_subtree_origin",
+    "resolve_subtree_origins",
+    "subtree_origin_key",
 ]

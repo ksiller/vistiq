@@ -68,6 +68,16 @@ from .overlap import (
     parse_region_map,
     region_map_from_dataframe,
 )
+from .spatial import (
+    KnnAnalysis,
+    KnnAnalysisConfig,
+    RnnAnalysis,
+    RnnAnalysisConfig,
+    SpatialGraphResult,
+    SpatialNeighborConfig,
+    SpatialScopeConfig,
+    distance_matrix_from_regions,
+)
 from .enrichment import (
     GridDensityFeaturesConfig,
     NeighborFeaturesConfig,
@@ -150,4 +160,12 @@ __all__ = [
     "RegionDataFrameEnrichmentConfig",
     "add_grid_density_features",
     "add_neighbor_features",
+    "KnnAnalysis",
+    "KnnAnalysisConfig",
+    "RnnAnalysis",
+    "RnnAnalysisConfig",
+    "SpatialGraphResult",
+    "SpatialNeighborConfig",
+    "SpatialScopeConfig",
+    "distance_matrix_from_regions",
 ]
