@@ -159,6 +159,10 @@ def _categorical_colormap(
     return CategoricalColormap(colormap=mapping, fallback_color=palette)
 
 
+def _continuous_colormap_requested(colormap: Optional[ColormapLike]) -> bool:
+    return colormap is not None and not _is_color_list(colormap)
+
+
 def _continuous_colormap_kwargs(
     color_spec: VisualSpec,
     properties: dict[str, np.ndarray],
@@ -166,13 +170,61 @@ def _continuous_colormap_kwargs(
     *,
     prefix: str,
 ) -> dict[str, Any]:
-    if colormap is None or _is_color_list(colormap):
+    if not _continuous_colormap_requested(colormap):
         return {}
     if not _is_mapped_property(color_spec, properties):
         return {}
     if not _property_is_continuous(properties, color_spec):
         return {}
     return {f"{prefix}_colormap": colormap}
+
+
+def _contrast_limits(values: np.ndarray) -> tuple[float, float]:
+    finite = np.asarray(values, dtype=float)[np.isfinite(values)]
+    if finite.size == 0:
+        return (0.0, 1.0)
+    vmin = float(np.min(finite))
+    vmax = float(np.max(finite))
+    if vmin == vmax:
+        vmax = vmin + 1.0
+    return (vmin, vmax)
+
+
+def _apply_continuous_color(
+    layer: Any,
+    color_spec: VisualSpec,
+    properties: dict[str, np.ndarray],
+    colormap: Optional[ColormapLike],
+    *,
+    kind: ColorKind,
+) -> None:
+    if not _continuous_colormap_requested(colormap):
+        return
+    if not _is_mapped_property(color_spec, properties):
+        return
+    if not _property_is_continuous(properties, color_spec):
+        return
+
+    from napari.utils.colormaps import ensure_colormap
+
+    cmap = ensure_colormap(colormap)
+    contrast_limits = _contrast_limits(properties[color_spec])
+
+    if kind == "face":
+        layer.face_color = color_spec
+        layer.face_colormap = cmap
+        layer.face_color_mode = "colormap"
+        layer.face_contrast_limits = contrast_limits
+    elif kind == "border":
+        layer.border_color = color_spec
+        layer.border_colormap = cmap
+        layer.border_color_mode = "colormap"
+        layer.border_contrast_limits = contrast_limits
+    elif kind == "edge":
+        layer.edge_color = color_spec
+        layer.edge_colormap = cmap
+        layer.edge_color_mode = "colormap"
+        layer.edge_contrast_limits = contrast_limits
 
 
 def _apply_categorical_color(
@@ -559,6 +611,14 @@ def graph_to_layers(
         node_size,
     ]
     node_numeric_specs = _attr_specs(node_size, attr_names=node_field_names)
+    if _continuous_colormap_requested(node_face_colormap):
+        node_numeric_specs = node_numeric_specs | _attr_specs(
+            node_face_color, attr_names=node_field_names
+        )
+    if _continuous_colormap_requested(node_border_colormap):
+        node_numeric_specs = node_numeric_specs | _attr_specs(
+            node_border_color, attr_names=node_field_names
+        )
     if node_symbol is not None:
         node_visual_specs.append(node_symbol)
     if node_border_width is not None:
@@ -647,6 +707,20 @@ def graph_to_layers(
         points_kwargs["blending"] = node_blending
 
     points = Points(positions, **points_kwargs)
+    _apply_continuous_color(
+        points,
+        face_color,
+        node_props,
+        node_face_colormap,
+        kind="face",
+    )
+    _apply_continuous_color(
+        points,
+        border_color,
+        node_props,
+        node_border_colormap,
+        kind="border",
+    )
     _apply_categorical_color(
         points,
         face_color,
@@ -684,6 +758,13 @@ def graph_to_layers(
         vectors_kwargs["vector_style"] = edge_vector_style
 
     vectors_layer = Vectors(vectors, **vectors_kwargs)
+    _apply_continuous_color(
+        vectors_layer,
+        edge_color_kw,
+        edge_properties,
+        edge_colormap,
+        kind="edge",
+    )
     _apply_categorical_color(
         vectors_layer,
         edge_color_kw,

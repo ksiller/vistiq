@@ -173,6 +173,27 @@ def test_graph_to_layers_edge_continuous_colormap():
     assert vectors.edge_colormap.name == "viridis"
 
 
+def test_graph_to_layers_node_continuous_colormap():
+    graph = _sample_graph()
+    points, _ = graph_to_layers(
+        graph,
+        node_face_color="volume",
+        node_border_color="white",
+        node_opacity=1.0,
+        node_size=8,
+        edge_color="cyan",
+        edge_thickness=1,
+        edge_opacity=1.0,
+        node_face_colormap="green",
+    )
+    assert points.face_color_mode == "colormap"
+    assert points.face_colormap.name == "green"
+    assert points.face_color == "volume"
+    assert np.issubdtype(points.properties["volume"].dtype, np.floating)
+    assert points.face_contrast_limits == pytest.approx((10.0, 20.0))
+    assert not np.allclose(points._face.colors[0], points._face.colors[1])
+
+
 def test_graph_to_layers_external_node_properties():
     import pandas as pd
 
