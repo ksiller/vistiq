@@ -13,8 +13,9 @@ from vistiq.analysis.spatial import (
     SpatialScopeConfig,
 )
 from vistiq.graph import (
-    NXGraphQuery,
-    NXGraphQueryConfig,
+    GraphQuery,
+    GraphQueryConfig,
+    NXGraph,
     resolve_subtree_origins,
 )
 
@@ -32,16 +33,16 @@ def _sample_regions() -> pd.DataFrame:
     ).set_index("object_id")
 
 
-def _sample_containment_graph() -> networkx.DiGraph:
+def _sample_containment_graph():
     graph = networkx.DiGraph()
     for object_id, row in _sample_regions().iterrows():
         attrs = row.to_dict()
         attrs["object_id"] = object_id
         graph.add_node(object_id, **attrs)
-    return graph
+    return NXGraph(graph)
 
 
-def _hierarchy_graph() -> networkx.DiGraph:
+def _hierarchy_graph():
     graph = networkx.DiGraph()
     for object_id, row in _sample_regions().iterrows():
         attrs = row.to_dict()
@@ -49,10 +50,10 @@ def _hierarchy_graph() -> networkx.DiGraph:
         graph.add_node(object_id, **attrs)
     graph.add_node("root", channel="A", synthetic=True, object_id="root")
     graph.add_edges_from([("root", "a"), ("root", "b"), ("root", "c"), ("root", "d")])
-    return graph
+    return NXGraph(graph)
 
 
-def _branched_hierarchy_graph() -> networkx.DiGraph:
+def _branched_hierarchy_graph():
     graph = networkx.DiGraph()
     left = _sample_regions().loc[["a", "b"]]
     right = _sample_regions().loc[["c", "d"]]
@@ -70,12 +71,12 @@ def _branched_hierarchy_graph() -> networkx.DiGraph:
             attrs["object_id"] = object_id
             graph.add_node(object_id, **attrs)
             graph.add_edge(root, object_id)
-    return graph
+    return NXGraph(graph)
 
 
 def _neighbor_summary(graph, *, analysis="knn", k=1, radius=None):
-    gq = NXGraphQuery(
-        NXGraphQueryConfig(
+    gq = GraphQuery(
+        GraphQueryConfig(
             attributes=["neighbor_summary"],
             weight_attribute="distance",
             neighbor_analysis=analysis,
@@ -116,9 +117,9 @@ class TestKnnAnalysis:
 
         assert result.distance_matrix.shape == (4, 4)
         assert result.matrix.shape == (4, 4)
-        assert isinstance(result.graph, networkx.DiGraph)
-        assert result.graph.edges["a", "b"]["distance"] == pytest.approx(3.0)
-        assert ("a", "c") not in result.graph.edges
+        assert isinstance(result.graph, NXGraph)
+        assert result.graph.edge_attrs("a", "b")["distance"] == pytest.approx(3.0)
+        assert not result.graph.has_edge("a", "c")
 
         summary = _neighbor_summary(result.graph, k=1)
         assert summary.loc["a", "knn_nearest_neighbor_distance_A_(k=1)"] == pytest.approx(
@@ -130,9 +131,9 @@ class TestKnnAnalysis:
             KnnAnalysisConfig(k=1, mode="heterotypic", grouping_attribute="channel")
         ).run(_sample_containment_graph())
 
-        assert ("a", "b") not in result.graph.edges
-        assert ("a", "c") in result.graph.edges
-        assert result.graph.edges["a", "c"]["distance"] == pytest.approx(10.0)
+        assert not result.graph.has_edge("a", "b")
+        assert result.graph.has_edge("a", "c")
+        assert result.graph.edge_attrs("a", "c")["distance"] == pytest.approx(10.0)
 
         summary = _neighbor_summary(result.graph, k=1)
         assert summary.loc["a", "knn_count_B_(k=1)"] == 1
@@ -154,7 +155,7 @@ class TestKnnAnalysis:
             distance_matrix=baseline.distance_matrix.to_numpy(),
         )
         assert result.distance_matrix.equals(baseline.distance_matrix)
-        assert result.graph.edges["a", "b"]["distance"] == pytest.approx(3.0)
+        assert result.graph.edge_attrs("a", "b")["distance"] == pytest.approx(3.0)
 
     def test_subtree_scope_by_match_dict(self):
         graph = _branched_hierarchy_graph()
@@ -205,8 +206,8 @@ class TestRnnAnalysis:
             RnnAnalysisConfig(radius=5.0, mode="global")
         ).run(_sample_containment_graph())
 
-        assert ("a", "b") in result.graph.edges
-        assert ("a", "c") not in result.graph.edges
+        assert result.graph.has_edge("a", "b")
+        assert not result.graph.has_edge("a", "c")
         summary = _neighbor_summary(result.graph, analysis="rnn", radius=5.0)
         assert summary.loc["a", "rnn_count_A_(radius=5)"] == 1
 
@@ -219,8 +220,8 @@ class TestRnnAnalysis:
             )
         ).run(_sample_containment_graph())
 
-        assert ("a", "b") in result.graph.edges
-        assert ("a", "c") not in result.graph.edges
+        assert result.graph.has_edge("a", "b")
+        assert not result.graph.has_edge("a", "c")
 
     def test_reuses_distance_matrix(self):
         knn_result = KnnAnalysis(KnnAnalysisConfig()).run(_sample_containment_graph())

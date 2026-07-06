@@ -1,4 +1,4 @@
-"""Tests for graph napari visualization helpers."""
+"""Tests for graph napari layer builders."""
 
 import numpy as np
 import pytest
@@ -6,7 +6,7 @@ import pytest
 networkx = pytest.importorskip("networkx")
 napari = pytest.importorskip("napari")
 
-from vistiq.graph import graph_to_layers
+from vistiq.graph import edges_to_layer, nodes_to_layer
 
 
 def _sample_graph():
@@ -27,25 +27,36 @@ def _sample_graph():
     return graph
 
 
-def test_graph_to_layers_constant_visuals():
+def test_nodes_to_layer_constant_visuals():
     graph = _sample_graph()
-    points, vectors = graph_to_layers(
+    points = nodes_to_layer(
         graph,
+        "nodes",
         node_face_color="red",
         node_border_color="white",
         node_opacity=0.8,
         node_size=12,
-        edge_color="cyan",
-        edge_thickness=2,
-        edge_opacity=0.5,
     )
 
+    assert points.name == "nodes"
     assert points.data.shape == (2, 3)
     np.testing.assert_allclose(points.data[0], [1.0, 2.0, 3.0])
     np.testing.assert_allclose(points.data[1], [4.0, 5.0, 6.0])
     assert points.opacity == pytest.approx(0.8)
     assert points.size == 12
 
+
+def test_edges_to_layer_constant_visuals():
+    graph = _sample_graph()
+    vectors = edges_to_layer(
+        graph,
+        "edges",
+        edge_color="cyan",
+        edge_thickness=2,
+        edge_opacity=0.5,
+    )
+
+    assert vectors.name == "edges"
     assert vectors.data.shape == (1, 2, 3)
     np.testing.assert_allclose(vectors.data[0, 0], [1.0, 2.0, 3.0])
     np.testing.assert_allclose(vectors.data[0, 1], [3.0, 3.0, 3.0])
@@ -53,17 +64,15 @@ def test_graph_to_layers_constant_visuals():
     assert vectors.edge_width == 2
 
 
-def test_graph_to_layers_attribute_visuals():
+def test_nodes_to_layer_attribute_visuals():
     graph = _sample_graph()
-    points, vectors = graph_to_layers(
+    points = nodes_to_layer(
         graph,
+        "nodes",
         node_face_color="channel",
         node_border_color="white",
         node_opacity=1.0,
         node_size="volume",
-        edge_color="weight",
-        edge_thickness="weight",
-        edge_opacity=1.0,
     )
 
     assert "channel" in points.properties
@@ -72,28 +81,23 @@ def test_graph_to_layers_attribute_visuals():
     assert points.face_color_mode == "cycle"
     assert points.size == "volume"
 
+
+def test_edges_to_layer_attribute_visuals():
+    graph = _sample_graph()
+    vectors = edges_to_layer(
+        graph,
+        "edges",
+        edge_color="weight",
+        edge_thickness="weight",
+        edge_opacity=1.0,
+    )
+
     assert "weight" in vectors.properties
     assert vectors.edge_color == "weight"
     assert vectors.edge_width == "weight"
 
 
-def test_graph_to_layers_applies_scale():
-    graph = _sample_graph()
-    points, _ = graph_to_layers(
-        graph,
-        node_face_color="red",
-        node_border_color="white",
-        node_opacity=1.0,
-        node_size=5,
-        edge_color="cyan",
-        edge_thickness=1,
-        edge_opacity=1.0,
-        scale=(2.0, 3.0, 4.0),
-    )
-    np.testing.assert_allclose(points.data[0], [2.0, 6.0, 12.0])
-
-
-def test_graph_to_layers_sparse_numeric_size():
+def test_nodes_to_layer_sparse_numeric_size():
     graph = networkx.DiGraph()
     graph.add_node(
         "leaf",
@@ -107,31 +111,27 @@ def test_graph_to_layers_sparse_numeric_size():
         synthetic=True,
         **{"centroid-z": 0.0, "centroid-y": 0.0, "centroid-x": 0.0},
     )
-    points, _ = graph_to_layers(
+    points = nodes_to_layer(
         graph,
+        "nodes",
         node_face_color="channel",
         node_border_color="white",
         node_opacity=1.0,
         node_size="volume",
-        edge_color="cyan",
-        edge_thickness=1,
-        edge_opacity=1.0,
     )
     assert np.issubdtype(points.properties["volume"].dtype, np.floating)
     assert float(np.nanmax(points.properties["volume"])) == 10.0
 
 
-def test_graph_to_layers_channel_color_cycle():
+def test_nodes_to_layer_channel_color_cycle():
     graph = _sample_graph()
-    points, _ = graph_to_layers(
+    points = nodes_to_layer(
         graph,
+        "nodes",
         node_face_color="channel",
         node_border_color="white",
         node_opacity=1.0,
         node_size=8,
-        edge_color="cyan",
-        edge_thickness=1,
-        edge_opacity=1.0,
         node_face_colormap=["red", "blue", "green"],
     )
     assert points.face_color_mode == "cycle"
@@ -140,30 +140,25 @@ def test_graph_to_layers_channel_color_cycle():
     assert not np.allclose(points._face.colors[0], points._face.colors[1])
 
 
-def test_graph_to_layers_channel_default_palette():
+def test_nodes_to_layer_channel_default_palette():
     graph = _sample_graph()
-    points, _ = graph_to_layers(
+    points = nodes_to_layer(
         graph,
+        "nodes",
         node_face_color="channel",
         node_border_color="white",
         node_opacity=1.0,
         node_size=8,
-        edge_color="cyan",
-        edge_thickness=1,
-        edge_opacity=1.0,
     )
     assert points.face_color_mode == "cycle"
     assert not np.allclose(points._face.colors[0], points._face.colors[1])
 
 
-def test_graph_to_layers_edge_continuous_colormap():
+def test_edges_to_layer_continuous_colormap():
     graph = _sample_graph()
-    _, vectors = graph_to_layers(
+    vectors = edges_to_layer(
         graph,
-        node_face_color="red",
-        node_border_color="white",
-        node_opacity=1.0,
-        node_size=8,
+        "edges",
         edge_color="weight",
         edge_thickness=1,
         edge_opacity=1.0,
@@ -173,17 +168,15 @@ def test_graph_to_layers_edge_continuous_colormap():
     assert vectors.edge_colormap.name == "viridis"
 
 
-def test_graph_to_layers_node_continuous_colormap():
+def test_nodes_to_layer_continuous_colormap():
     graph = _sample_graph()
-    points, _ = graph_to_layers(
+    points = nodes_to_layer(
         graph,
+        "nodes",
         node_face_color="volume",
         node_border_color="white",
         node_opacity=1.0,
         node_size=8,
-        edge_color="cyan",
-        edge_thickness=1,
-        edge_opacity=1.0,
         node_face_colormap="green",
     )
     assert points.face_color_mode == "colormap"
@@ -194,20 +187,18 @@ def test_graph_to_layers_node_continuous_colormap():
     assert not np.allclose(points._face.colors[0], points._face.colors[1])
 
 
-def test_graph_to_layers_external_node_properties():
+def test_nodes_to_layer_external_node_properties():
     import pandas as pd
 
     graph = _sample_graph()
     props = pd.DataFrame({"lineage Lobe": [1, 2]}, index=["a", "b"])
-    points, _ = graph_to_layers(
+    points = nodes_to_layer(
         graph,
+        "nodes",
         node_face_color="lineage Lobe",
         node_border_color="white",
         node_opacity=1.0,
         node_size=8,
-        edge_color="cyan",
-        edge_thickness=1,
-        edge_opacity=1.0,
         node_face_colormap=["magenta", "green", "red"],
         node_properties=props,
     )
@@ -217,30 +208,33 @@ def test_graph_to_layers_external_node_properties():
     assert not np.allclose(points._face.colors[0], points._face.colors[1])
 
 
-def test_graph_to_layers_missing_property_with_colormap_raises():
+def test_nodes_to_layer_missing_property_with_colormap_raises():
     graph = _sample_graph()
     with pytest.raises(ValueError, match="lineage Lobe"):
-        graph_to_layers(
+        nodes_to_layer(
             graph,
+            "nodes",
             node_face_color="lineage Lobe",
             node_border_color="white",
             node_opacity=1.0,
             node_size=8,
-            edge_color="cyan",
-            edge_thickness=1,
-            edge_opacity=1.0,
             node_face_colormap=["magenta", "green"],
         )
 
 
-def test_graph_to_layers_not_editable_by_default():
+def test_layers_not_editable_by_default():
     graph = _sample_graph()
-    points, vectors = graph_to_layers(
+    points = nodes_to_layer(
         graph,
+        "nodes",
         node_face_color="red",
         node_border_color="white",
         node_opacity=1.0,
         node_size=8,
+    )
+    vectors = edges_to_layer(
+        graph,
+        "edges",
         edge_color="cyan",
         edge_thickness=1,
         edge_opacity=1.0,
@@ -249,14 +243,20 @@ def test_graph_to_layers_not_editable_by_default():
     assert vectors.editable is False
 
 
-def test_graph_to_layers_editable_true():
+def test_layers_editable_true():
     graph = _sample_graph()
-    points, vectors = graph_to_layers(
+    points = nodes_to_layer(
         graph,
+        "nodes",
         node_face_color="red",
         node_border_color="white",
         node_opacity=1.0,
         node_size=8,
+        editable=True,
+    )
+    vectors = edges_to_layer(
+        graph,
+        "edges",
         edge_color="cyan",
         edge_thickness=1,
         edge_opacity=1.0,
@@ -266,17 +266,15 @@ def test_graph_to_layers_editable_true():
     assert vectors.editable is True
 
 
-def test_graph_to_layers_constant_symbol_and_border_width():
+def test_nodes_to_layer_constant_symbol_and_border_width():
     graph = _sample_graph()
-    points, _ = graph_to_layers(
+    points = nodes_to_layer(
         graph,
+        "nodes",
         node_face_color="red",
         node_border_color="white",
         node_opacity=1.0,
         node_size=8,
-        edge_color="cyan",
-        edge_thickness=1,
-        edge_opacity=1.0,
         node_symbol="square",
         node_border_width=0.2,
     )
@@ -285,17 +283,15 @@ def test_graph_to_layers_constant_symbol_and_border_width():
     assert float(points.border_width[0]) == pytest.approx(0.2)
 
 
-def test_graph_to_layers_channel_symbol_cycle():
+def test_nodes_to_layer_channel_symbol_cycle():
     graph = _sample_graph()
-    points, _ = graph_to_layers(
+    points = nodes_to_layer(
         graph,
+        "nodes",
         node_face_color="channel",
         node_border_color="white",
         node_opacity=1.0,
         node_size=8,
-        edge_color="cyan",
-        edge_thickness=1,
-        edge_opacity=1.0,
         node_symbol="channel",
         node_symbol_cycle=["o", "s", "+"],
     )
@@ -304,32 +300,34 @@ def test_graph_to_layers_channel_symbol_cycle():
     assert points.symbol[0].value != points.symbol[1].value
 
 
-def test_graph_to_layers_blending():
+def test_layers_blending():
     graph = _sample_graph()
-    points, vectors = graph_to_layers(
+    points = nodes_to_layer(
         graph,
+        "nodes",
         node_face_color="red",
         node_border_color="white",
         node_opacity=1.0,
         node_size=8,
+        node_blending="additive",
+    )
+    vectors = edges_to_layer(
+        graph,
+        "edges",
         edge_color="cyan",
         edge_thickness=1,
         edge_opacity=1.0,
-        node_blending="additive",
         edge_blending="minimum",
     )
     assert points.blending == "additive"
     assert vectors.blending == "minimum"
 
 
-def test_graph_to_layers_edge_vector_style():
+def test_edges_to_layer_vector_style():
     graph = _sample_graph()
-    _, vectors = graph_to_layers(
+    vectors = edges_to_layer(
         graph,
-        node_face_color="red",
-        node_border_color="white",
-        node_opacity=1.0,
-        node_size=8,
+        "edges",
         edge_color="cyan",
         edge_thickness=1,
         edge_opacity=1.0,

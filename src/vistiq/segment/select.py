@@ -429,9 +429,8 @@ class MatrixFilter(Filter):
                     "do not match; Filter failed."
                 )
             logger.warning(
-                "Length of attribute list %s and data shape do not match; "
-                "strict mode is disabled, ignoring filters.",
-                attribute_list,
+                f"Length of attribute list {attribute_list} and data shape do not match; "
+                "strict mode is disabled, ignoring filters."
             )
         return self.apply(values)
 

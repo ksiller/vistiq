@@ -33,9 +33,8 @@ from vistiq.graph import (
     GraphBuilderConfig,
     GraphExporter,
     GraphExporterConfig,
-    NXGraphBuilderConfig,
-    NXGraphQuery,
-    NXGraphQueryConfig,
+    GraphQuery,
+    GraphQueryConfig,
     graph_to_dataframe,
     resolve_subtree_origins,
     subtree_origin_key,
@@ -120,10 +119,10 @@ class AnalysisFlowConfig(WorkflowConfig):
         default_factory=lambda: HierarchicalMatrixConfig(orphan_strategy="drop")
     )
     graph_builder: Optional[GraphBuilderConfig] = Field(
-        default_factory=NXGraphBuilderConfig
+        default_factory=GraphBuilderConfig
     )
-    graph_query: Optional[NXGraphQueryConfig] = Field(
-        default_factory=lambda: NXGraphQueryConfig(
+    graph_query: Optional[GraphQueryConfig] = Field(
+        default_factory=lambda: GraphQueryConfig(
             attributes=["descendant_counts", "ancestor_lineage"],
             filter_attribute="channel",
             include_attributes=["label", "channel"],
@@ -134,8 +133,8 @@ class AnalysisFlowConfig(WorkflowConfig):
     graph_exporter: Optional[GraphExporterConfig] = Field(
         default_factory=GraphExporterConfig
     )
-    spatial_graph_query: Optional[NXGraphQueryConfig] = Field(
-        default_factory=lambda: NXGraphQueryConfig(
+    spatial_graph_query: Optional[GraphQueryConfig] = Field(
+        default_factory=lambda: GraphQueryConfig(
             attributes=["neighbor_summary"],
             include_attributes=[],
             weight_attribute="distance",
@@ -322,7 +321,7 @@ class AnalysisFlow(Workflow):
 
         filter_values = [cfg.filter_value for cfg in query_configs]
         logger.info(f"Running graph query for filter values: {filter_values}")
-        gq = NXGraphQuery(gqcfg.model_copy(update={"filter_value": None}))
+        gq = GraphQuery(gqcfg.model_copy(update={"filter_value": None}))
         gq_results = list(
             gq.run.map(unmapped(dag), node=None, filter_value=filter_values)
         )
@@ -400,7 +399,7 @@ class AnalysisFlow(Workflow):
 
             if gqcfg is not None:
                 knn_results = resolve_futures(knn_mapped)
-                gq = NXGraphQuery(
+                gq = GraphQuery(
                     gqcfg.model_copy(
                         update={
                             "output_index": index,
@@ -455,7 +454,7 @@ class AnalysisFlow(Workflow):
 
             if gqcfg is not None:
                 rnn_results = resolve_futures(rnn_mapped)
-                gq = NXGraphQuery(
+                gq = GraphQuery(
                     gqcfg.model_copy(
                         update={
                             "output_index": index,

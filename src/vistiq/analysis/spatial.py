@@ -14,12 +14,12 @@ from pydantic import Field
 from vistiq.analysis.distance import DistanceCalculator, DistanceCalculatorConfig
 from vistiq.constant.matrix import OFF_DIAGONAL
 from vistiq.core import Configurable, Configuration, generate_name
-from vistiq.graph import (
+from vistiq.graph.graph import (
+    GraphBuilder,
     GraphBuilderConfig,
     GraphExporter,
     GraphExporterConfig,
-    NXGraphBuilder,
-    NXGraphQuery,
+    GraphQuery,
     resolve_subtree_origin,
 )
 from vistiq.segment import TopKFilter, TopKFilterConfig, ValueFilter, ValueFilterConfig, dataframe_to_numpy
@@ -66,7 +66,7 @@ def _regions_from_containment(
     """Export region attributes from a containment DAG, optionally scoped to a subtree."""
     graph = containment_graph
     if node is not None:
-        graph = NXGraphQuery._origin_subgraph(containment_graph, node)
+        graph = GraphQuery._origin_subgraph(containment_graph, node)
     return GraphExporter(exporter).run(graph)
 
 
@@ -152,7 +152,7 @@ def _filtered_neighbor_graph(
         index=masked.index,
         columns=masked.columns,
     )
-    graph = NXGraphBuilder(graph_builder).run(neighbor_matrix, regions)
+    graph = GraphBuilder(graph_builder).run(neighbor_matrix, regions)
     return neighbor_matrix, graph
 
 
@@ -246,7 +246,7 @@ class KnnAnalysisConfig(SpatialNeighborConfig):
         )
     )
     graph_builder: GraphBuilderConfig = Field(
-        default_factory=lambda: GraphBuilderConfig(weight_attribute="distance")
+        default_factory=lambda: GraphBuilderConfig(edge_attribute="distance")
     )
 
 
@@ -263,7 +263,7 @@ class RnnAnalysisConfig(SpatialNeighborConfig):
         )
     )
     graph_builder: GraphBuilderConfig = Field(
-        default_factory=lambda: GraphBuilderConfig(weight_attribute="distance")
+        default_factory=lambda: GraphBuilderConfig(edge_attribute="distance")
     )
 
 

@@ -12,7 +12,7 @@ from vistiq.analysis.overlap import (
 from vistiq.analysis.workflow import AnalysisFlow, AnalysisFlowConfig
 from vistiq.constant.matrix import UPPER
 from vistiq.analysis.matrix import HierarchicalMatrixConfig, MatrixCombinerConfig
-from vistiq.graph import NXGraphBuilderConfig, NXGraphQueryConfig
+from vistiq.graph import GraphBuilderConfig, GraphQueryConfig
 from vistiq.analysis.spatial import KnnAnalysisConfig
 from vistiq.segment import ValueFilterConfig
 from vistiq.segment.analysis import RegionAnalyzerConfig
@@ -429,8 +429,8 @@ def test_analysis_flow_hierarchical_analysis(hierarchical_label_pair):
             rank_attribute="volume",
             threshold=0.2,
         ),
-        graph_builder=NXGraphBuilderConfig(),
-        graph_query=NXGraphQueryConfig(
+        graph_builder=GraphBuilderConfig(),
+        graph_query=GraphQueryConfig(
             attributes=["descendant_counts", "ancestor_lineage"],
             filter_attribute="channel",
             include_attributes=["label", "channel"],
@@ -471,7 +471,7 @@ def test_analysis_flow_knn_analysis(multi_object_label_pair):
             rank_attribute="volume",
             threshold=0.2,
         ),
-        graph_builder=NXGraphBuilderConfig(),
+        graph_builder=GraphBuilderConfig(),
         graph_query=None,
         knn_analysis=KnnAnalysisConfig(
             k=1,

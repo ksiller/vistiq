@@ -1125,7 +1125,8 @@ class TestTopKFilter:
     def test_axis_none_global_smallest(self):
         """axis=None selects globally over a flattened array."""
         import torch
-        from vistiq.segment import FULL, TopKFilter, TopKFilterConfig
+        from vistiq.constant.matrix import FULL
+        from vistiq.segment import TopKFilter, TopKFilterConfig
 
         values = torch.tensor([[3.0, 1.0], [4.0, 2.0]])
         coords = TopKFilter(
@@ -1138,7 +1139,8 @@ class TestTopKFilter:
     def test_off_diagonal_rowwise_nearest(self):
         """OFF_DIAGONAL skips self-pairs on square distance matrices."""
         import torch
-        from vistiq.segment import OFF_DIAGONAL, TopKFilter, TopKFilterConfig
+        from vistiq.constant.matrix import OFF_DIAGONAL
+        from vistiq.segment import TopKFilter, TopKFilterConfig
 
         values = torch.tensor(
             [
@@ -1171,7 +1173,8 @@ class TestTopKFilter:
     def test_axis_none_off_diagonal(self):
         """axis=None with OFF_DIAGONAL excludes diagonal on square matrices."""
         import torch
-        from vistiq.segment import OFF_DIAGONAL, TopKFilter, TopKFilterConfig
+        from vistiq.constant.matrix import OFF_DIAGONAL
+        from vistiq.segment import TopKFilter, TopKFilterConfig
 
         values = torch.tensor(
             [
@@ -1190,7 +1193,8 @@ class TestTopKFilter:
     def test_output_values(self):
         """output='values' returns selected entries as a tensor."""
         import torch
-        from vistiq.segment import OFF_DIAGONAL, TopKFilter, TopKFilterConfig
+        from vistiq.constant.matrix import OFF_DIAGONAL
+        from vistiq.segment import TopKFilter, TopKFilterConfig
 
         values = torch.tensor(
             [
@@ -1262,7 +1266,8 @@ class TestValueFilter:
     def test_off_diagonal(self):
         """OFF_DIAGONAL excludes self-pairs even when they pass the threshold."""
         import torch
-        from vistiq.segment import OFF_DIAGONAL, ValueFilter, ValueFilterConfig
+        from vistiq.constant.matrix import OFF_DIAGONAL
+        from vistiq.segment import ValueFilter, ValueFilterConfig
 
         values = torch.tensor([[0.0, 4.0], [3.0, 0.0]])
         mask = ValueFilter(
@@ -1279,7 +1284,8 @@ class TestValueFilter:
     def test_lower_triangle_only(self):
         """LOWER selects lower triangle including diagonal (i >= j)."""
         import torch
-        from vistiq.segment import LOWER, TopKFilter, TopKFilterConfig
+        from vistiq.constant.matrix import LOWER
+        from vistiq.segment import TopKFilter, TopKFilterConfig
 
         values = torch.tensor([[9.0, 1.0, 2.0], [3.0, 8.0, 4.0], [5.0, 6.0, 7.0]])
         mask = TopKFilter(
@@ -1294,7 +1300,8 @@ class TestValueFilter:
     def test_lower_triangle_rowwise(self):
         """LOWER with axis=1 does not zero the full matrix when one row lacks strict-lower cells."""
         import torch
-        from vistiq.segment import LOWER, TopKFilter, TopKFilterConfig
+        from vistiq.constant.matrix import LOWER
+        from vistiq.segment import TopKFilter, TopKFilterConfig
 
         dist = torch.tensor([[0.0, 5.0, 2.0], [5.0, 0.0, 4.0], [2.0, 4.0, 0.0]])
         masked = TopKFilter(
@@ -1310,7 +1317,8 @@ class TestValueFilter:
     def test_lower_nd_triangle(self):
         """LOWER_ND selects strict lower triangle (i > j) only."""
         import torch
-        from vistiq.segment import LOWER_ND, TopKFilter, TopKFilterConfig
+        from vistiq.constant.matrix import LOWER_ND
+        from vistiq.segment import TopKFilter, TopKFilterConfig
 
         values = torch.tensor([[9.0, 1.0, 2.0], [3.0, 8.0, 4.0], [5.0, 6.0, 7.0]])
         mask = TopKFilter(
@@ -1325,7 +1333,8 @@ class TestValueFilter:
     def test_upper_nd_triangle(self):
         """UPPER_ND selects strict upper triangle (i < j) only."""
         import torch
-        from vistiq.segment import UPPER_ND, TopKFilter, TopKFilterConfig
+        from vistiq.constant.matrix import UPPER_ND
+        from vistiq.segment import TopKFilter, TopKFilterConfig
 
         values = torch.tensor([[9.0, 1.0, 2.0], [3.0, 8.0, 4.0], [5.0, 6.0, 7.0]])
         mask = TopKFilter(

@@ -1,4 +1,10 @@
-"""Napari layer helpers for graph visualization."""
+"""Napari visualization helpers for graph and hierarchical spatial analysis.
+
+Builds single napari layers from a graph (:func:`nodes_to_layer`,
+:func:`edges_to_layer`) and assembles the hierarchical spatial views via
+:func:`add_hierarchical_napari_layers`. Use ``save_analysis`` and
+``load_analysis`` to persist and reload artifacts without rerunning the pipeline.
+"""
 
 from __future__ import annotations
 
@@ -7,9 +13,18 @@ from typing import TYPE_CHECKING, Any, Literal, Optional, Sequence, Union
 import numpy as np
 import pandas as pd
 
-from vistiq.graph.graph import graph_to_dataframe
+from vistiq.graph.graph import (
+    GraphBuilder,
+    GraphBuilderConfig,
+    GraphFilter,
+    GraphFilterConfig,
+    GraphLike,
+    edges_to_matrix,
+    graph_to_dataframe,
+    spatial_neighbor_column,
+    subtree_origin_key,
+)
 from vistiq.segment.analysis import dataframe_to_numpy
-from vistiq.utils import SpacingLike, abs_spacing
 
 if TYPE_CHECKING:
     from napari.layers import Points, Vectors
@@ -392,7 +407,7 @@ def _collect_node_properties(
                 properties[name] = _coerce_categorical(series.to_numpy())
         else:
             properties[name] = _property_values(
-                lambda node: graph.nodes[node],
+                lambda node: graph.node_attrs(node),
                 nodes,
                 name,
                 numeric=name in numeric_specs,
@@ -466,10 +481,14 @@ def _validate_mapped_color(
 def _node_positions(
     graph: Any,
     *,
-    scale: SpacingLike = None,
     axes: Optional[Sequence[str]] = None,
 ) -> tuple[list[Any], np.ndarray]:
-    """Node order and centroid coordinates, optionally rescaled."""
+    """Node order and centroid coordinates.
+
+    Coordinates are taken as-is from the graph's ``centroid`` attributes, which
+    are assumed to already carry physical spacing (applied upstream via
+    regionprops).
+    """
     nodes = list(graph.nodes())
     if not nodes:
         return nodes, np.empty((0, 3), dtype=float)
@@ -488,14 +507,6 @@ def _node_positions(
             f"available columns: {list(regions.columns)}"
         )
     coords = np.atleast_2d(np.asarray(coords, dtype=float))
-    spacing = abs_spacing(scale)
-    if spacing is not None:
-        factors = np.ones(coords.shape[1], dtype=float)
-        if len(spacing) <= coords.shape[1]:
-            factors[-len(spacing) :] = spacing
-        else:
-            factors = np.asarray(spacing[: coords.shape[1]], dtype=float)
-        coords = coords * factors
     return nodes, coords
 
 
@@ -522,40 +533,33 @@ def _edge_vectors(
     return np.stack(segments, axis=0)
 
 
-def graph_to_layers(
-    graph: Any,
+def nodes_to_layer(
+    graph: GraphLike,
+    name: str,
     node_face_color: VisualSpec,
     node_border_color: VisualSpec,
     node_opacity: float,
     node_size: VisualSpec,
-    edge_color: VisualSpec,
-    edge_thickness: VisualSpec,
-    edge_opacity: float,
-    scale: SpacingLike = None,
     *,
     axes: Optional[Sequence[str]] = None,
     node_face_colormap: Optional[ColormapLike] = None,
     node_border_colormap: Optional[ColormapLike] = None,
-    edge_colormap: Optional[ColormapLike] = None,
     node_properties: Optional[pd.DataFrame] = None,
     node_symbol: Optional[VisualSpec] = None,
     node_symbol_cycle: Optional[SymbolCycleLike] = None,
     node_border_width: Optional[VisualSpec] = None,
     node_blending: Optional[str] = None,
-    edge_blending: Optional[str] = None,
-    edge_vector_style: Optional[str] = None,
     editable: Optional[bool] = False,
-) -> tuple[Points, Vectors]:
-    """Build napari Points and Vectors layers from a graph.
+) -> Points:
+    """Build a napari Points layer named *name* from a graph's nodes.
 
     Node positions come from each node's ``centroid`` attribute (including
-    mapped columns such as ``centroid-z``, ``centroid-y``, ``centroid-x``).
-    When *scale* is provided, coordinates are multiplied axis-wise by
-    ``abs(spacing)``.
+    mapped columns such as ``centroid-z``, ``centroid-y``, ``centroid-x``),
+    assumed to already carry physical spacing applied upstream.
 
     Visual parameters may be literals (``int`` / ``float``) applied uniformly,
-    or ``str`` names of node/edge attributes. Unrecognized string values are
-    passed through as napari color names.
+    or ``str`` names of node attributes. Unrecognized string values are passed
+    through as napari color names.
 
     When a visual parameter references a property, optional ``*_colormap``
     arguments control coloring:
@@ -573,35 +577,27 @@ def graph_to_layers(
     *node_border_width* sets the point border width for all nodes or maps
     from a numeric node attribute.
 
-    *node_blending* and *edge_blending* set napari layer blending modes
-    (for example ``"translucent"``, ``"additive"``, ``"opaque"``). When
-    omitted, napari's default (``"translucent"``) is used.
-
-    *edge_vector_style* sets the edge rendering style: ``"line"``,
-    ``"triangle"``, or ``"arrow"``. When omitted, napari's default
-    (``"triangle"``) is used.
+    *node_blending* sets the napari layer blending mode (for example
+    ``"translucent"``, ``"additive"``, ``"opaque"``). When omitted, napari's
+    default (``"translucent"``) is used.
 
     *node_properties* may supply columns that are not stored on graph nodes
-    (for example ``lineage Lobe`` from hierarchical analysis). The frame is
+    (for example a lineage column from hierarchical analysis). The frame is
     aligned on ``object_id`` and may use a MultiIndex whose first level is
     ``object_id``.
 
-    When *editable* is not ``None``, it is applied to both returned layers
-    to control whether napari allows moving or editing them in the viewer.
-    Defaults to ``False``.
-
-    Returns:
-        ``(points_layer, vectors_layer)`` for graph nodes and edges.
+    When *editable* is not ``None``, it controls whether napari allows moving
+    or editing the layer in the viewer. Defaults to ``False``.
     """
     try:
-        from napari.layers import Points, Vectors
+        from napari.layers import Points
     except ImportError as exc:
         raise ImportError(
-            "graph_to_layers requires napari; install with "
+            "nodes_to_layer requires napari; install with "
             "`pip install vistiq[napari]`"
         ) from exc
 
-    nodes, positions = _node_positions(graph, scale=scale, axes=axes)
+    nodes, positions = _node_positions(graph, axes=axes)
     node_field_names = _node_attr_names(graph) | _node_column_names(graph)
     if node_properties is not None:
         node_field_names |= set(node_properties.columns)
@@ -667,24 +663,8 @@ def graph_to_layers(
             param="node_border_width",
         )
 
-    edges = list(graph.edges(data=True))
-    vectors = _edge_vectors(nodes, positions, graph)
-    edge_properties, edge_attr_names = _collect_edge_properties(
-        graph,
-        edges,
-        (edge_color, edge_thickness),
-        numeric_specs=_attr_specs(
-            edge_thickness,
-            edge_color,
-            attr_names=_edge_attr_names(graph),
-        ),
-    )
-    edge_color_kw, _ = _resolve_visual(edge_color, attr_names=edge_attr_names)
-    edge_width_kw, _ = _resolve_numeric_visual(
-        edge_thickness, attr_names=edge_attr_names, param="edge_thickness"
-    )
-
     points_kwargs: dict[str, Any] = {
+        "name": name,
         "properties": node_props or None,
         "face_color": face_color,
         "border_color": border_color,
@@ -742,8 +722,69 @@ def graph_to_layers(
             node_props,
             node_symbol_cycle,
         )
+    if editable is not None:
+        points.editable = editable
+    return points
+
+
+def edges_to_layer(
+    graph: GraphLike,
+    name: str,
+    edge_color: VisualSpec,
+    edge_thickness: VisualSpec,
+    edge_opacity: float,
+    *,
+    axes: Optional[Sequence[str]] = None,
+    edge_colormap: Optional[ColormapLike] = None,
+    edge_blending: Optional[str] = None,
+    edge_vector_style: Optional[str] = None,
+    editable: Optional[bool] = False,
+) -> Vectors:
+    """Build a napari Vectors layer named *name* from a graph's edges.
+
+    Each edge becomes a segment between its endpoints' ``centroid`` positions,
+    assumed to already carry physical spacing applied upstream.
+
+    Visual parameters may be literals (``int`` / ``float``) applied uniformly,
+    or ``str`` names of edge attributes. Unrecognized string values are passed
+    through as napari color names.
+
+    *edge_colormap* maps a continuous numeric edge attribute referenced by
+    *edge_color*. *edge_blending* sets the layer blending mode and
+    *edge_vector_style* sets the rendering style (``"line"``, ``"triangle"``,
+    or ``"arrow"``); both fall back to napari's defaults when omitted.
+
+    When *editable* is not ``None``, it controls whether napari allows editing
+    the layer in the viewer. Defaults to ``False``.
+    """
+    try:
+        from napari.layers import Vectors
+    except ImportError as exc:
+        raise ImportError(
+            "edges_to_layer requires napari; install with "
+            "`pip install vistiq[napari]`"
+        ) from exc
+
+    nodes, positions = _node_positions(graph, axes=axes)
+    edges = list(graph.edges(data=True))
+    vectors = _edge_vectors(nodes, positions, graph)
+    edge_properties, edge_attr_names = _collect_edge_properties(
+        graph,
+        edges,
+        (edge_color, edge_thickness),
+        numeric_specs=_attr_specs(
+            edge_thickness,
+            edge_color,
+            attr_names=_edge_attr_names(graph),
+        ),
+    )
+    edge_color_kw, _ = _resolve_visual(edge_color, attr_names=edge_attr_names)
+    edge_width_kw, _ = _resolve_numeric_visual(
+        edge_thickness, attr_names=edge_attr_names, param="edge_thickness"
+    )
 
     vectors_kwargs: dict[str, Any] = {
+        "name": name,
         "properties": edge_properties or None,
         "edge_color": edge_color_kw,
         "edge_width": edge_width_kw,
@@ -773,6 +814,386 @@ def graph_to_layers(
         kind="edge",
     )
     if editable is not None:
-        points.editable = editable
         vectors_layer.editable = editable
-    return points, vectors_layer
+    return vectors_layer
+
+
+def find_spatial_summary_column(
+    columns: Sequence[str],
+    analysis: str,
+    mode: str,
+    metric: str,
+    group: str,
+    *,
+    k: Optional[int] = None,
+    radius: Optional[float] = None,
+    origin_key: Optional[str] = None,
+) -> str:
+    """Resolve a post-hoc spatial summary column name.
+
+    Matches unscoped names (``rnn_homotypic__…``) or per-subtree prefixes
+    (``rnn_homotypic_{origin_key}__…``). Pass *origin_key* when multiple
+    subtree roots produced ambiguous matches.
+    """
+    suffix = spatial_neighbor_column(analysis, metric, group, k=k, radius=radius)
+    if origin_key is not None:
+        keyed = f"{analysis}_{mode}_{origin_key}__{suffix}"
+        if keyed in columns:
+            return keyed
+        raise KeyError(
+            f"column {keyed!r} not found for origin_key={origin_key!r}"
+        )
+
+    exact = f"{analysis}_{mode}__{suffix}"
+    if exact in columns:
+        return exact
+    matches = [
+        column
+        for column in columns
+        if column.endswith(suffix) and column.startswith(f"{analysis}_{mode}")
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise KeyError(
+            f"column for {analysis}/{mode}/{metric}/{group!r} not found; "
+            f"expected suffix {suffix!r}"
+        )
+    raise KeyError(
+        f"ambiguous spatial columns: {matches}; "
+        "pass origin_key or use spatial_columns_by_origin()"
+    )
+
+
+def spatial_columns_by_origin(
+    columns: Sequence[str],
+    analysis: str,
+    mode: str,
+    metric: str,
+    group: str,
+    *,
+    k: Optional[int] = None,
+    radius: Optional[float] = None,
+) -> dict[str, str]:
+    """Map spatial subtree origin keys to summary column names.
+
+    When a single subtree was analyzed, returns ``{"all": column}``.
+    Otherwise keys are ``subtree_origin_key`` values for each matched subtree root.
+    """
+    suffix = spatial_neighbor_column(analysis, metric, group, k=k, radius=radius)
+    unscoped = f"{analysis}_{mode}__{suffix}"
+    if unscoped in columns:
+        return {"all": unscoped}
+
+    prefix = f"{analysis}_{mode}_"
+    tail = f"__{suffix}"
+    mapping: dict[str, str] = {}
+    for column in columns:
+        if not column.startswith(prefix) or not column.endswith(tail):
+            continue
+        origin_key = column[len(prefix) : -len(tail)]
+        if origin_key:
+            mapping[origin_key] = column
+    if not mapping:
+        raise KeyError(
+            f"column for {analysis}/{mode}/{metric}/{group!r} not found; "
+            f"expected suffix {suffix!r}"
+        )
+    return mapping
+
+
+def infer_spatial_origin_keys(spatial_results: dict[str, Any], analysis: str, mode: str) -> list[str]:
+    """Return origin-key suffixes present in a spatial-results dict."""
+    prefix = f"{analysis}_{mode}@"
+    return sorted(key.split("@", 1)[1] for key in spatial_results if key.startswith(prefix))
+
+
+def _direct_path_predecessors(
+    dag: GraphLike,
+    node_ids: Sequence[Any],
+    *,
+    predecessor_key: str,
+    predecessor_value: str,
+) -> dict[Any, Any | None]:
+    edges = GraphFilter(
+        GraphFilterConfig(
+            mode="direct_path",
+            node_match={
+                "source": {predecessor_key: predecessor_value},
+                "target": list(node_ids),
+            },
+        )
+    ).run(dag)
+    predecessors = {node_id: None for node_id in node_ids}
+    for edge in edges:
+        predecessors[edge["target"]] = edge["source"]
+    return predecessors
+
+
+def assign_spatial_metric(
+    features: pd.DataFrame,
+    node_ids: Sequence[Any],
+    dag: GraphLike,
+    columns_by_origin: dict[str, str],
+    *,
+    predecessor_key: str = "channel",
+    predecessor_value: str = "Lobe",
+) -> pd.Series:
+    """Pick the per-subtree spatial summary value for each source node."""
+    if len(columns_by_origin) == 1:
+        column = next(iter(columns_by_origin.values()))
+        return pd.to_numeric(features.loc[node_ids, column], errors="coerce")
+
+    predecessors = _direct_path_predecessors(
+        dag,
+        node_ids,
+        predecessor_key=predecessor_key,
+        predecessor_value=predecessor_value,
+    )
+
+    values: list[float] = []
+    for node_id in node_ids:
+        origin_key = subtree_origin_key(predecessors.get(node_id))
+        column = columns_by_origin.get(origin_key)
+        if column is None:
+            values.append(float("nan"))
+        else:
+            values.append(float(features.loc[node_id, column]))
+    return pd.Series(values, index=node_ids, dtype=float)
+
+
+def _node_ids_for_origin_key(
+    dag: GraphLike,
+    node_ids: Sequence[Any],
+    origin_key: str,
+    *,
+    predecessor_key: str = "channel",
+    predecessor_value: str = "Lobe",
+) -> set[Any]:
+    if origin_key == "all":
+        return set(node_ids)
+    predecessors = _direct_path_predecessors(
+        dag,
+        node_ids,
+        predecessor_key=predecessor_key,
+        predecessor_value=predecessor_value,
+    )
+    return {
+        node_id
+        for node_id, predecessor_id in predecessors.items()
+        if subtree_origin_key(predecessor_id) == str(origin_key)
+    }
+
+
+def _spatial_result_graph(
+    spatial_results: dict[str, Any],
+    origin_key: str,
+    *,
+    analysis: str = "rnn",
+    mode: str = "heterotypic",
+) -> GraphLike | None:
+    result_key = f"{analysis}_{mode}@{origin_key}"
+    result = spatial_results.get(result_key)
+    if result is None:
+        return None
+    return result.graph
+
+
+def node_ids_by_key(
+    features: pd.DataFrame,
+    value: str,
+    *,
+    key: str = "channel",
+) -> list[Any]:
+    return features.index[features[key] == value].tolist()
+
+
+def _build_graph_from_matrix(
+    builder: GraphBuilder,
+    matrix: pd.DataFrame,
+    dag: GraphLike,
+) -> GraphLike:
+    """Materialize a query adjacency matrix with node attrs from *dag*."""
+    return builder.run(matrix, graph_to_dataframe(dag).loc[matrix.index])
+
+
+def add_hierarchical_napari_layers(
+    viewer: Any,
+    dag: GraphLike,
+    features: pd.DataFrame,
+    spatial_results: dict[str, Any],
+    *,
+    rnn_radius: float,
+    k: Optional[int] = None,
+    rnn_hetero_key: Optional[str] = None,
+    spatial_origin_keys: Optional[Sequence[str]] = None,
+    source_key: str = "channel",
+    source_value: str = "Dpn",
+    partner_key: str = "channel",
+    partner_value: str = "EdU",
+    predecessor_key: str = "channel",
+    predecessor_value: str = "Lobe",
+    source_size: float = 10,
+    partner_size: float = 8,
+) -> dict[str, Any]:
+    """Add hierarchical point and vector layers for napari views.
+
+    Creates point layers for the source channel (partner overlap flag,
+    homotypic RNN count, heterotypic partner RNN count), a partner-channel
+    neighbor layer, and vector layers from upstream predecessors to source
+    nodes and from source nodes to spatial-graph partners.
+
+    When multiple spatial subtrees were analyzed, per-node metrics and edges
+    use ``GraphQuery`` predecessor walks to map each source node to a spatial
+    origin key.
+
+    Returns a dict mapping short layer keys to the napari layer objects.
+    """
+    source_ids = node_ids_by_key(features, source_value, key=source_key)
+    source_graph = dag.subgraph(source_ids)
+    columns = list(features.columns)
+    origin_keys = list(
+        spatial_origin_keys
+        or infer_spatial_origin_keys(spatial_results, "rnn", "heterotypic")
+        or infer_spatial_origin_keys(spatial_results, "rnn", "homotypic")
+        or ["all"]
+    )
+    predecessor_match = {predecessor_key: predecessor_value}
+    predecessor_kwargs = {
+        "predecessor_key": predecessor_key,
+        "predecessor_value": predecessor_value,
+    }
+
+    homo_columns = spatial_columns_by_origin(
+        columns, "rnn", "homotypic", "count", source_value, radius=rnn_radius
+    )
+    hetero_partner_columns = spatial_columns_by_origin(
+        columns, "rnn", "heterotypic", "count", partner_value, radius=rnn_radius
+    )
+
+    source_features = features.loc[source_ids].copy()
+    source_features["_homotypic_rnn_count"] = assign_spatial_metric(
+        features, source_ids, dag, homo_columns, **predecessor_kwargs
+    )
+    source_features["_heterotypic_partner_rnn_count"] = assign_spatial_metric(
+        features, source_ids, dag, hetero_partner_columns, **predecessor_kwargs
+    )
+
+    partner_ids: set[Any] = set()
+    source_partner_edges: list[dict[str, Any]] = []
+    for origin_key in origin_keys:
+        graph = _spatial_result_graph(spatial_results, origin_key)
+        if graph is None:
+            continue
+        origin_nodes = _node_ids_for_origin_key(
+            dag, source_ids, origin_key, **predecessor_kwargs
+        )
+        filtered = GraphFilter(
+            GraphFilterConfig(
+                mode="edges",
+                node_match={
+                    "source": list(origin_nodes),
+                    "target": {partner_key: partner_value},
+                },
+            )
+        ).run(graph)
+        for edge in filtered:
+            partner_ids.add(edge["target"])
+            source_partner_edges.append(edge)
+
+    builder = GraphBuilder(GraphBuilderConfig())
+    layers: dict[str, Any] = {}
+
+    points_partner_flag = nodes_to_layer(
+        source_graph,
+        f"{source_value} ({partner_value}+/-)",
+        node_face_color="EdU +",
+        node_face_colormap=["magenta", "green"],
+        node_border_color="white",
+        node_opacity=0.95,
+        node_size=source_size,
+        node_properties=source_features,
+        editable=False,
+    )
+    viewer.add_layer(points_partner_flag)
+    layers["source_partner_flag"] = points_partner_flag
+
+    points_homo = nodes_to_layer(
+        source_graph,
+        f"{source_value} (homotypic RNN {source_value} count)",
+        node_face_color="_homotypic_rnn_count",
+        node_face_colormap="greens",
+        node_border_color="white",
+        node_opacity=0.95,
+        node_size=source_size,
+        node_properties=source_features,
+        editable=False,
+    )
+    viewer.add_layer(points_homo)
+    layers["homotypic_rnn_count"] = points_homo
+
+    points_hetero = nodes_to_layer(
+        source_graph,
+        f"{source_value} (heterotypic {partner_value} RNN count)",
+        node_face_color="_heterotypic_partner_rnn_count",
+        node_face_colormap="viridis",
+        node_border_color="white",
+        node_opacity=0.95,
+        node_size=source_size,
+        node_properties=source_features,
+        editable=False,
+    )
+    viewer.add_layer(points_hetero)
+    layers["heterotypic_partner_rnn_count"] = points_hetero
+
+    if partner_ids:
+        partner_ids = sorted(partner_ids)
+        partner_graph = dag.subgraph(partner_ids)
+        points_partner = nodes_to_layer(
+            partner_graph,
+            f"{partner_value} (heterotypic RNN neighbors of {source_value})",
+            node_face_color="green",
+            node_border_color="white",
+            node_opacity=0.9,
+            node_size=partner_size,
+            node_properties=features.loc[partner_ids],
+            editable=False,
+        )
+        viewer.add_layer(points_partner)
+        layers["partner_neighbors"] = points_partner
+
+    predecessor_edges = GraphFilter(
+        GraphFilterConfig(
+            mode="direct_path",
+            node_match={
+                "source": predecessor_match,
+                "target": list(source_ids),
+            },
+        )
+    ).run(dag)
+    predecessor_matrix = edges_to_matrix(predecessor_edges)
+    if not predecessor_matrix.empty:
+        predecessor_vectors = edges_to_layer(
+            _build_graph_from_matrix(builder, predecessor_matrix, dag),
+            f"{predecessor_value} → {source_value}",
+            edge_color="yellow",
+            edge_thickness=2,
+            edge_opacity=0.7,
+        )
+        viewer.add_layer(predecessor_vectors)
+        layers["predecessor_to_source"] = predecessor_vectors
+
+    if source_partner_edges:
+        partner_matrix = edges_to_matrix(source_partner_edges)
+        if not partner_matrix.empty:
+            source_partner_vectors = edges_to_layer(
+                _build_graph_from_matrix(builder, partner_matrix, dag),
+                f"{source_value} → {partner_value} (heterotypic RNN)",
+                edge_color="cyan",
+                edge_thickness=1.5,
+                edge_opacity=0.6,
+            )
+            viewer.add_layer(source_partner_vectors)
+            layers["source_to_partner"] = source_partner_vectors
+
+    return layers

@@ -11,12 +11,12 @@ from vistiq.graph import (
     GraphBuilderConfig,
     GraphExporter,
     GraphExporterConfig,
+    GraphFilter,
+    GraphFilterConfig,
     GraphQuery,
     GraphQueryConfig,
-    NXGraphBuilder,
-    NXGraphBuilderConfig,
-    NXGraphQuery,
-    NXGraphQueryConfig,
+    NXGraph,
+    edges_to_matrix,
     graph_to_dataframe,
 )
 
@@ -53,23 +53,22 @@ def _build_containment_dag(
 ):
     hm_cfg = HierarchicalMatrixConfig(**hierarchical_kwargs)
     result = HierarchicalMatrix(hm_cfg).run(matrix, regions)
-    return NXGraphBuilder(NXGraphBuilderConfig()).run(result.matrix, result.regions)
+    return GraphBuilder(GraphBuilderConfig()).run(result.matrix, result.regions)
 
 
-class TestNXGraphBuilder:
+class TestGraphBuilder:
     def test_graph_to_dataframe(self):
         dag = _build_containment_dag(_sample_matrix(), _sample_regions())
         frame = graph_to_dataframe(dag)
         assert frame.index.name == "object_id"
-        assert set(frame.index) == set(dag.nodes)
+        assert set(frame.index) == set(dag.nodes())
         assert frame.loc["a", "volume"] == 10.0
         assert frame.loc["a", "channel"] == "Lobe"
 
     def test_graph_exporter_dropna_rows(self):
         dag = _build_containment_dag(_sample_matrix(), _sample_regions())
         for node in ["p", "a", "b", "c"]:
-            dag.nodes[node]["synthetic"] = False
-            dag.nodes[node]["name"] = str(node)
+            dag.add_node(node, synthetic=False, name=str(node))
         dag.add_node(
             "synthetic",
             name="Orphans",
@@ -81,7 +80,7 @@ class TestNXGraphBuilder:
 
     def test_graph_exporter_dropna_cols(self):
         dag = _build_containment_dag(_sample_matrix(), _sample_regions())
-        dag.nodes["a"]["unused"] = float("nan")
+        dag.add_node("a", **{**dag.node_attrs("a"), "unused": float("nan")})
         frame = GraphExporter(GraphExporterConfig(dropna_cols=True)).run(dag)
         assert "unused" not in frame.columns
 
@@ -98,19 +97,19 @@ class TestNXGraphBuilder:
 
     def test_smallest_enclosing_parent(self):
         dag = _build_containment_dag(_sample_matrix(), _sample_regions())
-        assert isinstance(dag, networkx.DiGraph)
+        assert isinstance(dag, NXGraph)
         assert set(dag.successors("p")) == {"a", "b"}
         assert "c" not in dag.successors("p")
-        assert dag.nodes["a"]["volume"] == 10.0
-        assert dag.edges["p", "a"]["ios"] == pytest.approx(0.9)
-        assert dag.edges["p", "a"].get("synthetic") is not True
+        assert dag.node_attrs("a")["volume"] == 10.0
+        assert dag.edge_attrs("p", "a")["ios"] == pytest.approx(0.9)
+        assert dag.edge_attrs("p", "a").get("synthetic") is not True
 
     def test_regions_indexed_by_object_id(self):
         regions = _sample_regions()
         result = HierarchicalMatrix(HierarchicalMatrixConfig()).run(
             _sample_matrix(), regions
         )
-        dag = NXGraphBuilder(NXGraphBuilderConfig()).run(
+        dag = GraphBuilder(GraphBuilderConfig()).run(
             result.matrix, result.regions
         )
         assert dag.number_of_nodes() == 4
@@ -120,33 +119,111 @@ class TestNXGraphBuilder:
         result = HierarchicalMatrix(HierarchicalMatrixConfig()).run(
             _sample_matrix(), regions
         )
-        dag = NXGraphBuilder(NXGraphBuilderConfig()).run(
+        dag = GraphBuilder(GraphBuilderConfig()).run(
             result.matrix, result.regions
         )
         assert dag.number_of_nodes() == 4
 
     def test_requires_matrix_and_regions(self):
         with pytest.raises(TypeError):
-            NXGraphBuilder(NXGraphBuilderConfig()).run(
+            GraphBuilder(GraphBuilderConfig()).run(
                 matrix=_sample_matrix(),
             )
         with pytest.raises(TypeError):
-            NXGraphBuilder(NXGraphBuilderConfig()).run(
+            GraphBuilder(GraphBuilderConfig()).run(
                 regions=_sample_regions(),
             )
 
 
-class TestNXGraphQuery:
+class TestGraphQuery:
     def test_allowed_attributes(self):
         allowed = GraphQuery.allowed_attributes()
         assert "n_nodes" in allowed
         assert "edges" in allowed
+        assert "filtered_edges" in allowed
+        assert "first_matching_predecessor" in allowed
+        assert "matching_predecessor_edges" in allowed
         assert set(GraphQuery.default_attributes).issubset(set(allowed))
+
+    def test_filtered_edges(self):
+        dag = networkx.DiGraph()
+        dag.add_node("d1", channel="Dpn")
+        dag.add_node("d2", channel="Dpn")
+        dag.add_node("e1", channel="EdU")
+        dag.add_node("e2", channel="EdU")
+        dag.add_edge("d1", "e1", distance=1.0)
+        dag.add_edge("d1", "e2", distance=2.0)
+        dag.add_edge("d2", "e1", distance=3.0)
+        dag = NXGraph(dag)
+
+        all_edges = GraphQuery(
+            GraphQueryConfig(attributes=["filtered_edges"])
+        ).run(dag)["filtered_edges"]
+        assert len(all_edges) == 3
+
+        partner_edges = GraphQuery(
+            GraphQueryConfig(
+                attributes=["filtered_edges"],
+                source_nodes=["d1"],
+                target_filter={"channel": "EdU"},
+            )
+        ).run(dag)["filtered_edges"]
+        assert len(partner_edges) == 2
+        assert {e["target"] for e in partner_edges} == {"e1", "e2"}
+        assert all(e["source"] == "d1" for e in partner_edges)
+
+        runtime_edges = GraphQuery(
+            GraphQueryConfig(
+                attributes=["filtered_edges"],
+                target_filter={"channel": "EdU"},
+            )
+        ).run(dag, source_nodes=["d2"])["filtered_edges"]
+        assert len(runtime_edges) == 1
+        assert runtime_edges[0]["source"] == "d2"
+        assert runtime_edges[0]["target"] == "e1"
+
+    def test_first_matching_predecessor(self):
+        dag = networkx.DiGraph()
+        dag.add_node("lobe1", channel="Lobe", label=1)
+        dag.add_node("lobe2", channel="Lobe", label=2)
+        dag.add_node("d1", channel="Dpn")
+        dag.add_node("d2", channel="Dpn")
+        dag.add_edge("lobe1", "d1")
+        dag.add_edge("lobe2", "d2")
+        dag = NXGraph(dag)
+
+        predecessors = GraphQuery(
+            GraphQueryConfig(
+                attributes=["first_matching_predecessor"],
+                predecessor_match={"channel": "Lobe"},
+                seed_nodes=["d1", "d2"],
+            )
+        ).run(dag)["first_matching_predecessor"]
+        assert predecessors == {"d1": "lobe1", "d2": "lobe2"}
+
+        runtime = GraphQuery(
+            GraphQueryConfig(
+                attributes=["first_matching_predecessor"],
+                predecessor_match={"channel": "Lobe"},
+            )
+        ).run(dag, seed_nodes=["d1"])["first_matching_predecessor"]
+        assert runtime == {"d1": "lobe1"}
+
+        edges = GraphQuery(
+            GraphQueryConfig(
+                attributes=["matching_predecessor_edges"],
+                predecessor_match={"channel": "Lobe"},
+                seed_nodes=["d1", "d2"],
+            )
+        ).run(dag)["matching_predecessor_edges"]
+        assert len(edges) == 2
+        assert {e["source"] for e in edges} == {"lobe1", "lobe2"}
+        assert {e["target"] for e in edges} == {"d1", "d2"}
 
     def test_summary_dict(self):
         dag = _build_containment_dag(_sample_matrix(), _sample_regions())
-        summary = NXGraphQuery(
-            NXGraphQueryConfig(
+        summary = GraphQuery(
+            GraphQueryConfig(
                 attributes=[
                     *GraphQuery.default_attributes,
                     *GraphQuery.origin_attributes,
@@ -174,14 +251,14 @@ class TestNXGraphQuery:
     def test_summary_requires_node_for_multiple_roots(self):
         dag = _build_containment_dag(_sample_matrix(), _sample_regions())
         with pytest.raises(ValueError, match="root nodes"):
-            NXGraphQuery(
-                NXGraphQueryConfig(attributes=["origin"])
+            GraphQuery(
+                GraphQueryConfig(attributes=["origin"])
             ).run(dag)
 
     def test_summary_selective_attributes(self):
         dag = _build_containment_dag(_sample_matrix(), _sample_regions())
-        summary = NXGraphQuery(
-            NXGraphQueryConfig(attributes=["n_nodes", "n_edges", "roots"])
+        summary = GraphQuery(
+            GraphQueryConfig(attributes=["n_nodes", "n_edges", "roots"])
         ).run(dag)
         assert set(summary.keys()) == {"n_nodes", "n_edges", "roots"}
         assert summary["n_nodes"] == 4
@@ -189,8 +266,8 @@ class TestNXGraphQuery:
 
     def test_summary_from_custom_node(self):
         dag = _build_containment_dag(_sample_matrix(), _sample_regions())
-        summary = NXGraphQuery(
-            NXGraphQueryConfig(
+        summary = GraphQuery(
+            GraphQueryConfig(
                 attributes=[
                     *GraphQuery.default_attributes,
                     *GraphQuery.origin_attributes,
@@ -201,8 +278,8 @@ class TestNXGraphQuery:
         assert summary["subgraph_n_nodes"] == 3
         assert set(summary["subgraph_nodes"]) == {"p", "a", "b"}
 
-        orphan_summary = NXGraphQuery(
-            NXGraphQueryConfig(attributes=[*GraphQuery.origin_attributes])
+        orphan_summary = GraphQuery(
+            GraphQueryConfig(attributes=[*GraphQuery.origin_attributes])
         ).run(dag, node="c")
         assert orphan_summary["origin"] == "c"
         assert orphan_summary["depths"] == {"c": 0}
@@ -211,8 +288,8 @@ class TestNXGraphQuery:
 
     def test_origin_subgraph_metrics(self):
         dag = _build_containment_dag(_sample_matrix(), _sample_regions())
-        metrics = NXGraphQuery(
-            NXGraphQueryConfig(
+        metrics = GraphQuery(
+            GraphQueryConfig(
                 attributes=[
                     "subgraph_n_nodes",
                     "subgraph_n_edges",
@@ -240,10 +317,10 @@ class TestNXGraphQuery:
         dag = _build_containment_dag(_sample_matrix(), _sample_regions())
         labels = {"p": 1, "a": 2, "b": 3, "c": 4}
         for node_id, label in labels.items():
-            dag.nodes[node_id]["label"] = label
+            dag.add_node(node_id, **{**dag.node_attrs(node_id), "label": label})
 
-        scoped = NXGraphQuery(
-            NXGraphQueryConfig(
+        scoped = GraphQuery(
+            GraphQueryConfig(
                 attributes=["descendant_counts"],
                 filter_attribute="channel",
                 filter_value="Brain",
@@ -251,8 +328,8 @@ class TestNXGraphQuery:
         ).run(dag, node="p")
         assert scoped["descendant_counts"][0]["count Lobe"] == 2
 
-        lineage = NXGraphQuery(
-            NXGraphQueryConfig(
+        lineage = GraphQuery(
+            GraphQueryConfig(
                 attributes=["ancestor_lineage"],
                 filter_attribute="channel",
                 filter_value="Lobe",
@@ -261,8 +338,8 @@ class TestNXGraphQuery:
         assert len(lineage) == 2
         assert lineage[0]["lineage Brain"] == 1
 
-        df = NXGraphQuery(
-            NXGraphQueryConfig(
+        df = GraphQuery(
+            GraphQueryConfig(
                 attributes=["ancestor_lineage"],
                 filter_attribute="channel",
                 filter_value="Lobe",
@@ -275,8 +352,8 @@ class TestNXGraphQuery:
 
     def test_format_empty_rows_returns_empty_dataframe(self):
         dag = _build_containment_dag(_sample_matrix(), _sample_regions())
-        gq = NXGraphQuery(
-            NXGraphQueryConfig(
+        gq = GraphQuery(
+            GraphQueryConfig(
                 attributes=["descendant_counts"],
                 filter_attribute="channel",
                 filter_value="Dpn",
@@ -292,19 +369,126 @@ class TestNXGraphQuery:
 
     def test_invalid_attribute_raises(self):
         with pytest.raises(ValueError, match="invalid attributes"):
-            NXGraphQueryConfig(attributes=["not_a_real_key"])
+            GraphQueryConfig(attributes=["not_a_real_key"])
 
-    def test_abstract_summary_raises(self):
-        dag = _build_containment_dag(_sample_matrix(), _sample_regions())
-        with pytest.raises(NotImplementedError):
-            GraphQuery(GraphQueryConfig()).run(dag, node="p")
 
-    def test_abstract_builder_raises(self):
-        with pytest.raises(NotImplementedError):
-            GraphBuilder(GraphBuilderConfig()).run(
-                matrix=_sample_matrix(),
-                regions=_sample_regions(),
+
+class TestGraphFilter:
+    def _hierarchy_dag(self):
+        dag = networkx.DiGraph()
+        dag.add_node("lobe1", channel="Lobe", label=1)
+        dag.add_node("lobe2", channel="Lobe", label=2)
+        dag.add_node("d1", channel="Dpn")
+        dag.add_node("d2", channel="Dpn")
+        dag.add_node("e1", channel="EdU")
+        dag.add_edge("lobe1", "d1")
+        dag.add_edge("lobe2", "d2")
+        dag.add_edge("d1", "e1", distance=2.5)
+        return NXGraph(dag)
+
+    def test_nodes_by_attribute(self):
+        dag = self._hierarchy_dag()
+        nodes = GraphFilter(
+            GraphFilterConfig(mode="nodes", node_match={"channel": "Dpn"})
+        ).run(dag)
+        assert set(nodes) == {"d1", "d2"}
+
+    def test_edges_endpoints(self):
+        dag = self._hierarchy_dag()
+        edges = GraphFilter(
+            GraphFilterConfig(
+                mode="edges",
+                node_match={
+                    "source": ["d1"],
+                    "target": {"channel": "EdU"},
+                },
             )
+        ).run(dag)
+        assert len(edges) == 1
+        assert edges[0]["source"] == "d1"
+        assert edges[0]["target"] == "e1"
+
+    def test_edges_incident_list(self):
+        dag = self._hierarchy_dag()
+        edges = GraphFilter(
+            GraphFilterConfig(mode="edges", node_match=["d1"])
+        ).run(dag)
+        assert len(edges) == 2
+        assert {"source": "d1", "target": "e1", "distance": 2.5} in edges
+        assert {"source": "lobe1", "target": "d1"} in edges
+
+    def test_direct_path(self):
+        dag = self._hierarchy_dag()
+        edges = GraphFilter(
+            GraphFilterConfig(
+                mode="direct_path",
+                node_match={
+                    "source": {"channel": "Lobe"},
+                    "target": ["d1", "d2"],
+                },
+            )
+        ).run(dag)
+        assert {e["source"] for e in edges} == {"lobe1", "lobe2"}
+        assert {e["target"] for e in edges} == {"d1", "d2"}
+
+    def test_full_path(self):
+        dag = self._hierarchy_dag()
+        edges = GraphFilter(
+            GraphFilterConfig(
+                mode="full_path",
+                node_match={
+                    "source": {"channel": "Lobe"},
+                    "target": ["d1"],
+                },
+            )
+        ).run(dag)
+        assert len(edges) == 1
+        assert edges[0] == {"source": "lobe1", "target": "d1"}
+
+
+class TestEdgesToMatrix:
+    def test_weighted_and_default_weight(self):
+        dag = networkx.DiGraph()
+        dag.add_node("lobe1", channel="Lobe", label=1)
+        dag.add_node("d1", channel="Dpn")
+        dag.add_node("e1", channel="EdU")
+        dag.add_edge("lobe1", "d1")
+        dag.add_edge("d1", "e1", ios=2.5)
+        dag = NXGraph(dag)
+
+        partner_edges = GraphQuery(
+            GraphQueryConfig(
+                attributes=["filtered_edges"],
+                target_filter={"channel": "EdU"},
+            )
+        ).run(dag)["filtered_edges"]
+        partner_matrix = edges_to_matrix(partner_edges)
+        assert partner_matrix.loc["d1", "e1"] == pytest.approx(2.5)
+
+        predecessor_edges = GraphQuery(
+            GraphQueryConfig(
+                attributes=["matching_predecessor_edges"],
+                predecessor_match={"channel": "Lobe"},
+                seed_nodes=["d1"],
+            )
+        ).run(dag)["matching_predecessor_edges"]
+        predecessor_matrix = edges_to_matrix(predecessor_edges)
+        assert list(predecessor_matrix.index) == ["d1", "lobe1"]
+        assert predecessor_matrix.loc["lobe1", "d1"] == pytest.approx(1.0)
+
+        built = GraphBuilder(GraphBuilderConfig()).run(
+            predecessor_matrix,
+            graph_to_dataframe(dag).loc[predecessor_matrix.index],
+        )
+        assert list(built.edges()) == [("lobe1", "d1")]
+
+    def test_empty_records(self):
+        assert edges_to_matrix([]).empty
+
+    def test_custom_endpoints_and_weight(self):
+        records = [{"parent": "a", "child": "b", "ios": 0.5}]
+        matrix = edges_to_matrix(records, endpoints=("parent", "child"))
+        assert matrix.loc["a", "b"] == pytest.approx(0.5)
 
 
 class TestOrphanHandling:
@@ -314,22 +498,22 @@ class TestOrphanHandling:
         )
         return {
             node
-            for node in dag.nodes
-            if dag.in_degree(node) == 0 and not dag.nodes[node].get("synthetic")
+            for node in dag.nodes()
+            if dag.in_degree(node) == 0 and not dag.node_attrs(node).get("synthetic")
         }
 
     def test_as_roots_default(self):
         dag = _build_containment_dag(_sample_matrix(), _sample_regions())
-        assert set(dag.nodes) == {"p", "a", "b", "c"}
+        assert set(dag.nodes()) == {"p", "a", "b", "c"}
         assert self._orphan_roots(threshold=0.5) == {"p", "c"}
 
     def test_drop_orphans(self):
         dag = _build_containment_dag(
             _sample_matrix(), _sample_regions(), threshold=0.5, orphan_strategy="drop"
         )
-        assert set(dag.nodes) == {"p", "a", "b"}
+        assert set(dag.nodes()) == {"p", "a", "b"}
         assert dag.in_degree("p") == 0
-        summary = NXGraphQuery(NXGraphQueryConfig(attributes=["n_roots"])).run(
+        summary = GraphQuery(GraphQueryConfig(attributes=["n_roots"])).run(
             dag
         )
         assert summary["n_roots"] == 1
@@ -352,8 +536,8 @@ class TestOrphanHandling:
         dag = _build_containment_dag(
             matrix, regions, threshold=0.5, orphan_strategy="drop"
         )
-        assert set(dag.nodes) == {"r"}
-        summary = NXGraphQuery(NXGraphQueryConfig(attributes=["n_roots"])).run(
+        assert set(dag.nodes()) == {"r"}
+        summary = GraphQuery(GraphQueryConfig(attributes=["n_roots"])).run(
             dag
         )
         assert summary["n_roots"] == 1
@@ -368,15 +552,15 @@ class TestOrphanHandling:
         )
         synthetic_roots = [
             node
-            for node in dag.nodes
-            if dag.in_degree(node) == 0 and dag.nodes[node].get("synthetic")
+            for node in dag.nodes()
+            if dag.in_degree(node) == 0 and dag.node_attrs(node).get("synthetic")
         ]
         assert len(synthetic_roots) == 1
         orphan_root = synthetic_roots[0]
-        assert dag.nodes[orphan_root]["name"] == "Orphans"
+        assert dag.node_attrs(orphan_root)["name"] == "Orphans"
         assert dag.has_edge(orphan_root, "c")
-        assert dag.edges[orphan_root, "c"]["synthetic"] is True
-        assert dag.edges["p", "a"].get("synthetic") is not True
+        assert dag.edge_attrs(orphan_root, "c")["synthetic"] is True
+        assert dag.edge_attrs("p", "a").get("synthetic") is not True
         assert self._orphan_roots(
             threshold=0.5,
             orphan_strategy="group",
@@ -393,13 +577,13 @@ class TestOrphanHandling:
         )
         group_nodes = [
             node
-            for node in dag.nodes
-            if dag.nodes[node].get("orphan_group") == "EdU"
+            for node in dag.nodes()
+            if dag.node_attrs(node).get("orphan_group") == "EdU"
         ]
         assert len(group_nodes) == 1
         group_id = group_nodes[0]
         assert dag.has_edge(group_id, "c")
-        assert dag.edges[group_id, "c"]["synthetic"] is True
+        assert dag.edge_attrs(group_id, "c")["synthetic"] is True
 
     def test_unify_attach(self):
         dag = _build_containment_dag(
@@ -409,10 +593,10 @@ class TestOrphanHandling:
             orphan_strategy="group",
             orphan_attach="unify",
         )
-        all_roots = [node for node in dag.nodes if dag.in_degree(node) == 0]
+        all_roots = [node for node in dag.nodes() if dag.in_degree(node) == 0]
         assert len(all_roots) == 1
         all_root = all_roots[0]
-        assert dag.nodes[all_root]["name"] == "all"
+        assert dag.node_attrs(all_root)["name"] == "all"
         assert dag.out_degree(all_root) == 2
         for _parent, _child in dag.out_edges(all_root):
-            assert dag.edges[_parent, _child]["synthetic"] is True
+            assert dag.edge_attrs(_parent, _child)["synthetic"] is True
