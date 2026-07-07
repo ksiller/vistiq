@@ -13,13 +13,16 @@ from vistiq.analysis import OverlapResult
 from vistiq.analysis.overlap import OverlapCalculatorConfig, region_map_from_dataframe
 from vistiq.analysis.coincidence import CoincidenceDetectorConfig
 from vistiq.analysis.distance import DistanceCalculatorConfig
-from vistiq.analysis.matrix import (
+from vistiq.matrix.ops import (
     HierarchicalMatrix,
     HierarchicalMatrixConfig,
     MatrixAggregatorConfig,
     MatrixCombiner,
     MatrixCombinerConfig,
+    MatrixFormatter,
+    MatrixFormatterConfig,
 )
+from vistiq.matrix.types import MatrixData, UPPER
 from vistiq.analysis.spatial import (
     KnnAnalysis,
     KnnAnalysisConfig,
@@ -27,7 +30,6 @@ from vistiq.analysis.spatial import (
     RnnAnalysisConfig,
     SpatialScopeConfig,
 )
-from vistiq.constant.matrix import UPPER
 from vistiq.core import ArrayIteratorConfig, Configurable, generate_name
 from vistiq.graph import (
     GraphBuilderConfig,
@@ -108,6 +110,12 @@ class AnalysisFlowConfig(WorkflowConfig):
     overlap_calculator: Optional[OverlapCalculatorConfig] = None
     overlap_filter: Optional[MatrixFilterConfig] = None
     overlap_aggregator: Optional[MatrixAggregatorConfig] = None
+    matrix_formatter: MatrixFormatterConfig = Field(
+        default_factory=lambda: MatrixFormatterConfig(
+            output_type="dataframe",
+            annotate=True,
+        )
+    )
     matrix_combiner: Optional[MatrixCombinerConfig] = Field(
         default_factory=lambda: MatrixCombinerConfig(
             fill_value=float("nan"),
@@ -191,33 +199,45 @@ class AnalysisFlow(Workflow):
             output_type=output_type,
         )
 
-    @task(name="AnalysisFlow._to_dataframe", task_run_name=generate_name)
-    def _to_dataframe(self, result: ArrayLike, overlap_result: OverlapResult) -> Union[pd.DataFrame, ArrayLike]:
-        oc_cfg = self.config.overlap_calculator
-        filter_cfg = self.config.overlap_filter
-        if (
-            oc_cfg.output_type == "dataframe"
-            and filter_cfg.output in ("masked_values", "mask")
-            and overlap_result.annotations is not None
-        ):
-            row, col = overlap_result.annotations
-            return pd.DataFrame(_as_numpy(result), index=row, columns=col)
+    @task(name="AnalysisFlow._to_matrix_data", task_run_name=generate_name)
+    def _to_matrix_data(
+        self, result: ArrayLike | MatrixData, overlap_result: OverlapResult
+    ) -> MatrixData:
+        if isinstance(result, MatrixData):
+            return result
+        return MatrixData(matrix=result, annotations=overlap_result.annotations)
+
+    @task(name="AnalysisFlow._format_matrix", task_run_name=generate_name)
+    def _format_matrix(self, data: MatrixData) -> pd.DataFrame | pd.Series:
+        formatter = MatrixFormatter(self.config.matrix_formatter)
+        result = formatter.run(data)
+        if not isinstance(result, (pd.DataFrame, pd.Series)):
+            raise TypeError(
+                "matrix_formatter.output_type must be 'dataframe' for workflow export"
+            )
         return result
 
     @task(name="AnalysisFlow._to_dataseries", task_run_name=generate_name)
-    def _to_dataseries(self, result: ArrayLike, overlap_result: OverlapResult, axis: int, series_name: str) -> Union[pd.Series, ArrayLike]:
-        oc_cfg = self.config.overlap_calculator
+    def _to_dataseries(
+        self,
+        result: MatrixData,
+        overlap_result: OverlapResult,
+        axis: int,
+        series_name: str,
+    ) -> Union[pd.Series, MatrixData]:
         filter_cfg = self.config.overlap_filter
         if (
-            oc_cfg.output_type == "dataframe"
-            and filter_cfg.output in ("masked_values", "mask")
+            filter_cfg.output in ("masked_values", "mask")
             and overlap_result.annotations is not None
+            and result.annotations is not None
         ):
-            row, col = overlap_result.annotations
-            values = _as_numpy(result).ravel()
+            values = _as_numpy(result.matrix).ravel()
             axis = int(axis)
-            # axis=0 collapses rows → one value per column; axis=1 collapses columns → one per row
-            index = col if axis == 0 else row
+            if len(result.annotations) == 1:
+                (index,) = result.annotations
+            else:
+                row, col = result.annotations
+                index = col if axis == 0 else row
             if len(values) != len(index):
                 raise ValueError(
                     f"aggregated result length {len(values)} does not match "
@@ -291,14 +311,16 @@ class AnalysisFlow(Workflow):
         ):
             return {}
 
-        ios_global = MatrixCombiner(self.config.matrix_combiner).run(ios_matrices)
+        combiner = MatrixCombiner(self.config.matrix_combiner)
+        ios_global = combiner.run(ios_matrices)
         hm = HierarchicalMatrix(self.config.hierarchical_matrix).run(
             ios_global, regions
         )
         builder = Configurable.create_from_config(self.config.graph_builder)
         dag = builder.run(hm.matrix, hm.regions, annotations=None)
+        formatter = MatrixFormatter(self.config.matrix_formatter)
         output: dict[str, Any] = {
-            "ios_global": ios_global,
+            "ios_global": formatter.run(ios_global),
             "containment_graph": dag,
         }
 
@@ -540,13 +562,15 @@ class AnalysisFlow(Workflow):
 
             logger.info("Setting up overlap calculator for pairs: %s", stack_names)
             oc = Configurable.create_from_config(self.config.overlap_calculator)
+            matrix_formatter = MatrixFormatter(self.config.matrix_formatter)
             overlap_results = oc.run.map(
                 l1,
                 l2,
                 region_map=region_maps,
                 spacing=spacings,
             )
-            formatted_results = oc.format.map(overlap_results)
+            overlap_matrices = oc.matrix.map(overlap_results)
+            formatted_results = matrix_formatter.run.map(overlap_matrices)
             for stack_name, formatted_result in zip(stack_names, formatted_results):
                 results[_pair_key("overlap", stack_name)] = formatted_result
 
@@ -554,17 +578,26 @@ class AnalysisFlow(Workflow):
                 overlap_filter = Configurable.create_from_config(
                     self.config.overlap_filter
                 )
-                overlap_matrices = oc.matrix.map(overlap_results)
                 filtered_results = overlap_filter.run.map(overlap_matrices)
-                labeled_filtered = self._to_dataframe.map(filtered_results, overlap_results)
-                for stack_name, lf_result in zip(stack_names, labeled_filtered):
+                filter_output = self.config.overlap_filter.output
+                if filter_output in ("masked_values", "mask"):
+                    labeled_filtered = self._to_matrix_data.map(
+                        filtered_results, overlap_results
+                    )
+                    exported = self._format_matrix.map(labeled_filtered)
+                else:
+                    exported = filtered_results
+                for stack_name, lf_result in zip(stack_names, exported):
                     results[_pair_key("overlap_filtered", stack_name)] = lf_result
 
                 if self.config.overlap_aggregator is not None:
                     overlap_aggregator = Configurable.create_from_config(
                         self.config.overlap_aggregator
                     )
-                    agg_results = overlap_aggregator.run.map(filtered_results)
+                    agg_inputs = self._to_matrix_data.map(
+                        filtered_results, overlap_results
+                    )
+                    agg_results = overlap_aggregator.run.map(agg_inputs)
                     axis = self.config.overlap_aggregator.axis
                     operation = self.config.overlap_aggregator.operation
                     series_names = [

@@ -46,8 +46,8 @@ from vistiq.preprocess import (
 from vistiq.workflow import Workflow, WorkflowConfig
 
 from vistiq.analysis.overlap import OverlapCalculator, MaskOverlapCalculatorConfig
-from vistiq.analysis.matrix import group_matrix_indices
-from vistiq.constant.matrix import LOWER_ND
+from vistiq.matrix.types import LOWER_ND
+from vistiq.matrix.ops import MatrixFormatter, MatrixFormatterConfig, group_matrix_indices
 
 from vistiq.segment._debug import debug_mask_labels
 from vistiq.segment.analysis import RegionAnalyzer, RegionAnalyzerConfig
@@ -1716,7 +1716,9 @@ class TiledSegmentationFlow(SegmentationFlow):
         )
         ol_calc = OverlapCalculator(olcfg)
         ol_result = ol_calc.run(t_proj, t_proj)
-        iou = ol_calc.format(ol_result, "iou")
+        iou = MatrixFormatter(
+            MatrixFormatterConfig(output_type="np.ndarray", annotate=False)
+        ).run(ol_result.metric("iou"))
         groups = group_matrix_indices(iou, threshold=self.config.iou_threshold)
         logger.info(f"TiledSegmentationFlow: groups={groups}")
         # label grouped mask

@@ -74,11 +74,17 @@ def _box_overlap_matrix(
     calc = OverlapCalculator(
         BoxOverlapCalculatorConfig(
             metrics_calculators=[metric],
-            output_type="np.ndarray",
         )
     )
     result = calc.run(boxes_a, boxes_b, device=device)
-    return np.asarray(calc.format(result), dtype=np.float32)
+    from vistiq.matrix.ops import MatrixFormatter, MatrixFormatterConfig
+
+    return np.asarray(
+        MatrixFormatter(
+            MatrixFormatterConfig(output_type="np.ndarray", annotate=False)
+        ).run(result.metric()),
+        dtype=np.float32,
+    )
 
 
 def _label_overlap_matrix(
@@ -107,11 +113,17 @@ def _label_overlap_matrix(
             intersection_calculator=LabelIntersectionCalculatorConfig(
                 mode=intersection_mode
             ),
-            output_type="np.ndarray",
         )
     )
     result = calc.run(labels_a, labels_b, device=device)
-    scores = np.asarray(calc.format(result), dtype=np.float32)
+    from vistiq.matrix.ops import MatrixFormatter, MatrixFormatterConfig
+
+    scores = np.asarray(
+        MatrixFormatter(
+            MatrixFormatterConfig(output_type="np.ndarray", annotate=False)
+        ).run(result.metric()),
+        dtype=np.float32,
+    )
     return scores, np.asarray(build_a.label_ids), np.asarray(build_b.label_ids)
 
 

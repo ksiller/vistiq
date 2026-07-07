@@ -1125,7 +1125,7 @@ class TestTopKFilter:
     def test_axis_none_global_smallest(self):
         """axis=None selects globally over a flattened array."""
         import torch
-        from vistiq.constant.matrix import FULL
+        from vistiq.matrix.types import FULL
         from vistiq.segment import TopKFilter, TopKFilterConfig
 
         values = torch.tensor([[3.0, 1.0], [4.0, 2.0]])
@@ -1139,7 +1139,7 @@ class TestTopKFilter:
     def test_off_diagonal_rowwise_nearest(self):
         """OFF_DIAGONAL skips self-pairs on square distance matrices."""
         import torch
-        from vistiq.constant.matrix import OFF_DIAGONAL
+        from vistiq.matrix.types import OFF_DIAGONAL
         from vistiq.segment import TopKFilter, TopKFilterConfig
 
         values = torch.tensor(
@@ -1173,7 +1173,7 @@ class TestTopKFilter:
     def test_axis_none_off_diagonal(self):
         """axis=None with OFF_DIAGONAL excludes diagonal on square matrices."""
         import torch
-        from vistiq.constant.matrix import OFF_DIAGONAL
+        from vistiq.matrix.types import OFF_DIAGONAL
         from vistiq.segment import TopKFilter, TopKFilterConfig
 
         values = torch.tensor(
@@ -1193,7 +1193,7 @@ class TestTopKFilter:
     def test_output_values(self):
         """output='values' returns selected entries as a tensor."""
         import torch
-        from vistiq.constant.matrix import OFF_DIAGONAL
+        from vistiq.matrix.types import OFF_DIAGONAL
         from vistiq.segment import TopKFilter, TopKFilterConfig
 
         values = torch.tensor(
@@ -1266,7 +1266,7 @@ class TestValueFilter:
     def test_off_diagonal(self):
         """OFF_DIAGONAL excludes self-pairs even when they pass the threshold."""
         import torch
-        from vistiq.constant.matrix import OFF_DIAGONAL
+        from vistiq.matrix.types import OFF_DIAGONAL
         from vistiq.segment import ValueFilter, ValueFilterConfig
 
         values = torch.tensor([[0.0, 4.0], [3.0, 0.0]])
@@ -1284,7 +1284,7 @@ class TestValueFilter:
     def test_lower_triangle_only(self):
         """LOWER selects lower triangle including diagonal (i >= j)."""
         import torch
-        from vistiq.constant.matrix import LOWER
+        from vistiq.matrix.types import LOWER
         from vistiq.segment import TopKFilter, TopKFilterConfig
 
         values = torch.tensor([[9.0, 1.0, 2.0], [3.0, 8.0, 4.0], [5.0, 6.0, 7.0]])
@@ -1300,7 +1300,7 @@ class TestValueFilter:
     def test_lower_triangle_rowwise(self):
         """LOWER with axis=1 does not zero the full matrix when one row lacks strict-lower cells."""
         import torch
-        from vistiq.constant.matrix import LOWER
+        from vistiq.matrix.types import LOWER
         from vistiq.segment import TopKFilter, TopKFilterConfig
 
         dist = torch.tensor([[0.0, 5.0, 2.0], [5.0, 0.0, 4.0], [2.0, 4.0, 0.0]])
@@ -1317,7 +1317,7 @@ class TestValueFilter:
     def test_lower_nd_triangle(self):
         """LOWER_ND selects strict lower triangle (i > j) only."""
         import torch
-        from vistiq.constant.matrix import LOWER_ND
+        from vistiq.matrix.types import LOWER_ND
         from vistiq.segment import TopKFilter, TopKFilterConfig
 
         values = torch.tensor([[9.0, 1.0, 2.0], [3.0, 8.0, 4.0], [5.0, 6.0, 7.0]])
@@ -1333,7 +1333,7 @@ class TestValueFilter:
     def test_upper_nd_triangle(self):
         """UPPER_ND selects strict upper triangle (i < j) only."""
         import torch
-        from vistiq.constant.matrix import UPPER_ND
+        from vistiq.matrix.types import UPPER_ND
         from vistiq.segment import TopKFilter, TopKFilterConfig
 
         values = torch.tensor([[9.0, 1.0, 2.0], [3.0, 8.0, 4.0], [5.0, 6.0, 7.0]])
@@ -1362,3 +1362,54 @@ class TestValueFilter:
         assert torch.isnan(masked[0, 1])
         assert torch.isnan(masked[1, 0])
 
+    def test_matrix_data_masked_values_preserves_annotations(self):
+        """MatrixData input keeps original annotations for masked_values."""
+        import torch
+        from vistiq.matrix import MatrixData
+        from vistiq.segment import ValueFilter, ValueFilterConfig
+
+        data = MatrixData(
+            matrix=torch.tensor([[1.0, 5.0], [3.0, 2.0]]),
+            annotations=(("r0", "r1"), ("c0", "c1")),
+        )
+        result = ValueFilter(
+            ValueFilterConfig(ref_value=2.5, operator="<=", output="masked_values")
+        ).run(data)
+        assert isinstance(result, MatrixData)
+        assert result.annotations == data.annotations
+        assert result.matrix[0, 0].item() == 1.0
+        assert result.matrix[1, 1].item() == 2.0
+        assert torch.isnan(result.matrix[0, 1])
+
+    def test_matrix_data_values_uses_composite_annotations(self):
+        """MatrixData values output merges row/col labels with a separator."""
+        import torch
+        from vistiq.matrix import MatrixData
+        from vistiq.segment import ValueFilter, ValueFilterConfig
+
+        data = MatrixData(
+            matrix=torch.tensor([[1.0, 5.0], [3.0, 2.0]]),
+            annotations=(("r0", "r1"), ("c0", "c1")),
+        )
+        result = ValueFilter(
+            ValueFilterConfig(ref_value=2.5, operator="<=", output="values")
+        ).run(data)
+        assert isinstance(result, MatrixData)
+        assert result.matrix.tolist() == [1.0, 2.0]
+        assert result.annotations == (("r0|c0", "r1|c1"),)
+
+    def test_matrix_data_indices_returns_raw_coords(self):
+        """MatrixData input with indices output still returns ndarray coordinates."""
+        import torch
+        from vistiq.matrix import MatrixData
+        from vistiq.segment import ValueFilter, ValueFilterConfig
+
+        data = MatrixData(
+            matrix=torch.tensor([[1.0, 5.0], [3.0, 2.0]]),
+            annotations=(("r0", "r1"), ("c0", "c1")),
+        )
+        result = ValueFilter(
+            ValueFilterConfig(ref_value=2.5, operator="<=", output="indices")
+        ).run(data)
+        assert isinstance(result, np.ndarray)
+        assert result.tolist() == [[0, 0], [1, 1]]

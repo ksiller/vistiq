@@ -5,7 +5,7 @@ import pytest
 
 networkx = pytest.importorskip("networkx")
 
-from vistiq.analysis.matrix import HierarchicalMatrix, HierarchicalMatrixConfig
+from vistiq.matrix.ops import HierarchicalMatrix, HierarchicalMatrixConfig
 from vistiq.graph import (
     GraphBuilder,
     GraphBuilderConfig,

@@ -1,81 +1,144 @@
-"""Unary matrix operations on analysis results (e.g. distance matrices)."""
+"""Matrix formatters, combiners, aggregators, and hierarchical transforms."""
 
 from __future__ import annotations
 
 import logging
 import uuid
-from dataclasses import dataclass
 from typing import Any, Literal, Optional, Union
 
 import numpy as np
-import torch
 import pandas as pd
+import torch
 from numpy.typing import ArrayLike
 from prefect import task
 from pydantic import Field
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 
-from vistiq.constant.matrix import DIAGONAL, FULL, LOWER_ND, UPPER_ND
 from vistiq.core import Configurable, Configuration, generate_name
-from vistiq.utils import convert_array_like, prepare_matrix_values, resolve_torch_device
+from vistiq.matrix.mask import mask_triangle, prepare_matrix_values
+from vistiq.matrix.types import (
+    FULL,
+    AnnotationFactory,
+    HierarchicalResult,
+    MatrixArray,
+    MatrixAnnotations,
+    MatrixContainer,
+    MatrixData,
+    MatrixFormatOutput,
+    annotations_after_aggregate,
+    as_matrix_data,
+    default_matrix_annotations,
+    label_index,
+    matrix_to_numpy,
+    ordered_union,
+    resolve_matrix_annotations,
+    square_matrix,
+)
+from vistiq.utils import convert_array_like, resolve_torch_device
 
 logger = logging.getLogger(__name__)
 
 ORPHAN_GROUP_UNKNOWN = "unknown"
 
 
-def _ordered_union(existing: list[Any], new_items: list[Any]) -> list[Any]:
-    seen = set(existing)
-    for item in new_items:
-        if item not in seen:
-            existing.append(item)
-            seen.add(item)
-    return existing
+class MatrixFormatterConfig(Configuration):
+    """Configuration for :class:`MatrixFormatter`.
+
+    Attributes:
+        output_type: Export target (``"dataframe"``, ``"np.ndarray"``, or
+            ``"torch.Tensor"``).
+        annotate: When ``True``, attach axis labels from :class:`MatrixData` or
+            :attr:`annotation_factory`.
+        annotation_factory: Fallback labels when :class:`MatrixData` has no
+            annotations and :attr:`annotate` is ``True``.
+        preferred_device: Torch device when :attr:`output_type` is
+            ``"torch.Tensor"``; ``None`` selects automatically.
+    """
+
+    output_type: MatrixFormatOutput = "dataframe"
+    annotate: bool = True
+    annotation_factory: AnnotationFactory = default_matrix_annotations
+    preferred_device: Optional[Literal["cuda", "mps", "cpu"]] = None
 
 
-def _matrix_values(matrix: Union[pd.DataFrame, ArrayLike]) -> np.ndarray:
-    if isinstance(matrix, pd.DataFrame):
-        return matrix.to_numpy(dtype=float)
-    return np.asarray(matrix, dtype=float)
+class MatrixFormatter(Configurable[MatrixFormatterConfig]):
+    """Export :class:`MatrixData` to ndarray, tensor, or labeled pandas containers."""
+
+    def __init__(self, config: MatrixFormatterConfig):
+        super().__init__(config)
+
+    @classmethod
+    def from_config(cls, config: MatrixFormatterConfig) -> "MatrixFormatter":
+        return cls(config)
+
+    @task(name="MatrixFormatter.run", task_run_name=generate_name)
+    def run(
+        self,
+        data: MatrixData,
+        *,
+        device: Optional[torch.device] = None,
+    ) -> MatrixContainer:
+        """Format *data* using :attr:`~MatrixFormatterConfig.output_type`."""
+        resolved = resolve_matrix_annotations(
+            data,
+            annotate=self.config.annotate,
+            annotation_factory=self.config.annotation_factory,
+        )
+        output_type = self.config.output_type
+        matrix = data.matrix
+        if output_type == "np.ndarray":
+            if isinstance(matrix, np.ndarray):
+                return matrix
+            if isinstance(matrix, torch.Tensor):
+                return matrix.detach().cpu().numpy()
+            return np.asarray(matrix, dtype=float)
+        if output_type == "torch.Tensor":
+            if device is None:
+                device = resolve_torch_device(
+                    None,
+                    preferred_input_type="torch.Tensor",
+                    preferred_device=self.config.preferred_device,
+                )
+            if isinstance(matrix, torch.Tensor):
+                return matrix.to(device) if device is not None else matrix
+            array = (
+                matrix
+                if isinstance(matrix, np.ndarray)
+                else np.asarray(matrix, dtype=float)
+            )
+            tensor = torch.from_numpy(np.ascontiguousarray(array))
+            return tensor.to(device) if device is not None else tensor
+
+        if isinstance(matrix, np.ndarray):
+            values = matrix
+        elif isinstance(matrix, torch.Tensor):
+            values = matrix.detach().cpu().numpy()
+        else:
+            values = np.asarray(matrix, dtype=float)
+        if data.ndim == 1:
+            index = None
+            if resolved is not None:
+                index = [str(label) for label in resolved[0]]
+            return pd.Series(values, index=index, name="value")
+        if data.ndim != 2:
+            raise ValueError(
+                f"dataframe output requires ndim 1 or 2; got ndim={data.ndim}"
+            )
+        if resolved is not None:
+            columns = [str(label) for label in resolved[1]]
+            index = [str(label) for label in resolved[0]]
+            return pd.DataFrame(values, columns=columns, index=index)
+        return pd.DataFrame(values)
 
 
-def _square_dataframe(matrix: pd.DataFrame) -> pd.DataFrame:
+def square_dataframe(matrix: pd.DataFrame) -> pd.DataFrame:
     """Reindex to shared row/column labels (ordered union of index and columns)."""
-    nodes: list[Any] = []
-    nodes = _ordered_union(nodes, list(matrix.index))
-    nodes = _ordered_union(nodes, list(matrix.columns))
-    return matrix.reindex(index=nodes, columns=nodes)
-
-
-def _triangle_valid_mask_numpy(values: np.ndarray, flags: int) -> Optional[np.ndarray]:
-    """Boolean mask of allowed triangle regions; ``None`` if unrestricted or non-square."""
-    if flags == FULL:
-        return None
-    if values.ndim != 2 or values.shape[0] != values.shape[1]:
-        return None
-
-    n = values.shape[0]
-    row_idx = np.arange(n)[:, None]
-    col_idx = np.arange(n)[None, :]
-    valid = np.zeros((n, n), dtype=bool)
-    if flags & DIAGONAL:
-        valid |= row_idx == col_idx
-    if flags & LOWER_ND:
-        valid |= row_idx > col_idx
-    if flags & UPPER_ND:
-        valid |= row_idx < col_idx
-    return valid
-
-
-def _mask_triangle(values: np.ndarray, flags: int, fill_value: float) -> np.ndarray:
-    """Zero out (or fill) cells outside the configured triangle region."""
-    mask = _triangle_valid_mask_numpy(values, flags)
-    if mask is None:
-        return values
-    result = np.array(values, copy=True)
-    result[~mask] = fill_value
-    return result
+    formatted = MatrixFormatter(MatrixFormatterConfig()).run(
+        square_matrix(as_matrix_data(matrix))
+    )
+    assert isinstance(formatted, pd.DataFrame)
+    return formatted
 
 
 class MatrixCombinerConfig(Configuration):
@@ -87,7 +150,7 @@ class MatrixCombinerConfig(Configuration):
         symmetrize: When ``True``, merge ``(i, j)`` and ``(j, i)`` with
             element-wise ``nanmax`` on the squared global matrix before masking.
         triangle: Bitmask of retained regions on the square global matrix; see
-            :mod:`vistiq.constant.matrix`. ``FULL`` keeps all cells.
+            :mod:`vistiq.matrix.types`. ``FULL`` keeps all cells.
     """
 
     fill_value: float = float("nan")
@@ -108,11 +171,11 @@ class MatrixCombiner(Configurable[MatrixCombinerConfig]):
     @task(name="MatrixCombiner.run", task_run_name=generate_name)
     def run(
         self,
-        matrices: list[Union[pd.DataFrame, ArrayLike]],
+        matrices: list[Union[MatrixData, pd.DataFrame, ArrayLike]],
         *,
         object_ids: Optional[list[tuple[list[Any], list[Any]]]] = None,
-    ) -> pd.DataFrame:
-        """Combine pairwise metric blocks into a single labeled DataFrame.
+    ) -> MatrixData:
+        """Combine pairwise metric blocks into a single :class:`MatrixData`.
 
         Args:
             matrices: Pairwise metric blocks (e.g. IoS between two object lists).
@@ -121,11 +184,11 @@ class MatrixCombiner(Configurable[MatrixCombinerConfig]):
                 list length must match the corresponding matrix shape.
 
         Returns:
-            DataFrame with union row index and union column labels; unfilled cells
+            Combined 2-D matrix with union row/column annotations; unfilled cells
             use :attr:`~MatrixCombinerConfig.fill_value`.
         """
         if not matrices:
-            return pd.DataFrame(dtype=float)
+            return MatrixData(matrix=np.empty((0, 0), dtype=float))
 
         if object_ids is not None and len(object_ids) != len(matrices):
             raise ValueError(
@@ -133,7 +196,7 @@ class MatrixCombiner(Configurable[MatrixCombinerConfig]):
                 f"matrices length {len(matrices)}"
             )
 
-        blocks: list[pd.DataFrame] = []
+        blocks: list[MatrixData] = []
         global_rows: list[Any] = []
         global_cols: list[Any] = []
 
@@ -141,7 +204,7 @@ class MatrixCombiner(Configurable[MatrixCombinerConfig]):
             labels = object_ids[index] if object_ids is not None else None
             if labels is not None:
                 rows, cols = labels
-                values = _matrix_values(matrix)
+                values = matrix_to_numpy(matrix)
                 if values.ndim != 2:
                     raise ValueError(f"matrix {index} must be 2-D; got shape {values.shape}")
                 if len(rows) != values.shape[0] or len(cols) != values.shape[1]:
@@ -149,34 +212,61 @@ class MatrixCombiner(Configurable[MatrixCombinerConfig]):
                         f"object_ids[{index}] lengths ({len(rows)}, {len(cols)}) "
                         f"do not match matrix shape {values.shape}"
                     )
-                block = pd.DataFrame(values, index=list(rows), columns=list(cols))
+                block = MatrixData(
+                    matrix=values,
+                    annotations=(tuple(rows), tuple(cols)),
+                )
+            elif isinstance(matrix, MatrixData):
+                if matrix.ndim != 2:
+                    raise ValueError(f"matrix {index} must be 2-D; got ndim={matrix.ndim}")
+                block = matrix
             elif isinstance(matrix, pd.DataFrame):
-                block = matrix.astype(float, copy=False)
+                block = as_matrix_data(matrix.astype(float, copy=False))
             else:
                 raise ValueError(
-                    f"matrix {index} is not a DataFrame; pass object_ids for array inputs"
+                    f"matrix {index} is not MatrixData or DataFrame; "
+                    "pass object_ids for array inputs"
                 )
 
-            global_rows = _ordered_union(global_rows, list(block.index))
-            global_cols = _ordered_union(global_cols, list(block.columns))
+            assert block.annotations is not None
+            global_rows = ordered_union(global_rows, list(block.annotations[0]))
+            global_cols = ordered_union(global_cols, list(block.annotations[1]))
             blocks.append(block)
 
-        combined = pd.DataFrame(
-            self.config.fill_value, index=global_rows, columns=global_cols, dtype=float
+        combined_values = np.full(
+            (len(global_rows), len(global_cols)),
+            self.config.fill_value,
+            dtype=float,
         )
+        row_map = label_index(global_rows)
+        col_map = label_index(global_cols)
         for block in blocks:
-            combined.update(block.astype(float, copy=False))
+            assert block.annotations is not None
+            block_rows, block_cols = block.annotations
+            block_row_map = label_index(block_rows)
+            block_col_map = label_index(block_cols)
+            values = matrix_to_numpy(block)
+            for left in block_rows:
+                for right in block_cols:
+                    combined_values[row_map[left], col_map[right]] = values[
+                        block_row_map[left], block_col_map[right]
+                    ]
 
+        combined = MatrixData(
+            matrix=combined_values,
+            annotations=(tuple(global_rows), tuple(global_cols)),
+        )
         if self.config.symmetrize or self.config.triangle != FULL:
-            combined = _square_dataframe(combined)
-            values = combined.to_numpy(dtype=float)
+            combined = square_matrix(combined)
+            values = matrix_to_numpy(combined)
             if self.config.symmetrize:
-                values = _symmetrize_max(values)
-            values = _mask_triangle(values, self.config.triangle, self.config.fill_value)
-            combined = pd.DataFrame(values, index=combined.index, columns=combined.columns)
+                values = symmetrize_max(values)
+            values = mask_triangle(values, self.config.triangle, self.config.fill_value)
+            combined = MatrixData(matrix=values, annotations=combined.annotations)
         return combined
 
-def _symmetrize_max(values: np.ndarray) -> np.ndarray:
+
+def symmetrize_max(values: np.ndarray) -> np.ndarray:
     """Merge ``(i, j)`` and ``(j, i)`` with element-wise ``nanmax``."""
     sym = np.array(values, copy=True)
     n = sym.shape[0]
@@ -215,12 +305,12 @@ def upper_triangle_adjacency(
         Square DataFrame with weights only in the upper triangle.
     """
     nodes: list[Any] = []
-    nodes = _ordered_union(nodes, list(matrix.index))
-    nodes = _ordered_union(nodes, list(matrix.columns))
+    nodes = ordered_union(nodes, list(matrix.index))
+    nodes = ordered_union(nodes, list(matrix.columns))
     square = matrix.reindex(index=nodes, columns=nodes)
     values = square.to_numpy(dtype=float)
     if symmetrize:
-        values = _symmetrize_max(values)
+        values = symmetrize_max(values)
 
     n = values.shape[0]
     k = 0 if include_diagonal else 1
@@ -229,13 +319,13 @@ def upper_triangle_adjacency(
     result[upper_mask] = values[upper_mask]
     return pd.DataFrame(result, index=nodes, columns=nodes)
 
+
 def group_matrix_indices(matrix, threshold=0.5):
     """Group row/column indices with pairwise overlap > threshold."""
     if isinstance(matrix, torch.Tensor):
         matrix = matrix.detach().cpu().numpy()
     m = np.asarray(matrix, dtype=float)
     n = m.shape[0]
-    # Fill upper triangle from lower (self-comparison matrices are often lower-tri)
     sym = np.array(m, copy=True)
     for i in range(n):
         for j in range(i + 1, n):
@@ -250,6 +340,7 @@ def group_matrix_indices(matrix, threshold=0.5):
         groups.setdefault(lab, []).append(idx)
     return [sorted(g) for g in groups.values()]
 
+
 class MatrixAggregatorConfig(Configuration):
     """Configuration for :class:`MatrixAggregator`.
 
@@ -259,7 +350,7 @@ class MatrixAggregatorConfig(Configuration):
         axis: Axis along which to aggregate (required).
         ignore_nan: When ``True``, NaN entries are excluded from aggregation.
         triangle: Bitmask of selectable regions on square 2-D matrices; see
-            :mod:`vistiq.constant.matrix`.
+            :mod:`vistiq.matrix.types`.
         preferred_input_type: Backend for :meth:`MatrixAggregator.run`.
         preferred_device: Torch device when ``preferred_input_type`` is
             ``"torch.Tensor"``; ``None`` selects automatically.
@@ -286,18 +377,19 @@ class MatrixAggregator(Configurable[MatrixAggregatorConfig]):
     @task(name="MatrixAggregator.run", task_run_name=generate_name)
     def run(
         self,
-        data: Union[np.ndarray, torch.Tensor],
+        data: Union[MatrixData, np.ndarray, torch.Tensor],
         *,
         device: Optional[torch.device] = None,
-    ) -> Union[np.ndarray, torch.Tensor]:
+    ) -> MatrixData:
         """Reduce *data* along :attr:`~MatrixAggregatorConfig.axis`."""
-        as_numpy = isinstance(data, np.ndarray)
+        input_data = as_matrix_data(data) if not isinstance(data, MatrixData) else data
+        as_numpy = isinstance(input_data.matrix, np.ndarray)
         if (
             device is None
             and self.config.preferred_device is None
-            and isinstance(data, torch.Tensor)
+            and isinstance(input_data.matrix, torch.Tensor)
         ):
-            device = data.device
+            device = input_data.matrix.device
         else:
             device = resolve_torch_device(
                 device,
@@ -305,7 +397,7 @@ class MatrixAggregator(Configurable[MatrixAggregatorConfig]):
                 preferred_device=self.config.preferred_device,
             )
         values = convert_array_like(
-            data,
+            input_data.matrix,
             dtype=self.config.preferred_input_type,
             device=device,
         )
@@ -313,8 +405,14 @@ class MatrixAggregator(Configurable[MatrixAggregatorConfig]):
             values = convert_array_like(values, dtype="torch.Tensor", device=device)
         result = self._aggregate(values)
         if as_numpy or self.config.preferred_input_type == "numpy":
-            return result.detach().cpu().numpy()
-        return result
+            result_array: MatrixArray = result.detach().cpu().numpy()
+        else:
+            result_array = result
+        axis = self._resolve_axis(values)
+        return MatrixData(
+            matrix=result_array,
+            annotations=annotations_after_aggregate(input_data.annotations, axis),
+        )
 
     def _resolve_axis(self, values: torch.Tensor) -> int:
         axis = self.config.axis
@@ -382,33 +480,49 @@ class MatrixAggregator(Configurable[MatrixAggregatorConfig]):
         raise ValueError(f"Invalid operation: {operation}")
 
 
-def _pairwise_weight(matrix: pd.DataFrame, left: Any, right: Any) -> float:
+def _pairwise_value(table: Union[MatrixData, pd.DataFrame], left: Any, right: Any) -> float:
     """Return the symmetric matrix weight between left and right."""
-    values: list[float] = []
-    if left in matrix.index and right in matrix.columns:
-        values.append(float(matrix.loc[left, right]))
-    if right in matrix.index and left in matrix.columns:
-        values.append(float(matrix.loc[right, left]))
-    if not values:
+    if isinstance(table, MatrixData):
+        if table.ndim != 2 or table.annotations is None:
+            raise ValueError("pairwise lookup requires a labeled 2-D MatrixData")
+        values = matrix_to_numpy(table)
+        rows, cols = table.annotations
+        row_map = label_index(rows)
+        col_map = label_index(cols)
+        candidates: list[float] = []
+        if left in row_map and right in col_map:
+            candidates.append(float(values[row_map[left], col_map[right]]))
+        if right in row_map and left in col_map:
+            candidates.append(float(values[row_map[right], col_map[left]]))
+        if not candidates:
+            return float("nan")
+        return float(np.nanmax(candidates))
+
+    values_list: list[float] = []
+    if left in table.index and right in table.columns:
+        values_list.append(float(table.loc[left, right]))
+    if right in table.index and left in table.columns:
+        values_list.append(float(table.loc[right, left]))
+    if not values_list:
         return float("nan")
-    return float(np.nanmax(values))
+    return float(np.nanmax(values_list))
 
 
-def _normalize_regions_index(regions: pd.DataFrame) -> pd.DataFrame:
-    if regions.index.name == "object_id":
-        return regions
-    if isinstance(regions.index, pd.MultiIndex) and "object_id" in regions.index.names:
-        return regions.reset_index().set_index("object_id", drop=False)
-    if "object_id" in regions.columns:
-        return regions.set_index("object_id", drop=False)
+def _normalize_index(table: pd.DataFrame, index_name: str = "object_id") -> pd.DataFrame:
+    if table.index.name == index_name:
+        return table
+    if isinstance(table.index, pd.MultiIndex) and index_name in table.index.names:
+        return table.reset_index().set_index(index_name, drop=False)
+    if index_name in table.columns:
+        return table.set_index(index_name, drop=False)
     raise KeyError(
-        "regions must be indexed by object_id or include an object_id column; "
-        f"index={regions.index.name!r}, columns={list(regions.columns)}"
+        f"table must be indexed by {index_name} or include a {index_name} column; "
+        f"index={table.index.name!r}, columns={list(table.columns)}"
     )
 
 
 def _assign_parents(
-    weight_matrix: pd.DataFrame,
+    weight_matrix: MatrixData,
     region_table: pd.DataFrame,
     *,
     rank_attribute: str,
@@ -434,7 +548,7 @@ def _assign_parents(
         candidates = [
             parent
             for parent in candidates
-            if _pairwise_weight(weight_matrix, parent, child) >= threshold
+            if _pairwise_value(weight_matrix, parent, child) >= threshold
         ]
         if not candidates:
             parents[child] = None
@@ -442,7 +556,7 @@ def _assign_parents(
         if parent_strategy == "max_weight":
             parent = max(
                 candidates,
-                key=lambda candidate: _pairwise_weight(
+                key=lambda candidate: _pairwise_value(
                     weight_matrix, candidate, child
                 ),
             )
@@ -552,28 +666,21 @@ def _apply_orphan_grouping(
 
 def _parents_to_matrix(
     parents: dict[Any, Optional[Any]],
-    weight_matrix: pd.DataFrame,
+    weight_matrix: MatrixData,
     nodes: list[Any],
     *,
     synthetic_weight: float,
-) -> pd.DataFrame:
-    matrix = pd.DataFrame(float("nan"), index=nodes, columns=nodes, dtype=float)
+) -> MatrixData:
+    matrix = np.full((len(nodes), len(nodes)), np.nan, dtype=float)
+    node_map = label_index(nodes)
     for child, parent in parents.items():
-        if parent is None or child not in nodes or parent not in nodes:
+        if parent is None or child not in node_map or parent not in node_map:
             continue
-        weight = _pairwise_weight(weight_matrix, parent, child)
-        if pd.isna(weight):
+        weight = _pairwise_value(weight_matrix, parent, child)
+        if np.isnan(weight):
             weight = synthetic_weight
-        matrix.loc[parent, child] = weight
-    return matrix
-
-
-@dataclass
-class MatrixTransformResult:
-    """Output of a matrix transformer with optional updated region metadata."""
-
-    matrix: pd.DataFrame
-    regions: pd.DataFrame
+        matrix[node_map[parent], node_map[child]] = weight
+    return MatrixData(matrix=matrix, annotations=(tuple(nodes), tuple(nodes)))
 
 
 class MatrixTransformerConfig(Configuration):
@@ -593,9 +700,9 @@ class MatrixTransformer(Configurable[MatrixTransformerConfig]):
     @task(name="MatrixTransformer.run", task_run_name=generate_name)
     def run(
         self,
-        matrix: pd.DataFrame,
+        matrix: Union[MatrixData, pd.DataFrame],
         regions: pd.DataFrame,
-    ) -> MatrixTransformResult:
+    ) -> HierarchicalResult:
         raise NotImplementedError
 
 
@@ -629,7 +736,7 @@ class HierarchicalMatrixConfig(MatrixTransformerConfig):
 
 
 class HierarchicalMatrix(MatrixTransformer):
-    """Convert a filtered IoS matrix into a hierarchical adjacency matrix."""
+    """Convert a matrix into a hierarchical adjacency matrix (directed edges only)."""
 
     def __init__(self, config: HierarchicalMatrixConfig):
         super().__init__(config)
@@ -641,13 +748,14 @@ class HierarchicalMatrix(MatrixTransformer):
     @task(name="HierarchicalMatrix.run", task_run_name=generate_name)
     def run(
         self,
-        matrix: pd.DataFrame,
+        matrix: Union[MatrixData, pd.DataFrame],
         regions: pd.DataFrame,
-    ) -> MatrixTransformResult:
-        weight_matrix = _square_dataframe(matrix)
-        nodes = list(weight_matrix.index)
-        region_table = _normalize_regions_index(regions).reindex(nodes)
-        missing = region_table.index[region_table.isna().all(axis=1)]
+    ) -> HierarchicalResult:
+        weight_matrix = square_matrix(as_matrix_data(matrix))
+        assert weight_matrix.annotations is not None
+        nodes = list(weight_matrix.annotations[0])
+        node_table = _normalize_index(regions).reindex(nodes)
+        missing = node_table.index[node_table.isna().all(axis=1)]
         if len(missing) > 0:
             missing_ids = ", ".join(str(value) for value in missing[:5])
             raise KeyError(
@@ -657,7 +765,7 @@ class HierarchicalMatrix(MatrixTransformer):
 
         parents, primary_root = _assign_parents(
             weight_matrix,
-            region_table,
+            node_table,
             rank_attribute=self.config.rank_attribute,
             threshold=self.config.threshold,
             parent_strategy=self.config.parent_strategy,
@@ -670,7 +778,7 @@ class HierarchicalMatrix(MatrixTransformer):
 
         if self.config.orphan_strategy == "drop":
             keep_nodes = sorted(_drop_orphan_subtrees(nodes, parents, orphans))
-            region_table = region_table.loc[keep_nodes]
+            region_table = node_table.loc[keep_nodes]
             parents = {
                 child: parent
                 for child, parent in parents.items()
@@ -678,10 +786,11 @@ class HierarchicalMatrix(MatrixTransformer):
             }
         else:
             keep_nodes = list(nodes)
+            region_table = node_table
             if self.config.orphan_strategy == "group":
                 parents, region_table = _apply_orphan_grouping(
                     parents,
-                    region_table,
+                    node_table,
                     orphans=orphans,
                     primary_root=primary_root,
                     orphan_groupby=self.config.orphan_groupby,
@@ -698,4 +807,4 @@ class HierarchicalMatrix(MatrixTransformer):
             synthetic_weight=self.config.synthetic_weight,
         )
         region_table = _finalize_region_table(region_table)
-        return MatrixTransformResult(matrix=hierarchical, regions=region_table)
+        return HierarchicalResult(matrix=hierarchical, regions=region_table)

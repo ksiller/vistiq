@@ -13,8 +13,10 @@ import torch
 from prefect import task
 from pydantic import Field, model_validator
 
-from vistiq.constant.matrix import FULL
+from vistiq.matrix.types import FULL
 from vistiq.core import Configurable, Configuration, generate_name
+from vistiq.matrix.types import MatrixData, matrix_to_numpy
+from vistiq.matrix.mask import triangle_valid_mask
 from vistiq.segment.analysis import bbox_array_from_dataframe, dataframe_to_numpy
 from vistiq.utils import (
     SpacingLike,
@@ -22,7 +24,6 @@ from vistiq.utils import (
     voxel_size,
     resolve_torch_device,
     abs_spacing,
-    triangle_valid_mask,
 )
 
 logger = logging.getLogger(__name__)
@@ -1409,14 +1410,15 @@ class DiceMetricsCalculator(MetricsCalculator):
 class OverlapResult:
     """Metric matrices and optional geometry from OverlapCalculator.
 
-    Always returned by ``run``. ``metrics`` is always populated. ``area_a``,
+    Always returned by ``run``. ``metrics`` is always populated with
+    :class:`~vistiq.matrix.MatrixData` values. ``area_a``,
     ``area_b``, ``intersection``, and ``union`` are set only when
     ``return_components=True`` on the config. ``object_ids_a`` and
     ``object_ids_b`` mirror ``region_map`` key order when a map was provided.
-    ``annotations`` holds resolved row/column labels for ``format``.
+    ``annotations`` holds resolved row/column labels shared by metric matrices.
     """
 
-    metrics: dict[str, Union[np.ndarray, torch.Tensor]]
+    metrics: dict[str, MatrixData]
     area_a: Optional[Union[np.ndarray, torch.Tensor]] = None
     area_b: Optional[Union[np.ndarray, torch.Tensor]] = None
     intersection: Optional[Union[np.ndarray, torch.Tensor]] = None
@@ -1427,8 +1429,8 @@ class OverlapResult:
 
     def metric(
         self, name: Optional[str] = None
-    ) -> Union[np.ndarray, torch.Tensor]:
-        """Raw metric matrix; *name* defaults to the sole metric when only one."""
+    ) -> MatrixData:
+        """Metric matrix; *name* defaults to the sole metric when only one."""
         if name is None:
             if len(self.metrics) != 1:
                 names = ", ".join(sorted(self.metrics))
@@ -1458,13 +1460,7 @@ class OverlapCalculatorConfig(Configuration):
     Attributes:
         return_components: When True, include ``area_a``, ``area_b``,
             ``intersection``, and ``union`` on OverlapResult.
-        triangle: Triangle mask applied to each metric (see ``vistiq.constant.matrix``).
-        output_type: ``"dataframe"``, ``"np.ndarray"``, or ``"torch.Tensor"`` for
-            ``format``.
-        annotate: When True and ``output_type="dataframe"``, label rows/columns in
-            ``format``. With ``region_map``, defaults to ``object_id`` keys;
-            explicit ``annotations`` on ``run`` override display labels (length
-            must match).
+        triangle: Triangle mask applied to each metric (see ``vistiq.matrix.types``).
     """
 
     builder: MatrixBuilderConfig
@@ -1476,8 +1472,6 @@ class OverlapCalculatorConfig(Configuration):
 
     return_components: bool = False
     triangle: int = FULL
-    output_type: Literal["np.ndarray", "torch.Tensor", "dataframe"] = "np.ndarray"
-    annotate: bool = True
 
     @model_validator(mode="after")
     def _check_pipeline_backend_consistency(self) -> Self:
@@ -1561,86 +1555,14 @@ class OverlapCalculator(Configurable[OverlapCalculatorConfig]):
     def from_config(cls, config: OverlapCalculatorConfig) -> "OverlapCalculator":
         return cls(config)
 
-    def _format_matrix(
-        self,
-        matrix: Union[np.ndarray, torch.Tensor],
-        annotations: Optional[tuple[tuple[str, ...], tuple[str, ...]]] = None,
-        *,
-        device: Optional[torch.device] = None,
-    ) -> Union[np.ndarray, torch.Tensor, pd.DataFrame]:
-        if self.config.output_type == "dataframe":
-            if isinstance(matrix, torch.Tensor):
-                values = matrix.detach().cpu().numpy()
-            else:
-                values = matrix
-            if self.config.annotate:
-                if annotations is None:
-                    raise ValueError(
-                        "annotations must be provided when annotate is True"
-                    )
-                if (
-                    len(annotations[0]) != values.shape[0]
-                    or len(annotations[1]) != values.shape[1]
-                ):
-                    raise ValueError(
-                        "annotations must match matrix shape "
-                        f"{values.shape}; got {len(annotations[0])} x {len(annotations[1])}"
-                    )
-                columns = [str(value) for value in annotations[1]]
-                index = [str(value) for value in annotations[0]]
-                return pd.DataFrame(values, columns=columns, index=index)
-            return pd.DataFrame(values)
-        if self.config.output_type == "np.ndarray":
-            if isinstance(matrix, torch.Tensor):
-                return matrix.detach().cpu().numpy()
-            return matrix
-        if self.config.output_type == "torch.Tensor":
-            if isinstance(matrix, np.ndarray):
-                tensor = torch.from_numpy(np.ascontiguousarray(matrix))
-                return tensor.to(device) if device is not None else tensor
-            return matrix
-        return matrix
-
-    @task(name="OverlapCalculator.format", task_run_name=generate_name)
-    def format(
-        self,
-        result: OverlapResult,
-        metric: Optional[str] = None,
-        *,
-        device: Optional[torch.device] = None,
-    ) -> Union[
-        np.ndarray,
-        torch.Tensor,
-        pd.DataFrame,
-        dict[str, Union[np.ndarray, torch.Tensor, pd.DataFrame]],
-    ]:
-        """Format metric matrix(es) per ``output_type`` and ``annotate`` on the config."""
-        annotations = result.annotations if self.config.annotate else None
-        if metric is not None:
-            if metric not in result.metrics:
-                supported = ", ".join(sorted(result.metrics))
-                raise KeyError(
-                    f"metric {metric!r} not in result; available: {supported}"
-                )
-            return self._format_matrix(
-                result.metrics[metric], annotations, device=device
-            )
-        if len(result.metrics) == 1:
-            (only_matrix,) = result.metrics.values()
-            return self._format_matrix(only_matrix, annotations, device=device)
-        return {
-            name: self._format_matrix(matrix, annotations, device=device)
-            for name, matrix in result.metrics.items()
-        }
-
     @task(name="OverlapCalculator.matrix", task_run_name=generate_name)
     def matrix(
         self,
         result: OverlapResult,
         metric: Optional[str] = None,
-    ) -> np.ndarray:
-        """Return the raw metric matrix as ``float64`` numpy for matrix filters."""
-        return np.asarray(result.metric(metric), dtype=np.float64)
+    ) -> MatrixData:
+        """Return the metric matrix for matrix filters."""
+        return result.metric(metric)
 
     @task(name="OverlapCalculator.run", task_run_name=generate_name)
     def run(
@@ -1674,9 +1596,10 @@ class OverlapCalculator(Configurable[OverlapCalculatorConfig]):
             device: Torch device override when using tensor backends.
 
         Returns:
-            OverlapResult with metric arrays. Geometry fields are included only
-            when ``return_components=True``. Use ``format`` to apply
-            ``output_type`` and ``annotate``.
+            OverlapResult with :class:`~vistiq.matrix.MatrixData` metrics.
+            Geometry fields are included only when ``return_components=True``.
+            Use :class:`~vistiq.matrix.MatrixFormatter` to export DataFrames
+            or raw arrays.
         """
         logger.info(f"Running OverlapCalculator with config: {self.config}")
         is_label_builder = isinstance(self.config.builder, LabelBuilderConfig)
@@ -1696,31 +1619,36 @@ class OverlapCalculator(Configurable[OverlapCalculatorConfig]):
                 require_label_id=is_label_builder,
                 require_bbox=is_box_builder,
             )
-            if self.config.annotate:
-                default = (
-                    tuple(region_map[0].keys()),
-                    tuple(region_map[1].keys()),
-                )
-                if annotations is None:
+            default = (
+                tuple(region_map[0].keys()),
+                tuple(region_map[1].keys()),
+            )
+            if annotations is None:
+                resolved_annotations = default
+            else:
+                rows, cols = annotations
+                if len(rows) == 0 and len(cols) == 0:
                     resolved_annotations = default
                 else:
-                    rows, cols = annotations
-                    if len(rows) == 0 and len(cols) == 0:
-                        resolved_annotations = default
-                    else:
-                        expected_rows, expected_cols = default
-                        if len(rows) != len(expected_rows) or len(cols) != len(
-                            expected_cols
-                        ):
-                            raise ValueError(
-                                "annotations must match region_map size; "
-                                f"got {len(rows)} x {len(cols)}, expected "
-                                f"{len(expected_rows)} x {len(expected_cols)}"
-                            )
-                        resolved_annotations = (
-                            tuple(str(value) for value in rows),
-                            tuple(str(value) for value in cols),
+                    expected_rows, expected_cols = default
+                    if len(rows) != len(expected_rows) or len(cols) != len(
+                        expected_cols
+                    ):
+                        raise ValueError(
+                            "annotations must match region_map size; "
+                            f"got {len(rows)} x {len(cols)}, expected "
+                            f"{len(expected_rows)} x {len(expected_cols)}"
                         )
+                    resolved_annotations = (
+                        tuple(str(value) for value in rows),
+                        tuple(str(value) for value in cols),
+                    )
+        elif annotations is not None:
+            rows, cols = annotations
+            resolved_annotations = (
+                tuple(str(value) for value in rows),
+                tuple(str(value) for value in cols),
+            )
 
         if is_box_builder and region_map is None and (a is None or b is None):
             raise ValueError(
@@ -1763,12 +1691,30 @@ class OverlapCalculator(Configurable[OverlapCalculatorConfig]):
             matrix = apply_triangle_mask(matrix, self.config.triangle)
             raw_metrics[metric_calc.metric_name] = matrix
 
+        if resolved_annotations is not None:
+            rows, cols = resolved_annotations
+            for name, matrix in list(raw_metrics.items()):
+                if isinstance(matrix, torch.Tensor):
+                    shape = tuple(matrix.shape)
+                else:
+                    shape = np.asarray(matrix).shape
+                if len(rows) != shape[0] or len(cols) != shape[1]:
+                    raise ValueError(
+                        "annotations must match matrix shape "
+                        f"{shape}; got {len(rows)} x {len(cols)}"
+                    )
+
+        metric_data = {
+            name: MatrixData(matrix=matrix, annotations=resolved_annotations)
+            for name, matrix in raw_metrics.items()
+        }
+
         object_ids_a = region_ctx_a.object_ids if region_ctx_a is not None else None
         object_ids_b = region_ctx_b.object_ids if region_ctx_b is not None else None
 
         if self.config.return_components:
             return OverlapResult(
-                metrics=raw_metrics,
+                metrics=metric_data,
                 area_a=area_a,
                 area_b=area_b,
                 intersection=inter,
@@ -1778,7 +1724,7 @@ class OverlapCalculator(Configurable[OverlapCalculatorConfig]):
                 annotations=resolved_annotations,
             )
         return OverlapResult(
-            metrics=raw_metrics,
+            metrics=metric_data,
             object_ids_a=object_ids_a,
             object_ids_b=object_ids_b,
             annotations=resolved_annotations,

@@ -7,6 +7,7 @@ import torch
 from prefect import task
 from pydantic import model_validator
 
+from vistiq.matrix.types import MatrixData
 from vistiq.core import Configuration, Configurable, generate_name
 from vistiq.utils import convert_array_like, resolve_torch_device
 
@@ -16,8 +17,6 @@ logger = logging.getLogger(__name__)
 class MatrixCalculatorConfig(Configuration):
     """Configuration for :class:`MatrixCalculator`."""
 
-    annotate: bool = True
-    output_type: Literal["np.ndarray", "torch.Tensor", "dataframe"] = "dataframe"
     preferred_input_type: Literal["numpy", "torch.Tensor"] = "numpy"
     preferred_device: Optional[Literal["cuda", "mps", "cpu"]] = None
 
@@ -102,17 +101,17 @@ class MatrixCalculator(Configurable):
         points1: Union["torch.Tensor", np.ndarray],
         points2: Union["torch.Tensor", np.ndarray],
         spacing: Optional[tuple[float, ...]] = None,
-        point_annotations: Optional[tuple[tuple[str, str]]] = None,
+        point_annotations: Optional[tuple[tuple[str, ...], tuple[str, ...]]] = None,
         *,
         device: Optional[torch.device] = None,
-    ) -> Union[np.ndarray, "torch.Tensor", pd.DataFrame]:
+    ) -> MatrixData:
         """Perform matrix calculation on two collections of points.
 
         Args:
             points1: First collection of points.
             points2: Second collection of points.
             spacing: Per-axis scale applied before calculation.
-            point_annotations: Row/column labels for dataframe output.
+            point_annotations: Optional row/column labels stored on the result.
             device: Optional runtime torch device override. When omitted,
                 :attr:`MatrixCalculatorConfig.preferred_device` is resolved
                 via :func:`~vistiq.utils.resolve_torch_device`.
@@ -132,50 +131,20 @@ class MatrixCalculator(Configurable):
         raw_results = self._calculate(
             points1, points2, spacing=spacing_arr, device=device
         )
-        return self._format(
-            raw_results, point_annotations=point_annotations, device=device
-        )
-
-    def _format(
-        self,
-        results: Union[np.ndarray, "torch.Tensor"],
-        point_annotations: Optional[tuple[tuple[str, ...]]] = None,
-        *,
-        device: Optional[torch.device] = None,
-    ) -> Union[np.ndarray, "torch.Tensor", pd.DataFrame]:
-        """Format raw matrix results for the configured output type."""
-        if self.config.output_type == "dataframe":
-            if isinstance(results, torch.Tensor):
-                results = results.detach().cpu().numpy()
-            if self.config.annotate:
-                if point_annotations is None:
-                    raise ValueError(
-                        "point_annotations must be provided when annotate is True"
-                    )
-                if (
-                    len(point_annotations[0]) != results.shape[0]
-                    or len(point_annotations[1]) != results.shape[1]
-                ):
-                    raise ValueError(
-                        "point_annotations must have the same number of rows and "
-                        "columns as the results"
-                    )
-                col_annotations = [f"{p2}" for p2 in point_annotations[1]]
-                index_annotations = [f"{p1}" for p1 in point_annotations[0]]
-                return pd.DataFrame(
-                    results, columns=col_annotations, index=index_annotations
+        annotations: tuple[tuple[str, ...], tuple[str, ...]] | None = None
+        if point_annotations is not None:
+            rows, cols = point_annotations
+            if isinstance(raw_results, torch.Tensor):
+                shape = tuple(raw_results.shape)
+            else:
+                shape = np.asarray(raw_results).shape
+            if len(rows) != shape[0] or len(cols) != shape[1]:
+                raise ValueError(
+                    "point_annotations must have the same number of rows and "
+                    "columns as the results"
                 )
-            return pd.DataFrame(results)
-        if self.config.output_type == "np.ndarray":
-            if isinstance(results, torch.Tensor):
-                return results.detach().cpu().numpy()
-            return results
-        if self.config.output_type == "torch.Tensor":
-            if isinstance(results, np.ndarray):
-                tensor = torch.from_numpy(np.ascontiguousarray(results))
-                return tensor.to(device) if device is not None else tensor
-            return results
-        return results
+            annotations = (tuple(str(value) for value in rows), tuple(str(value) for value in cols))
+        return MatrixData(matrix=raw_results, annotations=annotations)
 
 
 class DistanceCalculatorConfig(MatrixCalculatorConfig):

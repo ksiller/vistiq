@@ -32,7 +32,25 @@ from vistiq.analysis.overlap import (
     _box_volumes,
 )
 from vistiq.analysis.overlap import IoUMetricsCalculator
-from vistiq.constant.matrix import UPPER
+from vistiq.matrix.ops import MatrixFormatter, MatrixFormatterConfig
+from vistiq.matrix.types import UPPER
+
+
+def _format_overlap(
+    result,
+    *,
+    output_type: str = "dataframe",
+    annotate: bool = True,
+):
+    formatter = MatrixFormatter(
+        MatrixFormatterConfig(output_type=output_type, annotate=annotate)
+    )
+    if len(result.metrics) == 1:
+        return formatter.run(result.metric())
+    return {
+        name: formatter.run(matrix)
+        for name, matrix in result.metrics.items()
+    }
 
 
 def _boxes_pair() -> tuple[np.ndarray, np.ndarray]:
@@ -168,7 +186,12 @@ class TestOverlapCalculatorBoxes:
         expected = _reference_box_overlap(boxes_a, boxes_b, overlap_metric="iou")
         calc = OverlapCalculator(BoxOverlapCalculatorConfig())
         result = calc.run(boxes_a, boxes_b)
-        np.testing.assert_allclose(calc.format(result), expected, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(
+            _format_overlap(result, output_type="np.ndarray", annotate=False),
+            expected,
+            rtol=1e-5,
+            atol=1e-5,
+        )
 
     def test_box_multi_metric(self):
         boxes_a, boxes_b = _boxes_pair()
@@ -180,7 +203,7 @@ class TestOverlapCalculatorBoxes:
             )
         )
         result = calc.run(boxes_a, boxes_b)
-        formatted = calc.format(result)
+        formatted = _format_overlap(result, output_type="np.ndarray", annotate=False)
         assert set(formatted.keys()) == {"iou", "ios", "dice"}
         for matrix in formatted.values():
             assert matrix.shape == (2, 2)
@@ -192,7 +215,12 @@ class TestOverlapCalculatorMasks:
         expected = _reference_mask_overlap(masks_a, masks_b, overlap_metric="iou")
         calc = OverlapCalculator(MaskOverlapCalculatorConfig())
         result = calc.run(masks_a, masks_b)
-        np.testing.assert_allclose(calc.format(result), expected, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(
+            _format_overlap(result, output_type="np.ndarray", annotate=False),
+            expected,
+            rtol=1e-5,
+            atol=1e-5,
+        )
 
     def test_mask_iou_invariant_under_anisotropic_spacing(self):
         masks_a, masks_b = _mask_pair()
@@ -208,7 +236,8 @@ class TestOverlapCalculatorMasks:
         without = calc.run(masks_a, masks_b)
         with_spacing = calc.run(masks_a, masks_b, spacing=spacing)
         np.testing.assert_allclose(
-            without.metrics["iou"], with_spacing.metrics["iou"], rtol=1e-5, atol=1e-5
+            without.metrics["iou"].matrix,
+            with_spacing.metrics["iou"].matrix, rtol=1e-5, atol=1e-5
         )
         voxel_volume = 2.0
         np.testing.assert_allclose(
@@ -237,14 +266,14 @@ class TestOverlapCalculatorMasks:
         signed = calc.run(masks_a, masks_b, spacing=signed_spacing)
         for metric in ("iou", "ios", "dice"):
             np.testing.assert_allclose(
-                without.metrics[metric],
-                positive.metrics[metric],
+                without.metrics[metric].matrix,
+                positive.metrics[metric].matrix,
                 rtol=1e-5,
                 atol=1e-5,
             )
             np.testing.assert_allclose(
-                positive.metrics[metric],
-                signed.metrics[metric],
+                positive.metrics[metric].matrix,
+                signed.metrics[metric].matrix,
                 rtol=1e-5,
                 atol=1e-5,
             )
@@ -279,7 +308,9 @@ class TestOverlapCalculatorLabels:
                 ),
             )
         ).run(labels, other)
-        np.testing.assert_allclose(result.metric(), expected, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(
+            result.metric().matrix, expected, rtol=1e-5, atol=1e-5
+        )
 
     def test_labels_iou_anisotropic_spacing(self):
         labels, other = _label_pair()
@@ -297,7 +328,8 @@ class TestOverlapCalculatorLabels:
         without = calc.run(labels, other)
         with_spacing = calc.run(labels, other, spacing=spacing)
         np.testing.assert_allclose(
-            without.metrics["iou"], with_spacing.metrics["iou"], rtol=1e-5, atol=1e-5
+            without.metrics["iou"].matrix,
+            with_spacing.metrics["iou"].matrix, rtol=1e-5, atol=1e-5
         )
         voxel_volume = 2.0
         np.testing.assert_allclose(
@@ -326,14 +358,14 @@ class TestOverlapCalculatorLabels:
         signed = calc.run(labels, other, spacing=signed_spacing)
         for metric in ("iou", "ios", "dice"):
             np.testing.assert_allclose(
-                without.metrics[metric],
-                positive.metrics[metric],
+                without.metrics[metric].matrix,
+                positive.metrics[metric].matrix,
                 rtol=1e-5,
                 atol=1e-5,
             )
             np.testing.assert_allclose(
-                positive.metrics[metric],
-                signed.metrics[metric],
+                positive.metrics[metric].matrix,
+                signed.metrics[metric].matrix,
                 rtol=1e-5,
                 atol=1e-5,
             )
@@ -359,7 +391,9 @@ class TestOverlapCalculatorLabels:
                 ),
             )
         ).run(labels, other)
-        np.testing.assert_allclose(sparse.metric(), linear.metric(), rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(
+            sparse.metric().matrix, linear.metric().matrix, rtol=1e-5, atol=1e-5
+        )
 
 
 class TestOverlapCalculatorExtras:
@@ -389,7 +423,7 @@ class TestOverlapCalculatorExtras:
         boxes = _boxes_pair()[0]
         calc = OverlapCalculator(BoxOverlapCalculatorConfig(triangle=UPPER))
         result = calc.run(boxes, boxes)
-        matrix = calc.format(result)
+        matrix = _format_overlap(result, output_type="np.ndarray", annotate=False)
         assert np.isnan(matrix[1, 0])
         assert not np.isnan(matrix[0, 1])
 
@@ -399,7 +433,12 @@ class TestOverlapCalculatorExtras:
         expected = _reference_box_overlap(boxes_a, boxes_b, overlap_metric="iou")
         calc = OverlapCalculator(BoxOverlapCalculatorConfig())
         result = calc.run(boxes_a, boxes_b)
-        np.testing.assert_allclose(calc.format(result), expected, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(
+            _format_overlap(result, output_type="np.ndarray", annotate=False),
+            expected,
+            rtol=1e-5,
+            atol=1e-5,
+        )
 
     def test_numpy_backend_requires_child_reconfiguration(self):
         boxes_a, boxes_b = _boxes_pair()
@@ -415,7 +454,12 @@ class TestOverlapCalculatorExtras:
             )
         )
         result = calc.run(boxes_a, boxes_b)
-        np.testing.assert_allclose(calc.format(result), expected, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(
+            _format_overlap(result, output_type="np.ndarray", annotate=False),
+            expected,
+            rtol=1e-5,
+            atol=1e-5,
+        )
 
     def test_backend_mismatch_rejected(self):
         with pytest.raises(ValueError, match="pipeline children must agree"):
@@ -442,13 +486,10 @@ class TestRegionMap:
         boxes_a, boxes_b = _boxes_pair()
         expected = _reference_box_overlap(boxes_a, boxes_b, overlap_metric="iou")
         calc = OverlapCalculator(
-            BoxOverlapCalculatorConfig(
-                output_type="dataframe",
-                annotate=True,
-            )
+            BoxOverlapCalculatorConfig()
         )
         result = calc.run(region_map=(map_a, map_b))
-        df = calc.format(result)
+        df = _format_overlap(result, output_type="dataframe", annotate=True)
         assert list(df.index) == list(map_a.keys())
         assert list(df.columns) == list(map_b.keys())
         np.testing.assert_allclose(df.to_numpy(), expected, rtol=1e-5, atol=1e-5)
@@ -471,45 +512,34 @@ class TestRegionMap:
                 intersection_calculator=LabelIntersectionCalculatorConfig(
                     mode="linear", **numpy_backend
                 ),
-                output_type="dataframe",
-                annotate=True,
             )
         )
         result = calc.run(labels, other, region_map=(map_a, map_b))
-        df = calc.format(result)
+        df = _format_overlap(result, output_type="dataframe", annotate=True)
         assert list(df.index) == ["obj-l1", "obj-l2"]
         assert list(df.columns) == ["obj-a1", "obj-a2"]
 
     def test_annotations_override_region_map_labels(self):
         map_a, map_b = self._box_region_maps()
         custom = (("row-a", "row-b"), ("col-a", "col-b"))
-        calc = OverlapCalculator(
-            BoxOverlapCalculatorConfig(output_type="dataframe", annotate=True)
-        )
+        calc = OverlapCalculator(BoxOverlapCalculatorConfig())
         result = calc.run(region_map=(map_a, map_b), annotations=custom)
-        df = calc.format(result)
+        df = _format_overlap(result, output_type="dataframe", annotate=True)
         assert list(df.index) == ["row-a", "row-b"]
         assert list(df.columns) == ["col-a", "col-b"]
 
-    def test_annotate_false_ignores_annotations_with_region_map(self):
+    def test_annotate_false_ignores_stored_annotations(self):
         map_a, map_b = self._box_region_maps()
-        calc = OverlapCalculator(
-            BoxOverlapCalculatorConfig(output_type="dataframe", annotate=False)
-        )
-        result = calc.run(
-            region_map=(map_a, map_b),
-            annotations=(("wrong",), ("obj-b0", "obj-b1")),
-        )
-        df = calc.format(result)
+        calc = OverlapCalculator(BoxOverlapCalculatorConfig())
+        result = calc.run(region_map=(map_a, map_b))
+        df = _format_overlap(result, output_type="dataframe", annotate=False)
         assert list(df.index) == [0, 1]
         assert list(df.columns) == [0, 1]
 
     def test_annotation_length_mismatch_rejected(self):
         map_a, map_b = self._box_region_maps()
         with pytest.raises(ValueError, match="annotations must match region_map size"):
-            OverlapCalculator(
-                BoxOverlapCalculatorConfig(output_type="dataframe", annotate=True)
-            ).run(
+            OverlapCalculator(BoxOverlapCalculatorConfig()).run(
                 region_map=(map_a, map_b),
                 annotations=(("only-one",), ("obj-b0", "obj-b1")),
             )

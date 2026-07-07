@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 
+from vistiq.matrix.ops import MatrixFormatter, MatrixFormatterConfig
 from vistiq.analysis.overlap import (
     DiceMetricsCalculatorConfig,
     IoUMetricsCalculatorConfig,
@@ -35,7 +36,9 @@ def _label_overlap(
         )
     )
     result = calc.run(labels_a, labels_b)
-    return calc.format(result)
+    return MatrixFormatter(
+        MatrixFormatterConfig(output_type="np.ndarray", annotate=False)
+    ).run(result.metric())
 
 
 def test_label_overlap_sparse_matches_linear():

@@ -2,7 +2,7 @@
 
 GraphBuilder materializes each non-NaN matrix cell as a directed edge and
 attaches region properties to nodes. Hierarchy shaping belongs upstream in
-:class:`~vistiq.analysis.matrix.HierarchicalMatrix`.
+:class:`~vistiq.matrix.HierarchicalMatrix`.
 """
 
 from __future__ import annotations
@@ -20,6 +20,8 @@ from prefect import task
 from pydantic import Field, field_validator
 
 from vistiq.core import Configurable, Configuration, generate_name
+
+from vistiq.matrix.types import default_matrix_annotations
 
 logger = logging.getLogger(__name__)
 
@@ -308,7 +310,7 @@ def spatial_neighbor_column(
     return f"{analysis}_{metric}_{group_part}_({param})"
 
 
-def _normalize_regions_index(regions: pd.DataFrame) -> pd.DataFrame:
+def _normalize_index(regions: pd.DataFrame) -> pd.DataFrame:
     """Return a copy of regions indexed by object_id.
 
     Accepts object_id as the index name, a column, or a MultiIndex level.
@@ -538,7 +540,7 @@ def _regions_for_nodes(regions: pd.DataFrame, nodes: list[Any]) -> pd.DataFrame:
     Raises:
         KeyError: If any node is missing from regions.
     """
-    region_table = _normalize_regions_index(regions)
+    region_table = _normalize_index(regions)
     aligned = region_table.reindex(nodes)
     missing = aligned.index[aligned.isna().all(axis=1)]
     if len(missing) > 0:
@@ -558,11 +560,14 @@ class GraphBuilderConfig(Configuration):
         synthetic_attribute: Edge attribute key set to ``True`` when either
             endpoint is a synthetic node (for example orphan-group roots).
         graph_type: Whether to build a directed or undirected graph.
+        annotation_factory: Applied when the input :class:`~vistiq.matrix.MatrixData`
+            has no annotations.
     """
 
     edge_attribute: str = "ios"
     synthetic_attribute: str = "synthetic"
     graph_type: Literal["directed", "undirected"] = "directed"
+    annotation_factory: Any = default_matrix_annotations
 
 
 class GraphBuilder(Configurable[GraphBuilderConfig]):
@@ -582,7 +587,7 @@ class GraphBuilder(Configurable[GraphBuilderConfig]):
     @task(name="GraphBuilder.run", task_run_name=generate_name)
     def run(
         self,
-        matrix: pd.DataFrame,
+        matrix: Any,
         regions: pd.DataFrame,
         annotations: Any = None,
     ) -> GraphLike:
@@ -592,19 +597,37 @@ class GraphBuilder(Configurable[GraphBuilderConfig]):
         column node. Node attributes come from ``regions``.
 
         Args:
-            matrix: Labeled square matrix (e.g. from :class:`HierarchicalMatrix`
-                or :func:`edges_to_matrix`).
+            matrix: :class:`~vistiq.matrix.MatrixData` or DataFrame
+                (e.g. from :class:`HierarchicalMatrix` or :func:`edges_to_matrix`).
             regions: Region metrics for all objects, indexed by object_id.
             annotations: Reserved for future use (ignored).
 
         Returns:
             Backend-specific graph with region metrics on nodes.
         """
+        from vistiq.matrix.types import (
+            MatrixData,
+            as_matrix_data,
+            default_matrix_annotations,
+            matrix_to_numpy,
+            square_matrix,
+        )
+
+        data = as_matrix_data(matrix)
+        if data.ndim != 2:
+            raise ValueError(f"GraphBuilder requires a 2-D matrix; got ndim={data.ndim}")
+        if data.annotations is None:
+            factory = self.config.annotation_factory or default_matrix_annotations
+            data = MatrixData(matrix=data.matrix, annotations=factory(data.shape))
+        data = square_matrix(data)
+        assert data.annotations is not None
+        values = matrix_to_numpy(data)
+        nodes = list(data.annotations[0])
         logger.info(f"Building graph with config: {self.config}")
-        logger.info(f"Matrix shape: {matrix.shape}")
+        logger.info(f"Matrix shape: {values.shape}")
         logger.info(f"Regions shape: {regions.shape}")
         del annotations  # reserved
-        return self._build(matrix=matrix, regions=regions)
+        return self._build(regions=regions, nodes=nodes, values=values)
 
     def _new_graph(self) -> GraphLike:
         if self.config.graph_type not in {"directed", "undirected"}:
@@ -613,13 +636,11 @@ class GraphBuilder(Configurable[GraphBuilderConfig]):
 
     def _build(
         self,
-        matrix: pd.DataFrame,
         regions: pd.DataFrame,
+        *,
+        nodes: list[Any],
+        values: np.ndarray,
     ) -> GraphLike:
-        from vistiq.analysis.matrix import _square_dataframe
-
-        weight_matrix = _square_dataframe(matrix)
-        nodes = list(weight_matrix.index)
         region_table = _regions_for_nodes(regions, nodes)
 
         graph = self._new_graph()
@@ -637,11 +658,12 @@ class GraphBuilder(Configurable[GraphBuilderConfig]):
             attrs["object_id"] = node
             graph.add_node(node, **attrs)
 
+        node_map = {node: index for index, node in enumerate(nodes)}
         for parent in nodes:
             for child in nodes:
                 if parent == child:
                     continue
-                weight = weight_matrix.loc[parent, child]
+                weight = values[node_map[parent], node_map[child]]
                 if pd.isna(weight):
                     continue
                 edge_attrs: dict[str, Any] = {edge_attr: float(weight)}

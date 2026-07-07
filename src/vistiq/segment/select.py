@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional, Tuple, Union, final, Literal, Any
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union, final, Literal, Any
 
 import numpy as np
 import pandas as pd
@@ -7,15 +7,19 @@ import torch
 from prefect import task
 from pydantic import field_validator, model_validator
 
-from vistiq.constant.matrix import FULL
 from vistiq.core import Configurable, Configuration, generate_name
-from vistiq.utils import convert_array_like, prepare_matrix_values, resolve_torch_device
+from vistiq.matrix.mask import prepare_matrix_values
+from vistiq.matrix.types import FULL
+from vistiq.utils import convert_array_like, resolve_torch_device
 from vistiq.segment.analysis import (
     RegionAnalyzer,
     dataframe_to_numpy,
     region_to_numpy,
     regions_to_numpy,
 )
+
+if TYPE_CHECKING:
+    from vistiq.matrix.types import MatrixData
 
 logger = logging.getLogger(__name__)
 
@@ -362,6 +366,34 @@ class MatrixFilter(Filter):
         """Select from *values* and return the configured :attr:`~MatrixFilterConfig.output`."""
         return self._format_output(values, self.accept_indices(values))
 
+    def _wrap_matrix_data_output(
+        self,
+        data: "MatrixData",
+        coords: np.ndarray,
+        raw: Union[np.ndarray, torch.Tensor],
+    ) -> Union["MatrixData", np.ndarray, torch.Tensor]:
+        """Attach annotations when filtering :class:`MatrixData` input."""
+        from vistiq.matrix.types import (
+            MatrixData,
+            annotations_at_coords,
+            composite_matrix_annotations,
+        )
+
+        output = self.config.output
+        if output in ("masked_values", "mask"):
+            return MatrixData(matrix=raw, annotations=data.annotations)
+        if output == "indices":
+            return raw
+        if output == "values":
+            if data.annotations is None:
+                return MatrixData(matrix=raw, annotations=None)
+            projected = annotations_at_coords(data.annotations, coords)
+            return MatrixData(
+                matrix=raw,
+                annotations=composite_matrix_annotations(projected),
+            )
+        return raw
+
     def _format_output(
         self, values: torch.Tensor, indices: np.ndarray
     ) -> Union[np.ndarray, torch.Tensor]:
@@ -405,18 +437,30 @@ class MatrixFilter(Filter):
     @task(name="MatrixFilter.run", task_run_name=generate_name)
     def run(
         self,
-        data: Union[np.ndarray, "torch.Tensor", List[float], List["RegionProperties"], pd.Series, pd.DataFrame],
+        data: Union[
+            "MatrixData",
+            np.ndarray,
+            "torch.Tensor",
+            List[float],
+            List["RegionProperties"],
+            pd.Series,
+            pd.DataFrame,
+        ],
         *args: Any,
         device: Optional[torch.device] = None,
-    ) -> Union[np.ndarray, torch.Tensor]:
+    ) -> Union["MatrixData", np.ndarray, torch.Tensor]:
         """Normalize *data* to a tensor and return the configured output."""
+        from vistiq.matrix.types import MatrixData
+
+        matrix_data = data if isinstance(data, MatrixData) else None
+        source = data.matrix if matrix_data is not None else data
         device = resolve_torch_device(
             device,
             preferred_input_type=self.config.preferred_input_type,
             preferred_device=self.config.preferred_device,
         )
         values = self._convert_input(
-            data, dtype=self.config.preferred_input_type, device=device
+            source, dtype=self.config.preferred_input_type, device=device
         )
         attribute_list = self.config.attribute_list()
         if (
@@ -432,7 +476,11 @@ class MatrixFilter(Filter):
                 f"Length of attribute list {attribute_list} and data shape do not match; "
                 "strict mode is disabled, ignoring filters."
             )
-        return self.apply(values)
+        coords = self.accept_indices(values)
+        raw = self._format_output(values, coords)
+        if matrix_data is not None:
+            return self._wrap_matrix_data_output(matrix_data, coords, raw)
+        return raw
 
     def _prepare_values(
         self, values: torch.Tensor, exclude: torch.Tensor

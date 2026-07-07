@@ -4,14 +4,17 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from vistiq.analysis.matrix import MatrixAggregatorConfig, MatrixCombinerConfig
+from vistiq.matrix.ops import (
+    HierarchicalMatrixConfig,
+    MatrixAggregatorConfig,
+    MatrixCombinerConfig,
+)
 from vistiq.analysis.overlap import (
     LabelOverlapCalculatorConfig,
     metrics_calculator_configs,
 )
 from vistiq.analysis.workflow import AnalysisFlow, AnalysisFlowConfig
-from vistiq.constant.matrix import UPPER
-from vistiq.analysis.matrix import HierarchicalMatrixConfig, MatrixCombinerConfig
+from vistiq.matrix.types import UPPER
 from vistiq.graph import GraphBuilderConfig, GraphQueryConfig
 from vistiq.analysis.spatial import KnnAnalysisConfig
 from vistiq.segment import ValueFilterConfig
@@ -92,8 +95,6 @@ def _region_analyzer_config() -> RegionAnalyzerConfig:
 def _overlap_calculator_config(**updates) -> LabelOverlapCalculatorConfig:
     return LabelOverlapCalculatorConfig(
         metrics_calculators=metrics_calculator_configs(("ios",)),
-        output_type="dataframe",
-        annotate=True,
         **updates,
     )
 

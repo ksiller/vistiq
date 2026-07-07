@@ -25,8 +25,6 @@ import cv2
 import uuid
 import torch
 
-from vistiq.constant.matrix import DIAGONAL, FULL, LOWER_ND, UPPER_ND
-
 try:
     from bioio_ome_tiff.writers import OmeTiffWriter
     OME_TIFF_AVAILABLE = True
@@ -1716,44 +1714,3 @@ def find_matching_file_pairs(
         raise ValueError(f"Invalid strategy: {strategy}. Must be one of (0,0), (1,0), (0,1), or (1,1)")
     
     return matches
-
-
-def triangle_valid_mask(
-    values: torch.Tensor, flags: int
-) -> Optional[torch.Tensor]:
-    """Return a boolean mask of allowed triangle regions, or ``None`` if unrestricted."""
-    if flags == FULL:
-        return None
-    if values.ndim != 2 or values.shape[0] != values.shape[1]:
-        return None
-
-    n = values.shape[0]
-    row_idx = torch.arange(n, device=values.device).unsqueeze(1)
-    col_idx = torch.arange(n, device=values.device).unsqueeze(0)
-
-    valid = torch.zeros((n, n), dtype=torch.bool, device=values.device)
-    if flags & DIAGONAL:
-        valid |= row_idx == col_idx
-    if flags & LOWER_ND:
-        valid |= row_idx > col_idx
-    if flags & UPPER_ND:
-        valid |= row_idx < col_idx
-    return valid
-
-
-def prepare_matrix_values(
-    values: torch.Tensor,
-    exclude: torch.Tensor,
-    *,
-    ignore_nan: bool,
-    triangle: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Return *(masked values, validity mask)* for matrix reduction or selection."""
-    valid = torch.ones(values.shape, dtype=torch.bool, device=values.device)
-    if ignore_nan:
-        valid &= ~torch.isnan(values)
-    triangle_mask = triangle_valid_mask(values, triangle)
-    if triangle_mask is not None:
-        valid &= triangle_mask
-    prepared = torch.where(valid, values, exclude)
-    return prepared, valid

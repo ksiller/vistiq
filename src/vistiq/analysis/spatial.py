@@ -11,8 +11,9 @@ import pandas as pd
 from prefect import task
 from pydantic import Field
 
+from vistiq.matrix.ops import MatrixFormatter, MatrixFormatterConfig
 from vistiq.analysis.distance import DistanceCalculator, DistanceCalculatorConfig
-from vistiq.constant.matrix import OFF_DIAGONAL
+from vistiq.matrix.types import OFF_DIAGONAL
 from vistiq.core import Configurable, Configuration, generate_name
 from vistiq.graph.graph import (
     GraphBuilder,
@@ -50,11 +51,12 @@ def distance_matrix_from_regions(
             f"centroid coordinates missing; available: {list(regions.columns)}"
         )
     idx = tuple(regions.index)
-    return DistanceCalculator(calculator).run(
+    result = DistanceCalculator(calculator).run(
         points,
         points,
         point_annotations=(idx, idx),
     )
+    return MatrixFormatter(MatrixFormatterConfig()).run(result)
 
 
 def _regions_from_containment(
