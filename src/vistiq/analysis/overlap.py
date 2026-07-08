@@ -1,4 +1,16 @@
-"""IoU, IoS, and Dice overlap for boxes, masks, and label volumes."""
+"""IoU, IoS, and Dice overlap for boxes, masks, and label volumes.
+
+This module contains **domain-specific matrix producers**: calculators that
+turn imaging geometry (boxes, mask stacks, label volumes) into labeled
+:class:`~vistiq.matrix.types.MatrixData` overlap matrices. Generic matrix
+storage, filtering, combination, and export live in :mod:`vistiq.matrix`; graph
+structure and hierarchy inference live in :mod:`vistiq.graph`.
+
+Typical flow: ``OverlapCalculator`` → :class:`OverlapResult` →
+:class:`~vistiq.matrix.select.MatrixFilter` →
+:class:`~vistiq.matrix.ops.MatrixCombiner` →
+:class:`~vistiq.matrix.ops.MatrixFormatter` → ``HierarchyBuilder``.
+"""
 
 from __future__ import annotations
 

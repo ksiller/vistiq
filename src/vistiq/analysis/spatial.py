@@ -11,8 +11,15 @@ import pandas as pd
 from prefect import task
 from pydantic import Field
 
+from vistiq.matrix.calc import DistanceCalculator, DistanceCalculatorConfig
 from vistiq.matrix.ops import MatrixFormatter, MatrixFormatterConfig
-from vistiq.analysis.distance import DistanceCalculator, DistanceCalculatorConfig
+from vistiq.matrix.select import (
+    MatrixFilter,
+    TopKFilter,
+    TopKFilterConfig,
+    ValueFilter,
+    ValueFilterConfig,
+)
 from vistiq.matrix.types import OFF_DIAGONAL
 from vistiq.core import Configurable, Configuration, generate_name
 from vistiq.graph.graph import (
@@ -23,8 +30,7 @@ from vistiq.graph.graph import (
     GraphQuery,
     resolve_subtree_origin,
 )
-from vistiq.segment import TopKFilter, TopKFilterConfig, ValueFilter, ValueFilterConfig, dataframe_to_numpy
-from vistiq.segment.select import MatrixFilter
+from vistiq.segment import dataframe_to_numpy
 
 logger = logging.getLogger(__name__)
 

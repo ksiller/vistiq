@@ -14,6 +14,10 @@ from vistiq.graph import (
     GraphFilterConfig,
     GraphQuery,
     GraphQueryConfig,
+    GraphQueryFormatter,
+    GraphQueryFormatterConfig,
+    GraphQueryResult,
+    GRAPH_NODE_INDEX,
     HierarchyBuilder,
     HierarchyBuilderConfig,
     NXGraph,
@@ -225,7 +229,7 @@ class TestGraphQuery:
                 ]
             )
         ).run(dag, node="p")
-        assert isinstance(summary, dict)
+        assert isinstance(summary, GraphQueryResult)
         assert summary["n_nodes"] == 4
         assert summary["n_edges"] == 2
         assert summary["n_roots"] == 2
@@ -332,15 +336,11 @@ class TestGraphQuery:
         assert len(lineage) == 2
         assert lineage[0]["lineage Brain"] == 1
 
-        df = GraphQuery(
-            GraphQueryConfig(
-                attributes=["ancestor_lineage"],
-                filter_attribute="channel",
-                filter_value="Lobe",
-                include_attributes=["volume"],
+        df = GraphQueryFormatter(
+            GraphQueryFormatterConfig(
                 output_type="dataframe",
             )
-        ).format(lineage)
+        ).run(lineage)
         assert len(df) == 2
         assert "lineage Brain" in df.columns
 
@@ -351,15 +351,59 @@ class TestGraphQuery:
                 attributes=["descendant_counts"],
                 filter_attribute="channel",
                 filter_value="Dpn",
-                output_type="dataframe",
             )
         )
         result = gq.run(dag)
         assert result["descendant_counts"] == []
-        frame = gq.format(result, attribute="descendant_counts")
+        gqfmt = GraphQueryFormatter(GraphQueryFormatterConfig(output_type="dataframe"))
+        frame = gqfmt.run(result, attribute="descendant_counts")
         assert isinstance(frame, pd.DataFrame)
         assert frame.empty
-        assert gq.format([]).empty
+        assert gqfmt.run([]).empty
+
+    def test_query_result_carries_row_index(self):
+        dag = _build_containment_dag(_sample_matrix(), _sample_regions())
+        result = GraphQuery(
+            GraphQueryConfig(attributes=["n_nodes"], row_index=GRAPH_NODE_INDEX)
+        ).run(dag)
+        assert result.row_index == GRAPH_NODE_INDEX
+
+    def test_descendant_counts_row_index_uses_node_id(self):
+        raw = networkx.DiGraph()
+        raw.add_node("p", channel="Brain", label=1)
+        raw.add_node("a", channel="Lobe", label=2)
+        raw.add_edge("p", "a", ios=0.9)
+        dag = NXGraph(raw)
+        result = GraphQuery(
+            GraphQueryConfig(
+                attributes=["descendant_counts"],
+                filter_attribute="channel",
+                filter_value="Brain",
+            )
+        ).run(dag)
+        row = result["descendant_counts"][0]
+        assert row[GRAPH_NODE_INDEX] == "p"
+
+    def test_formatter_uses_result_row_index(self):
+        result = GraphQueryResult(
+            attributes={"rows": [{"custom_id": "a", "value": 1}]},
+            row_index="custom_id",
+        )
+        frame = GraphQueryFormatter(
+            GraphQueryFormatterConfig(output_index=GRAPH_NODE_INDEX)
+        ).run(result, attribute="rows")
+        assert frame.index.name == "custom_id"
+        assert list(frame.index) == ["a"]
+
+    def test_formatter_missing_index_raises(self):
+        result = GraphQueryResult(
+            attributes={"rows": [{"value": 1}]},
+            row_index=GRAPH_NODE_INDEX,
+        )
+        with pytest.raises(KeyError, match="row index column"):
+            GraphQueryFormatter(GraphQueryFormatterConfig()).run(
+                result, attribute="rows"
+            )
 
     def test_invalid_attribute_raises(self):
         with pytest.raises(ValueError, match="invalid attributes"):

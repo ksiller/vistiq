@@ -15,6 +15,8 @@ from vistiq.analysis.spatial import (
 from vistiq.graph import (
     GraphQuery,
     GraphQueryConfig,
+    GraphQueryFormatter,
+    GraphQueryFormatterConfig,
     NXGraph,
     resolve_subtree_origins,
 )
@@ -82,10 +84,11 @@ def _neighbor_summary(graph, *, analysis="knn", k=1, radius=None):
             neighbor_analysis=analysis,
             neighbor_k=k if analysis == "knn" else None,
             neighbor_radius=radius if analysis == "rnn" else None,
-            output_type="dataframe",
         )
     )
-    return gq.format(gq.run(graph), attribute="neighbor_summary")
+    return GraphQueryFormatter(GraphQueryFormatterConfig()).run(
+        gq.run(graph), attribute="neighbor_summary"
+    )
 
 
 class TestResolveSubtreeOrigins:

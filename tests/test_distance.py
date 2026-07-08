@@ -4,7 +4,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from vistiq.analysis.distance import DistanceCalculator, DistanceCalculatorConfig
+from vistiq.matrix.calc import DistanceCalculator, DistanceCalculatorConfig
 from vistiq.matrix.types import MatrixData
 
 

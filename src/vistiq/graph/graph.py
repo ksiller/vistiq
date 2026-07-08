@@ -11,6 +11,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any, ClassVar, List, Literal, Optional, Sequence, Union
 
 import networkx as nx
@@ -24,6 +25,25 @@ from vistiq.core import Configurable, Configuration, generate_name
 from vistiq.matrix.types import default_matrix_annotations
 
 logger = logging.getLogger(__name__)
+
+GRAPH_NODE_INDEX = "object_id"
+"""Default column name for graph node identifiers in tables and query rows."""
+
+
+def _node_row(
+    node_id: Any,
+    attrs: dict[str, Any],
+    *,
+    index: str = GRAPH_NODE_INDEX,
+    include: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Build a query row with the graph node id as the index column."""
+    row: dict[str, Any] = {index: node_id}
+    for key in include:
+        if key == index:
+            continue
+        row[key] = attrs.get(key)
+    return row
 
 
 class GraphLike(ABC):
@@ -327,7 +347,7 @@ def _normalize_index(regions: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def graph_to_dataframe(graph: GraphLike, *, index: str = "object_id") -> pd.DataFrame:
+def graph_to_dataframe(graph: GraphLike, *, index: str = GRAPH_NODE_INDEX) -> pd.DataFrame:
     """Build a region property table from graph node attributes.
 
     Args:
@@ -387,7 +407,7 @@ def edges_to_matrix(
         key=str,
     )
     matrix = pd.DataFrame(np.nan, index=nodes, columns=nodes)
-    matrix.index.name = "object_id"
+    matrix.index.name = GRAPH_NODE_INDEX
     for record in records:
         weight = record.get(weight_attribute)
         if weight is None or pd.isna(weight):
@@ -485,7 +505,7 @@ class GraphFormatterConfig(Configuration):
             :class:`GraphBuilder`).
     """
 
-    index: str = "object_id"
+    index: str = GRAPH_NODE_INDEX
     columns: Optional[List[str]] = None
     dropna_cols: bool = False
     dropna_rows: bool = False
@@ -655,7 +675,7 @@ class GraphBuilder(Configurable[GraphBuilderConfig]):
         for node in node_ids:
             raw = aligned.loc[node].to_dict()
             attrs = {key: value for key, value in raw.items() if pd.notna(value)}
-            attrs["object_id"] = node
+            attrs[GRAPH_NODE_INDEX] = node
             graph.add_node(node, **attrs)
 
         node_map = {node: index for index, node in enumerate(node_ids)}
@@ -860,6 +880,118 @@ class GraphFilter(Configurable[GraphFilterConfig]):
         return edges
 
 
+@dataclass(frozen=True)
+class GraphQueryResult:
+    """Structured output from :class:`GraphQuery`.
+
+    ``attributes`` maps each requested query key to its computed value (scalars,
+    lists, dicts, or ``list[dict]`` row tables for tabular attributes).
+    ``row_index`` names the column that identifies each row (the graph node id).
+    """
+
+    attributes: dict[str, Any]
+    row_index: str = GRAPH_NODE_INDEX
+
+    def __getitem__(self, key: str) -> Any:
+        return self.attributes[key]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.attributes.get(key, default)
+
+    def keys(self):
+        return self.attributes.keys()
+
+    def values(self):
+        return self.attributes.values()
+
+    def items(self):
+        return self.attributes.items()
+
+    def rows(self, name: str) -> list[dict[str, Any]]:
+        """Return tabular rows for *name* when the attribute is row-oriented."""
+        value = self.attributes.get(name)
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [row for row in value if isinstance(row, dict)]
+        if isinstance(value, dict):
+            return [value]
+        return []
+
+
+class GraphQueryFormatterConfig(Configuration):
+    """Configuration for :class:`GraphQueryFormatter`.
+
+    Attributes:
+        output_type: Return a labeled ``dataframe`` or the raw ``list`` of rows.
+        output_index: DataFrame index column when :attr:`output_type` is
+            ``"dataframe"``.
+    """
+
+    output_type: Literal["dataframe", "list"] = "dataframe"
+    output_index: str = GRAPH_NODE_INDEX
+
+
+def _graph_query_index_column(
+    data: list[dict[str, Any]] | GraphQueryResult,
+    output_index: str,
+) -> str:
+    if isinstance(data, GraphQueryResult):
+        return data.row_index
+    return output_index
+
+
+def _graph_query_rows(
+    data: list[dict[str, Any]] | GraphQueryResult,
+    *,
+    attribute: Optional[str],
+) -> list[dict[str, Any]]:
+    if isinstance(data, GraphQueryResult):
+        if attribute is None:
+            raise TypeError(
+                "attribute is required when formatting GraphQueryResult"
+            )
+        return data.rows(attribute)
+    if attribute is not None:
+        raise TypeError(
+            "attribute is only valid when formatting GraphQueryResult"
+        )
+    return list(data)
+
+
+class GraphQueryFormatter(Configurable[GraphQueryFormatterConfig]):
+    """Format graph query row tables as DataFrames or row lists."""
+
+    def __init__(self, config: GraphQueryFormatterConfig):
+        super().__init__(config)
+
+    @classmethod
+    def from_config(cls, config: GraphQueryFormatterConfig) -> "GraphQueryFormatter":
+        return cls(config)
+
+    @task(name="GraphQueryFormatter.run", task_run_name=generate_name)
+    def run(
+        self,
+        data: list[dict[str, Any]] | GraphQueryResult,
+        *,
+        attribute: Optional[str] = None,
+    ) -> pd.DataFrame | list[dict[str, Any]]:
+        """Format query rows or one tabular attribute from a query result."""
+        rows = _graph_query_rows(data, attribute=attribute)
+        if self.config.output_type == "list":
+            return rows
+        if not rows:
+            return pd.DataFrame()
+        index_col = _graph_query_index_column(data, self.config.output_index)
+        if index_col not in rows[0]:
+            available = sorted(rows[0])
+            raise KeyError(
+                f"row index column {index_col!r} missing from query rows; "
+                f"available columns: {available}"
+            )
+        return pd.DataFrame(rows).set_index(index_col)
+
+
 class GraphQuery(Configurable["GraphQueryConfig"]):
     """Query a directed graph such as a containment DAG.
 
@@ -954,44 +1086,6 @@ class GraphQuery(Configurable["GraphQueryConfig"]):
     def from_config(cls, config: "GraphQueryConfig") -> "GraphQuery":
         return cls(config)
 
-    @task(name="GraphQuery.format", task_run_name=generate_name)
-    def format(
-        self,
-        output: list[dict[str, Any]] | dict[str, Any],
-        attribute: Optional[str] = None,
-    ) -> Any:
-        """Format query rows or one attribute from a :meth:`run` result.
-
-        Args:
-            output: Tabular query rows, or the dictionary returned by
-                :meth:`run` when ``attribute`` is set.
-            attribute: Name of the key to format from a :meth:`run` result
-                (for example ``"descendant_counts"``).
-        """
-        if attribute is not None:
-            if not isinstance(output, dict):
-                raise TypeError(
-                    "attribute requires output from GraphQuery.run (a dict)"
-                )
-            rows = output.get(attribute)
-            if rows is None:
-                if self.config.output_type == "dataframe":
-                    return pd.DataFrame()
-                return []
-            output = rows
-
-        if self.config.output_type == "dataframe":
-            rows = output if isinstance(output, list) else [output]
-            if not rows:
-                return pd.DataFrame()
-            return self._to_dataframe(rows)
-        if isinstance(output, dict):
-            return output
-        return list(output)
-
-    def _to_dataframe(self, output: list[dict[str, Any]]) -> pd.DataFrame:
-        return pd.DataFrame(output).set_index(self.config.output_index)
-
     @task(name="GraphQuery.run", task_run_name=generate_name)
     def run(
         self,
@@ -1001,8 +1095,8 @@ class GraphQuery(Configurable["GraphQueryConfig"]):
         filter_value: Any = None,
         source_nodes: Optional[Sequence[Any]] = None,
         seed_nodes: Optional[Sequence[Any]] = None,
-    ) -> dict[str, Any]:
-        """Query a graph and return a plain dictionary of results."""
+    ) -> GraphQueryResult:
+        """Query a graph and return structured attribute values."""
         updates: dict[str, Any] = {}
         if filter_value is not None:
             updates["filter_value"] = filter_value
@@ -1016,7 +1110,10 @@ class GraphQuery(Configurable["GraphQueryConfig"]):
         logger.info(f"Summarizing graph with config: {query.config}")
         logger.info(f"Node: {node}")
         attributes = query.config.attributes
-        return query._summarize(graph, node=node, attributes=attributes)
+        return GraphQueryResult(
+            attributes=query._summarize(graph, node=node, attributes=attributes),
+            row_index=query.config.row_index,
+        )
 
     def _summarize(
         self,
@@ -1319,9 +1416,13 @@ class GraphQuery(Configurable["GraphQueryConfig"]):
 
         data = []
         for node_id in nodes:
-            base_keys = list(set(["object_id", self.config.output_index, *include]))
             attrs = graph.node_attrs(node_id)
-            row = {key: attrs.get(key) for key in base_keys}
+            row = _node_row(
+                node_id,
+                attrs,
+                index=self.config.row_index,
+                include=include,
+            )
             for desc in graph.descendants(node_id):
                 bucket = graph.node_attrs(desc).get(classify_attribute, None)
                 key = f"count {bucket}"
@@ -1339,9 +1440,13 @@ class GraphQuery(Configurable["GraphQueryConfig"]):
 
         data = []
         for node_id in nodes:
-            base_keys = list(set(["object_id", self.config.output_index, *include]))
             attrs = graph.node_attrs(node_id)
-            row = {key: attrs.get(key) for key in base_keys}
+            row = _node_row(
+                node_id,
+                attrs,
+                index=self.config.row_index,
+                include=include,
+            )
             ancestors = graph.ancestors(node_id)
             for ancestor in graph.topological_sort():
                 if ancestor not in ancestors:
@@ -1363,11 +1468,13 @@ class GraphQuery(Configurable["GraphQueryConfig"]):
         include = list(self.config.include_attributes)
         data: list[dict[str, Any]] = []
         for node_id in graph.nodes():
-            row: dict[str, Any] = {self.config.output_index: node_id}
             node_attrs = graph.node_attrs(node_id)
-            if analysis is None:
-                for key in set(include):
-                    row[key] = node_attrs.get(key)
+            row = _node_row(
+                node_id,
+                node_attrs,
+                index=self.config.row_index,
+                include=include,
+            )
 
             by_group: dict[Any, list[tuple[float, Any]]] = {}
             for _, child, edge_data in graph.out_edges(node_id, data=True):
@@ -1464,6 +1571,9 @@ class GraphQueryConfig(Configuration):
             must match the first upstream predecessor found by BFS.
         seed_nodes: Seed node ids for predecessor walks. Defaults to all
             graph nodes when omitted.
+        row_index: Column name used for the graph node id in tabular query
+            attributes (``descendant_counts``, ``ancestor_lineage``,
+            ``neighbor_summary``).
         attributes: Query keys to compute. Each name must appear in
             GraphQuery.allowed_attributes(). When omitted, defaults to
             GraphQuery.default_attributes.
@@ -1484,11 +1594,10 @@ class GraphQueryConfig(Configuration):
     source_nodes: Optional[List[Any]] = None
     predecessor_match: Optional[dict[str, Any]] = None
     seed_nodes: Optional[List[Any]] = None
+    row_index: str = GRAPH_NODE_INDEX
     attributes: List[str] = Field(
         default_factory=lambda: list(GraphQuery.default_attributes)
     )
-    output_type: Literal["dataframe", "list"] = "list"
-    output_index: str = "object_id"
 
     @field_validator("attributes")
     @classmethod

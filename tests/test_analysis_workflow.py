@@ -435,7 +435,6 @@ def test_analysis_flow_hierarchical_analysis(hierarchical_label_pair):
             filter_attribute="channel",
             include_attributes=["label", "channel"],
             lineage_value_attribute="label",
-            output_type="dataframe",
         ),
     )
     measurements = _run_flow(cfg, hierarchical_label_pair)

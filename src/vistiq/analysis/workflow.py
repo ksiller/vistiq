@@ -12,7 +12,8 @@ from prefect import task, unmapped
 from vistiq.analysis import OverlapResult
 from vistiq.analysis.overlap import OverlapCalculatorConfig, region_map_from_dataframe
 from vistiq.analysis.coincidence import CoincidenceDetectorConfig
-from vistiq.analysis.distance import DistanceCalculatorConfig
+from vistiq.matrix.calc import DistanceCalculatorConfig
+from vistiq.matrix import MatrixFilterConfig
 from vistiq.matrix.ops import (
     MatrixAggregatorConfig,
     MatrixCombiner,
@@ -37,11 +38,12 @@ from vistiq.graph import (
     HierarchyBuilderConfig,
     GraphQuery,
     GraphQueryConfig,
+    GraphQueryFormatter,
+    GraphQueryFormatterConfig,
     graph_to_dataframe,
     resolve_subtree_origins,
     subtree_origin_key,
 )
-from vistiq.segment import MatrixFilterConfig
 from vistiq.segment.analysis import RegionAnalyzer, RegionAnalyzerConfig
 from vistiq.utils import resolve_futures
 from vistiq.workflow import Workflow, WorkflowConfig
@@ -135,8 +137,10 @@ class AnalysisFlowConfig(WorkflowConfig):
             filter_attribute="channel",
             include_attributes=["label", "channel"],
             lineage_value_attribute="label",
-            output_type="dataframe",
         )
+    )
+    graph_query_formatter: GraphQueryFormatterConfig = Field(
+        default_factory=GraphQueryFormatterConfig
     )
     graph_formatter: Optional[GraphFormatterConfig] = Field(
         default_factory=GraphFormatterConfig
@@ -146,7 +150,6 @@ class AnalysisFlowConfig(WorkflowConfig):
             attributes=["neighbor_summary"],
             include_attributes=[],
             weight_attribute="distance",
-            output_type="dataframe",
         )
     )
     knn_analysis: Optional[KnnAnalysisConfig] = None
@@ -343,21 +346,37 @@ class AnalysisFlow(Workflow):
 
         filter_values = [cfg.filter_value for cfg in query_configs]
         logger.info(f"Running graph query for filter values: {filter_values}")
-        gq = GraphQuery(gqcfg.model_copy(update={"filter_value": None}))
+        index = (self.config.graph_formatter or GraphFormatterConfig()).index
+        gq = GraphQuery(
+            gqcfg.model_copy(update={"filter_value": None, "row_index": index})
+        )
+        gqfmt = GraphQueryFormatter(
+            self.config.graph_query_formatter.model_copy(
+                update={"output_index": index}
+            )
+        )
         gq_results = list(
             gq.run.map(unmapped(hierarchy.graph), node=None, filter_value=filter_values)
         )
         counts_frames = [
             frame
             for frame in resolve_futures(
-                list(gq.format.map(gq_results, unmapped("descendant_counts")))
+                list(
+                    gqfmt.run.map(
+                        gq_results, attribute=unmapped("descendant_counts")
+                    )
+                )
             )
             if isinstance(frame, pd.DataFrame) and not frame.empty
         ]
         lineage_frames = [
             frame
             for frame in resolve_futures(
-                list(gq.format.map(gq_results, unmapped("ancestor_lineage")))
+                list(
+                    gqfmt.run.map(
+                        gq_results, attribute=unmapped("ancestor_lineage")
+                    )
+                )
             )
             if isinstance(frame, pd.DataFrame) and not frame.empty
         ]
@@ -398,6 +417,9 @@ class AnalysisFlow(Workflow):
         axes = tuple(metadata[0].get("axes", ())) if metadata else None
         gqcfg = self.config.spatial_graph_query
         index = (self.config.graph_formatter or GraphFormatterConfig()).index
+        gqfmt_cfg = self.config.graph_query_formatter.model_copy(
+            update={"output_index": index}
+        )
         output: dict[str, Any] = {}
         knn_mapped: Optional[list[Any]] = None
         knn_results: Optional[list[Any]] = None
@@ -424,20 +446,25 @@ class AnalysisFlow(Workflow):
                 gq = GraphQuery(
                     gqcfg.model_copy(
                         update={
-                            "output_index": index,
+                            "row_index": index,
                             "group_attribute": self.config.knn_analysis.grouping_attribute,
                             "neighbor_analysis": "knn",
                             "neighbor_k": self.config.knn_analysis.k,
                         }
                     )
                 )
+                gqfmt = GraphQueryFormatter(gqfmt_cfg)
                 gq_results = list(
                     gq.run.map([result.graph for result in knn_results])
                 )
                 frames = [
                     frame
                     for frame in resolve_futures(
-                        list(gq.format.map(gq_results, unmapped("neighbor_summary")))
+                        list(
+                            gqfmt.run.map(
+                                gq_results, attribute=unmapped("neighbor_summary")
+                            )
+                        )
                     )
                     if isinstance(frame, pd.DataFrame) and not frame.empty
                 ]
@@ -479,20 +506,25 @@ class AnalysisFlow(Workflow):
                 gq = GraphQuery(
                     gqcfg.model_copy(
                         update={
-                            "output_index": index,
+                            "row_index": index,
                             "group_attribute": self.config.rnn_analysis.grouping_attribute,
                             "neighbor_analysis": "rnn",
                             "neighbor_radius": self.config.rnn_analysis.radius,
                         }
                     )
                 )
+                gqfmt = GraphQueryFormatter(gqfmt_cfg)
                 gq_results = list(
                     gq.run.map([result.graph for result in rnn_results])
                 )
                 frames = [
                     frame
                     for frame in resolve_futures(
-                        list(gq.format.map(gq_results, unmapped("neighbor_summary")))
+                        list(
+                            gqfmt.run.map(
+                                gq_results, attribute=unmapped("neighbor_summary")
+                            )
+                        )
                     )
                     if isinstance(frame, pd.DataFrame) and not frame.empty
                 ]

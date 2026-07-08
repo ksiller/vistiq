@@ -1,8 +1,26 @@
 """Pytest configuration and shared fixtures."""
+import logging
+import os
+
+# Prefect tasks run in unit tests; disable Cloud log shipping and avoid
+# background threads logging to stdout after pytest teardown (wandb/napari
+# console capture can close streams early).
+os.environ.setdefault("PREFECT_LOGGING_TO_API_WHEN_MISSING_FLOW", "ignore")
+os.environ.setdefault("PREFECT_LOGGING_TO_API_ENABLED", "false")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 import numpy as np
 import pytest
+from prefect.testing.utilities import prefect_test_harness
+
 from vistiq.core import Configuration, StackProcessorConfig
 from vistiq.utils import ArrayIteratorConfig
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _prefect_test_harness():
+    with prefect_test_harness():
+        yield
 
 
 @pytest.fixture

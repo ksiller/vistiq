@@ -4,10 +4,7 @@ from .coincidence import (
     CoincidenceDetector,
     CoincidenceDetectorConfig,
 )
-from .distance import (
-    DistanceCalculator,
-    DistanceCalculatorConfig,
-)
+from vistiq.matrix.calc import DistanceCalculator, DistanceCalculatorConfig
 from .overlap import (
     AreaCalculator,
     AreaCalculatorConfig,

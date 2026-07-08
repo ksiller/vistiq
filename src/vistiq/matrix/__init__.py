@@ -1,4 +1,19 @@
-"""Matrix types, masking, and operations."""
+"""Matrix types, masking, selection, and operations.
+
+``vistiq.matrix`` owns labeled numeric data and generic matrix algebra:
+
+- :class:`~vistiq.matrix.types.MatrixData` — ndarray/tensor + axis labels
+- :class:`~vistiq.matrix.calc.MatrixCalculator` — pairwise calculators
+  (e.g. :class:`~vistiq.matrix.calc.DistanceCalculator`)
+- :class:`~vistiq.matrix.select.MatrixFilter` — threshold / top-k selection
+- :class:`~vistiq.matrix.ops.MatrixFormatter` — export to DataFrame/ndarray
+- :class:`~vistiq.matrix.ops.MatrixCombiner` / :class:`~vistiq.matrix.ops.MatrixAggregator`
+
+Domain-specific matrix **producers** (overlap IoU/IoS/Dice for boxes, masks,
+and labels) live in :mod:`vistiq.analysis.overlap` because they encode imaging
+geometry, not generic matrix math. Graph structure and hierarchy inference live
+in :mod:`vistiq.graph`.
+"""
 
 from vistiq.matrix.mask import prepare_matrix_values, triangle_valid_mask
 from vistiq.matrix.types import (
@@ -28,8 +43,21 @@ from vistiq.matrix.types import (
 
 _CALC_EXPORTS = frozenset(
     {
+        "DistanceCalculator",
+        "DistanceCalculatorConfig",
         "MatrixCalculator",
         "MatrixCalculatorConfig",
+    }
+)
+
+_SELECT_EXPORTS = frozenset(
+    {
+        "MatrixFilter",
+        "MatrixFilterConfig",
+        "TopKFilter",
+        "TopKFilterConfig",
+        "ValueFilter",
+        "ValueFilterConfig",
     }
 )
 
@@ -52,6 +80,10 @@ def __getattr__(name: str):
         from vistiq.matrix import calc
 
         return getattr(calc, name)
+    if name in _SELECT_EXPORTS:
+        from vistiq.matrix import select
+
+        return getattr(select, name)
     if name in _OPS_EXPORTS:
         from vistiq.matrix import ops
 
@@ -69,6 +101,8 @@ __all__ = [
     "UPPER_ND",
     "AnnotationFactory",
     "ArrayBackend",
+    "DistanceCalculator",
+    "DistanceCalculatorConfig",
     "MatrixAggregator",
     "MatrixAggregatorConfig",
     "MatrixAnnotations",
@@ -79,9 +113,15 @@ __all__ = [
     "MatrixCombinerConfig",
     "MatrixContainer",
     "MatrixData",
+    "MatrixFilter",
+    "MatrixFilterConfig",
     "MatrixFormatOutput",
     "MatrixFormatter",
     "MatrixFormatterConfig",
+    "TopKFilter",
+    "TopKFilterConfig",
+    "ValueFilter",
+    "ValueFilterConfig",
     "annotations_at_coords",
     "as_matrix_data",
     "composite_matrix_annotations",

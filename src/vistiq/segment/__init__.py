@@ -34,8 +34,6 @@ from vistiq.segment.select import (
     FilterConfig,
     FilterOps,
     FilterOpsConfig,
-    MatrixFilter,
-    MatrixFilterConfig,
     MaxFilter,
     MaxFilterConfig,
     MinFilter,
@@ -44,10 +42,14 @@ from vistiq.segment.select import (
     RangeFilterConfig,
     RegionFilter,
     RegionFilterConfig,
-    ValueFilter,
-    ValueFilterConfig,
+)
+from vistiq.matrix.select import (
+    MatrixFilter,
+    MatrixFilterConfig,
     TopKFilter,
     TopKFilterConfig,
+    ValueFilter,
+    ValueFilterConfig,
 )
 from vistiq.segment.label import (
     SegmentationFlow,

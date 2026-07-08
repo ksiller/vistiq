@@ -1,3 +1,17 @@
+"""Directed graphs, containment hierarchies, and graph queries.
+
+``vistiq.graph`` owns topology and structure:
+
+- :class:`~vistiq.graph.graph.GraphBuilder` — adjacency / edge tables → DAG
+- :class:`~vistiq.graph.hierarchy.HierarchyBuilder` — overlap matrix → containment DAG
+- :class:`~vistiq.graph.graph.GraphQuery` — attribute summaries on a graph
+- :class:`~vistiq.graph.graph.GraphFormatter` / :class:`~vistiq.graph.graph.GraphQueryFormatter` — in-memory projection to tables
+
+Labeled numeric matrices are represented by :class:`~vistiq.matrix.types.MatrixData`
+in :mod:`vistiq.matrix`. Domain-specific matrix producers (overlap metrics) remain
+in :mod:`vistiq.analysis.overlap`.
+"""
+
 from .hierarchy import (
     HierarchyBuilder,
     HierarchyBuilderConfig,
@@ -13,6 +27,10 @@ from .graph import (
     GraphLike,
     GraphQuery,
     GraphQueryConfig,
+    GraphQueryFormatter,
+    GraphQueryFormatterConfig,
+    GraphQueryResult,
+    GRAPH_NODE_INDEX,
     NXGraph,
     edges_to_matrix,
     graph_to_dataframe,
@@ -44,6 +62,10 @@ __all__ = [
     "GraphLike",
     "GraphQuery",
     "GraphQueryConfig",
+    "GraphQueryFormatter",
+    "GraphQueryFormatterConfig",
+    "GraphQueryResult",
+    "GRAPH_NODE_INDEX",
     "NXGraph",
     "add_hierarchical_napari_layers",
     "default_spatial_result_key",
