@@ -471,13 +471,13 @@ def resolve_subtree_origin(
     return origins[0]
 
 
-class GraphExporterConfig(Configuration):
-    """Configuration for :class:`GraphExporter`.
+class GraphFormatterConfig(Configuration):
+    """Configuration for :class:`GraphFormatter`.
 
     Attributes:
-        index: Index name for exported object identifiers.
+        index: Index name for formatted object identifiers.
         columns: Optional subset of node attributes to include. When omitted,
-            all node attributes are exported.
+            all node attributes are included.
         dropna_cols: When ``True``, drop columns that are entirely NA.
         dropna_rows: When ``True``, drop rows with any NA value.
         exclude_synthetic: When ``True``, omit nodes whose ``synthetic``
@@ -492,17 +492,17 @@ class GraphExporterConfig(Configuration):
     exclude_synthetic: bool = False
 
 
-class GraphExporter(Configurable[GraphExporterConfig]):
-    """Export graph node attributes to a region property table."""
+class GraphFormatter(Configurable[GraphFormatterConfig]):
+    """Format graph node attributes as a region property table."""
 
-    def __init__(self, config: GraphExporterConfig):
+    def __init__(self, config: GraphFormatterConfig):
         super().__init__(config)
 
     @classmethod
-    def from_config(cls, config: GraphExporterConfig) -> "GraphExporter":
+    def from_config(cls, config: GraphFormatterConfig) -> "GraphFormatter":
         return cls(config)
 
-    @task(name="GraphExporter.run", task_run_name=generate_name)
+    @task(name="GraphFormatter.run", task_run_name=generate_name)
     def run(self, graph: GraphLike) -> pd.DataFrame:
         """Build a DataFrame from graph node attributes."""
         frame = graph_to_dataframe(graph, index=self.config.index)

@@ -8,8 +8,8 @@ networkx = pytest.importorskip("networkx")
 from vistiq.graph import (
     GraphBuilder,
     GraphBuilderConfig,
-    GraphExporter,
-    GraphExporterConfig,
+    GraphFormatter,
+    GraphFormatterConfig,
     GraphFilter,
     GraphFilterConfig,
     GraphQuery,
@@ -65,7 +65,7 @@ class TestGraphBuilder:
         assert frame.loc["a", "volume"] == 10.0
         assert frame.loc["a", "channel"] == "Lobe"
 
-    def test_graph_exporter_dropna_rows(self):
+    def test_graph_formatter_dropna_rows(self):
         dag = _build_containment_dag(_sample_matrix(), _sample_regions())
         for node in ["p", "a", "b", "c"]:
             dag.add_node(node, synthetic=False, name=str(node))
@@ -74,24 +74,24 @@ class TestGraphBuilder:
             name="Orphans",
             synthetic=True,
         )
-        frame = GraphExporter(GraphExporterConfig(dropna_rows=True)).run(dag)
+        frame = GraphFormatter(GraphFormatterConfig(dropna_rows=True)).run(dag)
         assert "synthetic" not in frame.index
         assert set(frame.index) == {"p", "a", "b", "c"}
 
-    def test_graph_exporter_dropna_cols(self):
+    def test_graph_formatter_dropna_cols(self):
         dag = _build_containment_dag(_sample_matrix(), _sample_regions())
         dag.add_node("a", **{**dag.node_attrs("a"), "unused": float("nan")})
-        frame = GraphExporter(GraphExporterConfig(dropna_cols=True)).run(dag)
+        frame = GraphFormatter(GraphFormatterConfig(dropna_cols=True)).run(dag)
         assert "unused" not in frame.columns
 
-    def test_graph_exporter_exclude_synthetic(self):
+    def test_graph_formatter_exclude_synthetic(self):
         dag = _build_containment_dag(_sample_matrix(), _sample_regions())
         dag.add_node(
             "synthetic",
             name="Orphans",
             synthetic=True,
         )
-        frame = GraphExporter(GraphExporterConfig(exclude_synthetic=True)).run(dag)
+        frame = GraphFormatter(GraphFormatterConfig(exclude_synthetic=True)).run(dag)
         assert "synthetic" not in frame.index
         assert set(frame.index) == {"p", "a", "b", "c"}
 

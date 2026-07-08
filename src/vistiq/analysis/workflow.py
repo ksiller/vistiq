@@ -31,8 +31,8 @@ from vistiq.analysis.spatial import (
 from vistiq.core import ArrayIteratorConfig, Configurable, generate_name
 from vistiq.graph import (
     GraphBuilderConfig,
-    GraphExporter,
-    GraphExporterConfig,
+    GraphFormatter,
+    GraphFormatterConfig,
     HierarchyBuilder,
     HierarchyBuilderConfig,
     GraphQuery,
@@ -138,8 +138,8 @@ class AnalysisFlowConfig(WorkflowConfig):
             output_type="dataframe",
         )
     )
-    graph_exporter: Optional[GraphExporterConfig] = Field(
-        default_factory=GraphExporterConfig
+    graph_formatter: Optional[GraphFormatterConfig] = Field(
+        default_factory=GraphFormatterConfig
     )
     spatial_graph_query: Optional[GraphQueryConfig] = Field(
         default_factory=lambda: GraphQueryConfig(
@@ -264,8 +264,8 @@ class AnalysisFlow(Workflow):
         self, measurements: dict[str, Any]
     ) -> Optional[pd.DataFrame]:
         graph = measurements.get("containment_graph")
-        if graph is not None and self.config.graph_exporter is not None:
-            return GraphExporter(self.config.graph_exporter).run(graph)
+        if graph is not None and self.config.graph_formatter is not None:
+            return GraphFormatter(self.config.graph_formatter).run(graph)
         if graph is not None:
             return graph_to_dataframe(graph)
         return self._concat_region_tables(measurements)
@@ -397,7 +397,7 @@ class AnalysisFlow(Workflow):
         )
         axes = tuple(metadata[0].get("axes", ())) if metadata else None
         gqcfg = self.config.spatial_graph_query
-        index = (self.config.graph_exporter or GraphExporterConfig()).index
+        index = (self.config.graph_formatter or GraphFormatterConfig()).index
         output: dict[str, Any] = {}
         knn_mapped: Optional[list[Any]] = None
         knn_results: Optional[list[Any]] = None

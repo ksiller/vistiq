@@ -18,8 +18,8 @@ from vistiq.core import Configurable, Configuration, generate_name
 from vistiq.graph.graph import (
     GraphBuilder,
     GraphBuilderConfig,
-    GraphExporter,
-    GraphExporterConfig,
+    GraphFormatter,
+    GraphFormatterConfig,
     GraphQuery,
     resolve_subtree_origin,
 )
@@ -61,15 +61,15 @@ def distance_matrix_from_regions(
 
 def _regions_from_containment(
     containment_graph: Any,
-    exporter: GraphExporterConfig,
+    formatter: GraphFormatterConfig,
     *,
     node: Optional[Any] = None,
 ) -> pd.DataFrame:
-    """Export region attributes from a containment DAG, optionally scoped to a subtree."""
+    """Format region attributes from a containment DAG, optionally scoped to a subtree."""
     graph = containment_graph
     if node is not None:
         graph = GraphQuery._origin_subgraph(containment_graph, node)
-    return GraphExporter(exporter).run(graph)
+    return GraphFormatter(formatter).run(graph)
 
 
 def _resolve_distance_matrix(
@@ -210,7 +210,7 @@ class SpatialNeighborConfig(Configuration):
     """Shared settings for spatial neighbor graph analysis.
 
     Region attributes are read from the containment graph via
-    :class:`~vistiq.graph.GraphExporter`. :class:`SpatialScopeConfig` selects
+    :class:`~vistiq.graph.GraphFormatter`. :class:`SpatialScopeConfig` selects
     the subtree; ``run(node=…)`` overrides scope for one-off calls.
     """
 
@@ -225,8 +225,8 @@ class SpatialNeighborConfig(Configuration):
     """
     centroid: str = "centroid"
     axes: Optional[Tuple[str, ...]] = None
-    graph_exporter: GraphExporterConfig = Field(
-        default_factory=lambda: GraphExporterConfig(exclude_synthetic=True),
+    graph_formatter: GraphFormatterConfig = Field(
+        default_factory=lambda: GraphFormatterConfig(exclude_synthetic=True),
     )
     distance_calculator: DistanceCalculatorConfig = Field(
         default_factory=DistanceCalculatorConfig
@@ -291,7 +291,7 @@ class KnnAnalysis(Configurable[KnnAnalysisConfig]):
         cfg = self.config
         origin = _resolve_analysis_origin(containment_graph, node, cfg.scope)
         regions = _regions_from_containment(
-            containment_graph, cfg.graph_exporter, node=origin
+            containment_graph, cfg.graph_formatter, node=origin
         )
         if regions.empty:
             raise ValueError(
@@ -337,7 +337,7 @@ class RnnAnalysis(Configurable[RnnAnalysisConfig]):
         cfg = self.config
         origin = _resolve_analysis_origin(containment_graph, node, cfg.scope)
         regions = _regions_from_containment(
-            containment_graph, cfg.graph_exporter, node=origin
+            containment_graph, cfg.graph_formatter, node=origin
         )
         if regions.empty:
             raise ValueError(

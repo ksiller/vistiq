@@ -1404,40 +1404,94 @@ class DiceMetricsCalculator(MetricsCalculator):
 # Overlap orchestrator
 # ---------------------------------------------------------------------------
 
+OVERLAP_COMPONENT_KEYS = frozenset(
+    {"area_a", "area_b", "intersection", "union"}
+)
+
+
+def _axis_annotations(
+    resolved: Optional[tuple[tuple[str, ...], tuple[str, ...]]],
+    axis: int,
+) -> Optional[tuple[tuple[str, ...], ...]]:
+    if resolved is None:
+        return None
+    return (resolved[axis],)
+
 
 @dataclass(frozen=True)
 class OverlapResult:
-    """Metric matrices and optional geometry from OverlapCalculator.
+    """Labeled overlap matrices from :class:`OverlapCalculator`.
 
-    Always returned by ``run``. ``metrics`` is always populated with
-    :class:`~vistiq.matrix.MatrixData` values. ``area_a``,
-    ``area_b``, ``intersection``, and ``union`` are set only when
-    ``return_components=True`` on the config. ``object_ids_a`` and
-    ``object_ids_b`` mirror ``region_map`` key order when a map was provided.
-    ``annotations`` holds resolved row/column labels shared by metric matrices.
+    ``matrices`` holds metric outputs (``iou``, ``ios``, ``dice``, …) and,
+    when ``return_components=True``, geometry keys ``area_a``, ``area_b``,
+    ``intersection``, and ``union``. All values are
+    :class:`~vistiq.matrix.MatrixData` sharing row/column axis labels.
     """
 
-    metrics: dict[str, MatrixData]
-    area_a: Optional[Union[np.ndarray, torch.Tensor]] = None
-    area_b: Optional[Union[np.ndarray, torch.Tensor]] = None
-    intersection: Optional[Union[np.ndarray, torch.Tensor]] = None
-    union: Optional[Union[np.ndarray, torch.Tensor]] = None
-    object_ids_a: Optional[tuple[str, ...]] = None
-    object_ids_b: Optional[tuple[str, ...]] = None
-    annotations: Optional[tuple[tuple[str, ...], tuple[str, ...]]] = None
+    matrices: dict[str, MatrixData]
+
+    @property
+    def metrics(self) -> dict[str, MatrixData]:
+        """Metric matrices excluding reserved component keys."""
+        return {
+            name: matrix
+            for name, matrix in self.matrices.items()
+            if name not in OVERLAP_COMPONENT_KEYS
+        }
+
+    @property
+    def annotations(self) -> Optional[tuple[tuple[str, ...], tuple[str, ...]]]:
+        """Row/column labels shared by 2-D matrices in the result."""
+        for name in ("iou", "ios", "dice"):
+            if name in self.matrices:
+                data = self.matrices[name]
+                if data.ndim == 2:
+                    return data.annotations  # type: ignore[return-value]
+        for matrix in self.matrices.values():
+            if matrix.ndim == 2:
+                return matrix.annotations  # type: ignore[return-value]
+        for key in ("intersection", "union"):
+            matrix = self.matrices.get(key)
+            if matrix is not None and matrix.ndim == 2:
+                return matrix.annotations  # type: ignore[return-value]
+        for matrix in self.matrices.values():
+            if matrix.annotations is not None:
+                if matrix.ndim == 1:
+                    return (matrix.annotations[0], ())
+                return matrix.annotations  # type: ignore[return-value]
+        return None
+
+    @property
+    def area_a(self) -> Optional[MatrixData]:
+        return self.matrices.get("area_a")
+
+    @property
+    def area_b(self) -> Optional[MatrixData]:
+        return self.matrices.get("area_b")
+
+    @property
+    def intersection(self) -> Optional[MatrixData]:
+        return self.matrices.get("intersection")
+
+    @property
+    def union(self) -> Optional[MatrixData]:
+        return self.matrices.get("union")
 
     def metric(
         self, name: Optional[str] = None
     ) -> MatrixData:
         """Metric matrix; *name* defaults to the sole metric when only one."""
+        metrics = self.metrics
         if name is None:
-            if len(self.metrics) != 1:
-                names = ", ".join(sorted(self.metrics))
+            if len(metrics) != 1:
+                names = ", ".join(sorted(metrics))
                 raise ValueError(
                     f"metric name required when multiple metrics are present: {names}"
                 )
-            return next(iter(self.metrics.values()))
-        return self.metrics[name]
+            return next(iter(metrics.values()))
+        if name in OVERLAP_COMPONENT_KEYS:
+            raise KeyError(f"{name!r} is a component key, not a metric name")
+        return metrics[name]
 
 
 _PIPELINE_BACKEND_FIELDS = ("preferred_input_type", "preferred_device")
@@ -1458,7 +1512,7 @@ class OverlapCalculatorConfig(Configuration):
 
     Attributes:
         return_components: When True, include ``area_a``, ``area_b``,
-            ``intersection``, and ``union`` on OverlapResult.
+            ``intersection``, and ``union`` in :class:`OverlapResult.matrices`.
         triangle: Triangle mask applied to each metric (see ``vistiq.matrix.types``).
     """
 
@@ -1486,6 +1540,13 @@ class OverlapCalculatorConfig(Configuration):
                         f"{name}.{field}={child_val!r} does not match "
                         f"builder.{field}={ref_val!r}; pipeline children must agree"
                     )
+        for metric_cfg in self.metrics_calculators:
+            if metric_cfg.name in OVERLAP_COMPONENT_KEYS:
+                reserved = ", ".join(sorted(OVERLAP_COMPONENT_KEYS))
+                raise ValueError(
+                    f"metric name {metric_cfg.name!r} is reserved; "
+                    f"reserved keys: {reserved}"
+                )
         return self
 
 
@@ -1571,7 +1632,6 @@ class OverlapCalculator(Configurable[OverlapCalculatorConfig]):
         *,
         region_map: Optional[tuple[RegionMap, RegionMap]] = None,
         spacing: SpacingLike = None,
-        annotations: Optional[tuple[tuple[str, ...], tuple[str, ...]]] = None,
         device: Optional[torch.device] = None,
     ) -> OverlapResult:
         """Compute overlap metric(s) between two collections.
@@ -1588,15 +1648,11 @@ class OverlapCalculator(Configurable[OverlapCalculatorConfig]):
                 encode acquisition direction; magnitudes scale areas and
                 intersections. Ratios (IoU/IoS/Dice) are unchanged under uniform
                 scaling.
-            annotations: Optional ``(row_labels, col_labels)`` for DataFrame
-                output when ``annotate=True``. Overrides ``object_id`` display
-                names; lengths must match region counts. Ignored when
-                ``annotate=False``.
             device: Torch device override when using tensor backends.
 
         Returns:
-            OverlapResult with :class:`~vistiq.matrix.MatrixData` metrics.
-            Geometry fields are included only when ``return_components=True``.
+            OverlapResult with labeled :class:`~vistiq.matrix.MatrixData` values.
+            Component keys are included only when ``return_components=True``.
             Use :class:`~vistiq.matrix.MatrixFormatter` to export DataFrames
             or raw arrays.
         """
@@ -1604,49 +1660,21 @@ class OverlapCalculator(Configurable[OverlapCalculatorConfig]):
         is_label_builder = isinstance(self.config.builder, LabelBuilderConfig)
         is_box_builder = isinstance(self.config.builder, BoxBuilderConfig)
 
-        region_ctx_a: Optional[RegionBuildContext] = None
-        region_ctx_b: Optional[RegionBuildContext] = None
         resolved_annotations: Optional[tuple[tuple[str, ...], tuple[str, ...]]] = None
         if region_map is not None:
-            region_ctx_a = parse_region_map(
+            parse_region_map(
                 region_map[0],
                 require_label_id=is_label_builder,
                 require_bbox=is_box_builder,
             )
-            region_ctx_b = parse_region_map(
+            parse_region_map(
                 region_map[1],
                 require_label_id=is_label_builder,
                 require_bbox=is_box_builder,
             )
-            default = (
+            resolved_annotations = (
                 tuple(region_map[0].keys()),
                 tuple(region_map[1].keys()),
-            )
-            if annotations is None:
-                resolved_annotations = default
-            else:
-                rows, cols = annotations
-                if len(rows) == 0 and len(cols) == 0:
-                    resolved_annotations = default
-                else:
-                    expected_rows, expected_cols = default
-                    if len(rows) != len(expected_rows) or len(cols) != len(
-                        expected_cols
-                    ):
-                        raise ValueError(
-                            "annotations must match region_map size; "
-                            f"got {len(rows)} x {len(cols)}, expected "
-                            f"{len(expected_rows)} x {len(expected_cols)}"
-                        )
-                    resolved_annotations = (
-                        tuple(str(value) for value in rows),
-                        tuple(str(value) for value in cols),
-                    )
-        elif annotations is not None:
-            rows, cols = annotations
-            resolved_annotations = (
-                tuple(str(value) for value in rows),
-                tuple(str(value) for value in cols),
             )
 
         if is_box_builder and region_map is None and (a is None or b is None):
@@ -1708,27 +1736,22 @@ class OverlapCalculator(Configurable[OverlapCalculatorConfig]):
             for name, matrix in raw_metrics.items()
         }
 
-        object_ids_a = region_ctx_a.object_ids if region_ctx_a is not None else None
-        object_ids_b = region_ctx_b.object_ids if region_ctx_b is not None else None
-
+        matrices = dict(metric_data)
         if self.config.return_components:
-            return OverlapResult(
-                metrics=metric_data,
-                area_a=area_a,
-                area_b=area_b,
-                intersection=inter,
-                union=union,
-                object_ids_a=object_ids_a,
-                object_ids_b=object_ids_b,
-                annotations=resolved_annotations,
+            row_annotations = _axis_annotations(resolved_annotations, 0)
+            col_annotations = _axis_annotations(resolved_annotations, 1)
+            matrices.update(
+                {
+                    "area_a": MatrixData(matrix=area_a, annotations=row_annotations),
+                    "area_b": MatrixData(matrix=area_b, annotations=col_annotations),
+                    "intersection": MatrixData(
+                        matrix=inter, annotations=resolved_annotations
+                    ),
+                    "union": MatrixData(matrix=union, annotations=resolved_annotations),
+                }
             )
-        return OverlapResult(
-            metrics=metric_data,
-            object_ids_a=object_ids_a,
-            object_ids_b=object_ids_b,
-            annotations=resolved_annotations,
-        )
 
+        return OverlapResult(matrices=matrices)
 
 # ---------------------------------------------------------------------------
 # Metric config helpers

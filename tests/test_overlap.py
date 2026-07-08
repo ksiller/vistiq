@@ -33,7 +33,7 @@ from vistiq.analysis.overlap import (
 )
 from vistiq.analysis.overlap import IoUMetricsCalculator
 from vistiq.matrix.ops import MatrixFormatter, MatrixFormatterConfig
-from vistiq.matrix.types import UPPER
+from vistiq.matrix.types import UPPER, matrix_to_numpy
 
 
 def _format_overlap(
@@ -241,10 +241,17 @@ class TestOverlapCalculatorMasks:
         )
         voxel_volume = 2.0
         np.testing.assert_allclose(
-            with_spacing.intersection, without.intersection * voxel_volume
+            matrix_to_numpy(with_spacing.intersection),
+            matrix_to_numpy(without.intersection) * voxel_volume,
         )
-        np.testing.assert_allclose(with_spacing.area_a, without.area_a * voxel_volume)
-        np.testing.assert_allclose(with_spacing.area_b, without.area_b * voxel_volume)
+        np.testing.assert_allclose(
+            matrix_to_numpy(with_spacing.area_a),
+            matrix_to_numpy(without.area_a) * voxel_volume,
+        )
+        np.testing.assert_allclose(
+            matrix_to_numpy(with_spacing.area_b),
+            matrix_to_numpy(without.area_b) * voxel_volume,
+        )
 
     def test_mask_metrics_with_signed_spacing(self):
         masks_a, masks_b = _mask_pair()
@@ -277,9 +284,9 @@ class TestOverlapCalculatorMasks:
                 rtol=1e-5,
                 atol=1e-5,
             )
-        assert np.all(signed.area_a > 0)
-        assert np.all(signed.area_b > 0)
-        assert np.all(signed.intersection >= 0)
+        assert np.all(matrix_to_numpy(signed.area_a) > 0)
+        assert np.all(matrix_to_numpy(signed.area_b) > 0)
+        assert np.all(matrix_to_numpy(signed.intersection) >= 0)
 
 
 class TestOverlapCalculatorLabels:
@@ -333,7 +340,8 @@ class TestOverlapCalculatorLabels:
         )
         voxel_volume = 2.0
         np.testing.assert_allclose(
-            with_spacing.intersection, without.intersection * voxel_volume
+            matrix_to_numpy(with_spacing.intersection),
+            matrix_to_numpy(without.intersection) * voxel_volume,
         )
 
     def test_labels_metrics_with_signed_spacing(self):
@@ -369,9 +377,9 @@ class TestOverlapCalculatorLabels:
                 rtol=1e-5,
                 atol=1e-5,
             )
-        assert np.all(signed.area_a > 0)
-        assert np.all(signed.area_b > 0)
-        assert np.all(signed.intersection >= 0)
+        assert np.all(matrix_to_numpy(signed.area_a) > 0)
+        assert np.all(matrix_to_numpy(signed.area_b) > 0)
+        assert np.all(matrix_to_numpy(signed.intersection) >= 0)
 
     def test_labels_sparse_matches_linear(self):
         labels, other = _label_pair()
@@ -519,15 +527,6 @@ class TestRegionMap:
         assert list(df.index) == ["obj-l1", "obj-l2"]
         assert list(df.columns) == ["obj-a1", "obj-a2"]
 
-    def test_annotations_override_region_map_labels(self):
-        map_a, map_b = self._box_region_maps()
-        custom = (("row-a", "row-b"), ("col-a", "col-b"))
-        calc = OverlapCalculator(BoxOverlapCalculatorConfig())
-        result = calc.run(region_map=(map_a, map_b), annotations=custom)
-        df = _format_overlap(result, output_type="dataframe", annotate=True)
-        assert list(df.index) == ["row-a", "row-b"]
-        assert list(df.columns) == ["col-a", "col-b"]
-
     def test_annotate_false_ignores_stored_annotations(self):
         map_a, map_b = self._box_region_maps()
         calc = OverlapCalculator(BoxOverlapCalculatorConfig())
@@ -535,14 +534,6 @@ class TestRegionMap:
         df = _format_overlap(result, output_type="dataframe", annotate=False)
         assert list(df.index) == [0, 1]
         assert list(df.columns) == [0, 1]
-
-    def test_annotation_length_mismatch_rejected(self):
-        map_a, map_b = self._box_region_maps()
-        with pytest.raises(ValueError, match="annotations must match region_map size"):
-            OverlapCalculator(BoxOverlapCalculatorConfig()).run(
-                region_map=(map_a, map_b),
-                annotations=(("only-one",), ("obj-b0", "obj-b1")),
-            )
 
     def test_region_map_from_dataframe(self):
         df = pd.DataFrame(

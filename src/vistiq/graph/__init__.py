@@ -6,8 +6,8 @@ from .hierarchy import (
 from .graph import (
     GraphBuilder,
     GraphBuilderConfig,
-    GraphExporter,
-    GraphExporterConfig,
+    GraphFormatter,
+    GraphFormatterConfig,
     GraphFilter,
     GraphFilterConfig,
     GraphLike,
@@ -34,8 +34,8 @@ from .napari import (
 __all__ = [
     "GraphBuilder",
     "GraphBuilderConfig",
-    "GraphExporter",
-    "GraphExporterConfig",
+    "GraphFormatter",
+    "GraphFormatterConfig",
     "GraphFilter",
     "GraphFilterConfig",
     "HierarchyBuilder",
