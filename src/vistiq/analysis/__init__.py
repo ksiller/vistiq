@@ -7,8 +7,6 @@ from .coincidence import (
 from .distance import (
     DistanceCalculator,
     DistanceCalculatorConfig,
-    MatrixCalculator,
-    MatrixCalculatorConfig,
 )
 from .overlap import (
     AreaCalculator,
@@ -85,8 +83,6 @@ __all__ = [
     "CoincidenceDetectorConfig",
     "DistanceCalculator",
     "DistanceCalculatorConfig",
-    "MatrixCalculator",
-    "MatrixCalculatorConfig",
     "AreaCalculator",
     "AreaCalculatorConfig",
     "BoxAreaCalculator",

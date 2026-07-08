@@ -282,7 +282,7 @@ class TestResolveTorchDevice:
         assert device.type in {"cpu", "cuda", "mps", "xpu"}
 
     def test_resolve_torch_device_numpy_backend_returns_none(self):
-        assert resolve_torch_device(preferred_input_type="numpy") is None
+        assert resolve_torch_device(preferred_input_type="np.ndarray") is None
 
     def test_convert_array_like_accepts_backend_name(self):
         arr = np.array([1.0, 2.0, 3.0])

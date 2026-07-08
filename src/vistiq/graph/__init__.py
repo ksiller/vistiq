@@ -1,3 +1,8 @@
+from .hierarchy import (
+    HierarchyBuilder,
+    HierarchyBuilderConfig,
+    HierarchyResult,
+)
 from .graph import (
     GraphBuilder,
     GraphBuilderConfig,
@@ -33,6 +38,9 @@ __all__ = [
     "GraphExporterConfig",
     "GraphFilter",
     "GraphFilterConfig",
+    "HierarchyBuilder",
+    "HierarchyBuilderConfig",
+    "HierarchyResult",
     "GraphLike",
     "GraphQuery",
     "GraphQueryConfig",

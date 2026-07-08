@@ -9,7 +9,7 @@ from pydantic import field_validator, model_validator
 
 from vistiq.core import Configurable, Configuration, generate_name
 from vistiq.matrix.mask import prepare_matrix_values
-from vistiq.matrix.types import FULL
+from vistiq.matrix.types import ArrayBackend, FULL
 from vistiq.utils import convert_array_like, resolve_torch_device
 from vistiq.segment.analysis import (
     RegionAnalyzer,
@@ -44,14 +44,14 @@ class FilterConfig(Configuration):
         strict: When ``True``, :meth:`Filter.run` raises if the number of
             configured attributes does not match the width of the value array.
         preferred_input_type: Value array backend passed to
-            :meth:`Filter._convert_input` (``"numpy"`` or ``"torch.Tensor"``).
+            :meth:`Filter._convert_input` (``"np.ndarray"`` or ``"torch.Tensor"``).
             Torch-backed filters should set this and implement
             :meth:`accept_indices` against :class:`torch.Tensor`.
     """
     attribute: Optional[Union[str, List[str]]] = None
     axis: Optional[Union[int, tuple[int, ...]]] = None
     strict: bool = True
-    preferred_input_type: Literal["numpy", "torch.Tensor"] = "numpy"
+    preferred_input_type: ArrayBackend = "np.ndarray"
 
     def attribute_list(self) -> List[str]:
         """Return configured attribute selector(s) as a list.
@@ -171,7 +171,7 @@ class Filter(Configurable[FilterConfig]):
     def _convert_input(
         self,
         data: Union[np.ndarray, "torch.Tensor", List[float], List["RegionProperties"], pd.Series, pd.DataFrame],
-        dtype: Literal["numpy", "torch.Tensor"] = "numpy",
+        dtype: ArrayBackend = "np.ndarray",
         device: Optional[torch.device] = None,
     ) -> Union[np.ndarray, "torch.Tensor"]:
         """Normalize supported containers to the requested array backend."""

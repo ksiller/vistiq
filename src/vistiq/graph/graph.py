@@ -1,8 +1,8 @@
-"""Build graphs from labeled matrices and region metrics.
+"""Build graphs from labeled matrices and node metrics.
 
 GraphBuilder materializes each non-NaN matrix cell as a directed edge and
-attaches region properties to nodes. Hierarchy shaping belongs upstream in
-:class:`~vistiq.matrix.HierarchicalMatrix`.
+attaches node properties. Hierarchy inference belongs in
+:class:`~vistiq.graph.HierarchyBuilder`.
 """
 
 from __future__ import annotations
@@ -571,7 +571,7 @@ class GraphBuilderConfig(Configuration):
 
 
 class GraphBuilder(Configurable[GraphBuilderConfig]):
-    """Materialize a labeled matrix into a graph with region node attributes.
+    """Materialize a labeled matrix into a graph with node attributes.
 
     Graph construction goes through the configured :class:`GraphLike` backend.
     """
@@ -588,22 +588,22 @@ class GraphBuilder(Configurable[GraphBuilderConfig]):
     def run(
         self,
         matrix: Any,
-        regions: pd.DataFrame,
+        nodes: pd.DataFrame,
         annotations: Any = None,
     ) -> GraphLike:
-        """Build a graph from matrix weights and region metrics.
+        """Build a graph from matrix weights and node metrics.
 
         Each non-NaN matrix cell becomes an edge from the row node to the
-        column node. Node attributes come from ``regions``.
+        column node. Node attributes come from ``nodes``.
 
         Args:
             matrix: :class:`~vistiq.matrix.MatrixData` or DataFrame
-                (e.g. from :class:`HierarchicalMatrix` or :func:`edges_to_matrix`).
-            regions: Region metrics for all objects, indexed by object_id.
+                (e.g. from :class:`HierarchyBuilder` or :func:`edges_to_matrix`).
+            nodes: Node metrics for all objects, indexed by object_id.
             annotations: Reserved for future use (ignored).
 
         Returns:
-            Backend-specific graph with region metrics on nodes.
+            Backend-specific graph with node metrics on nodes.
         """
         from vistiq.matrix.types import (
             MatrixData,
@@ -622,12 +622,12 @@ class GraphBuilder(Configurable[GraphBuilderConfig]):
         data = square_matrix(data)
         assert data.annotations is not None
         values = matrix_to_numpy(data)
-        nodes = list(data.annotations[0])
+        node_ids = list(data.annotations[0])
         logger.info(f"Building graph with config: {self.config}")
         logger.info(f"Matrix shape: {values.shape}")
-        logger.info(f"Regions shape: {regions.shape}")
+        logger.info(f"Nodes shape: {nodes.shape}")
         del annotations  # reserved
-        return self._build(regions=regions, nodes=nodes, values=values)
+        return self._build(node_table=nodes, node_ids=node_ids, values=values)
 
     def _new_graph(self) -> GraphLike:
         if self.config.graph_type not in {"directed", "undirected"}:
@@ -636,31 +636,31 @@ class GraphBuilder(Configurable[GraphBuilderConfig]):
 
     def _build(
         self,
-        regions: pd.DataFrame,
+        node_table: pd.DataFrame,
         *,
-        nodes: list[Any],
+        node_ids: list[Any],
         values: np.ndarray,
     ) -> GraphLike:
-        region_table = _regions_for_nodes(regions, nodes)
+        aligned = _regions_for_nodes(node_table, node_ids)
 
         graph = self._new_graph()
         edge_attr = self.config.edge_attribute
         synthetic_attr = self.config.synthetic_attribute
         synthetic_nodes = {
             node
-            for node in nodes
-            if bool(region_table.loc[node].get("synthetic", False))
+            for node in node_ids
+            if bool(aligned.loc[node].get("synthetic", False))
         }
 
-        for node in nodes:
-            raw = region_table.loc[node].to_dict()
+        for node in node_ids:
+            raw = aligned.loc[node].to_dict()
             attrs = {key: value for key, value in raw.items() if pd.notna(value)}
             attrs["object_id"] = node
             graph.add_node(node, **attrs)
 
-        node_map = {node: index for index, node in enumerate(nodes)}
-        for parent in nodes:
-            for child in nodes:
+        node_map = {node: index for index, node in enumerate(node_ids)}
+        for parent in node_ids:
+            for child in node_ids:
                 if parent == child:
                     continue
                 weight = values[node_map[parent], node_map[child]]

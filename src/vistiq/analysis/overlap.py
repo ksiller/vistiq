@@ -13,9 +13,8 @@ import torch
 from prefect import task
 from pydantic import Field, model_validator
 
-from vistiq.matrix.types import FULL
+from vistiq.matrix.types import FULL, ArrayBackend, MatrixData, matrix_to_numpy
 from vistiq.core import Configurable, Configuration, generate_name
-from vistiq.matrix.types import MatrixData, matrix_to_numpy
 from vistiq.matrix.mask import triangle_valid_mask
 from vistiq.segment.analysis import bbox_array_from_dataframe, dataframe_to_numpy
 from vistiq.utils import (
@@ -751,7 +750,7 @@ def _select_label_boxes(
 class MatrixBuilderConfig(Configuration):
     """Shared settings for overlap input builders."""
 
-    preferred_input_type: Literal["numpy", "torch.Tensor"] = "torch.Tensor"
+    preferred_input_type: ArrayBackend = "torch.Tensor"
     preferred_device: Optional[Literal["cuda", "mps", "cpu"]] = None
 
 
@@ -849,7 +848,7 @@ class MaskStackBuilder(MatrixBuilder):
 class LabelBuilderConfig(MatrixBuilderConfig):
     """Configuration for LabelBuilder."""
 
-    preferred_input_type: Literal["numpy", "torch.Tensor"] = "numpy"
+    preferred_input_type: ArrayBackend = "np.ndarray"
 
 
 class LabelBuilder(MatrixBuilder):
@@ -911,7 +910,7 @@ class LabelBuilder(MatrixBuilder):
 class AreaCalculatorConfig(Configuration):
     """Shared settings for per-instance area calculators."""
 
-    preferred_input_type: Literal["numpy", "torch.Tensor"] = "torch.Tensor"
+    preferred_input_type: ArrayBackend = "torch.Tensor"
     preferred_device: Optional[Literal["cuda", "mps", "cpu"]] = None
 
 
@@ -994,7 +993,7 @@ class MaskAreaCalculator(AreaCalculator):
 class LabelAreaCalculatorConfig(AreaCalculatorConfig):
     """Configuration for LabelAreaCalculator."""
 
-    preferred_input_type: Literal["numpy", "torch.Tensor"] = "numpy"
+    preferred_input_type: ArrayBackend = "np.ndarray"
 
 
 class LabelAreaCalculator(AreaCalculator):
@@ -1032,7 +1031,7 @@ class LabelAreaCalculator(AreaCalculator):
 class IntersectionCalculatorConfig(Configuration):
     """Shared settings for pairwise intersection calculators."""
 
-    preferred_input_type: Literal["numpy", "torch.Tensor"] = "torch.Tensor"
+    preferred_input_type: ArrayBackend = "torch.Tensor"
     preferred_device: Optional[Literal["cuda", "mps", "cpu"]] = None
 
 
@@ -1226,7 +1225,7 @@ class LabelIntersectionCalculatorConfig(IntersectionCalculatorConfig):
         max_bbox_volume_fraction: Largest-box fraction threshold for ``auto`` linear.
     """
 
-    preferred_input_type: Literal["numpy", "torch.Tensor"] = "numpy"
+    preferred_input_type: ArrayBackend = "np.ndarray"
     mode: Literal["linear", "sparse", "auto"] = "auto"
     total_memory_limit: int = 512
     pair_memory_limit: int = 512

@@ -14,8 +14,6 @@ from vistiq.analysis.overlap import OverlapCalculatorConfig, region_map_from_dat
 from vistiq.analysis.coincidence import CoincidenceDetectorConfig
 from vistiq.analysis.distance import DistanceCalculatorConfig
 from vistiq.matrix.ops import (
-    HierarchicalMatrix,
-    HierarchicalMatrixConfig,
     MatrixAggregatorConfig,
     MatrixCombiner,
     MatrixCombinerConfig,
@@ -35,6 +33,8 @@ from vistiq.graph import (
     GraphBuilderConfig,
     GraphExporter,
     GraphExporterConfig,
+    HierarchyBuilder,
+    HierarchyBuilderConfig,
     GraphQuery,
     GraphQueryConfig,
     graph_to_dataframe,
@@ -123,8 +123,8 @@ class AnalysisFlowConfig(WorkflowConfig):
             triangle=UPPER,
         )
     )
-    hierarchical_matrix: Optional[HierarchicalMatrixConfig] = Field(
-        default_factory=lambda: HierarchicalMatrixConfig(orphan_strategy="drop")
+    hierarchy_builder: Optional[HierarchyBuilderConfig] = Field(
+        default_factory=lambda: HierarchyBuilderConfig(orphan_strategy="drop")
     )
     graph_builder: Optional[GraphBuilderConfig] = Field(
         default_factory=GraphBuilderConfig
@@ -176,8 +176,8 @@ class AnalysisFlow(Workflow):
         required_properties = ["label", "object_id", "centroid"]
         if self.config.overlap_calculator is not None:
             required_properties.append("bbox")
-        if self.config.hierarchical_matrix is not None:
-            required_properties.append(self.config.hierarchical_matrix.rank_attribute)
+        if self.config.hierarchy_builder is not None:
+            required_properties.append(self.config.hierarchy_builder.rank_attribute)
         if self.config.knn_analysis is not None:
             required_properties.append("centroid")
 
@@ -306,22 +306,22 @@ class AnalysisFlow(Workflow):
             return {}
         if (
             self.config.matrix_combiner is None
-            or self.config.hierarchical_matrix is None
-            or self.config.graph_builder is None
+            or self.config.hierarchy_builder is None
         ):
             return {}
 
         combiner = MatrixCombiner(self.config.matrix_combiner)
         ios_global = combiner.run(ios_matrices)
-        hm = HierarchicalMatrix(self.config.hierarchical_matrix).run(
-            ios_global, regions
-        )
-        builder = Configurable.create_from_config(self.config.graph_builder)
-        dag = builder.run(hm.matrix, hm.regions, annotations=None)
+        hb_cfg = self.config.hierarchy_builder
+        if self.config.graph_builder is not None:
+            hb_cfg = hb_cfg.model_copy(
+                update={"graph_builder": self.config.graph_builder}
+            )
+        hierarchy = HierarchyBuilder(hb_cfg).run(ios_global, regions)
         formatter = MatrixFormatter(self.config.matrix_formatter)
         output: dict[str, Any] = {
             "ios_global": formatter.run(ios_global),
-            "containment_graph": dag,
+            "containment_graph": hierarchy.graph,
         }
 
         gqcfg = self.config.graph_query
@@ -345,7 +345,7 @@ class AnalysisFlow(Workflow):
         logger.info(f"Running graph query for filter values: {filter_values}")
         gq = GraphQuery(gqcfg.model_copy(update={"filter_value": None}))
         gq_results = list(
-            gq.run.map(unmapped(dag), node=None, filter_value=filter_values)
+            gq.run.map(unmapped(hierarchy.graph), node=None, filter_value=filter_values)
         )
         counts_frames = [
             frame

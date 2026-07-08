@@ -225,7 +225,7 @@ class TestOverlapCalculatorMasks:
     def test_mask_iou_invariant_under_anisotropic_spacing(self):
         masks_a, masks_b = _mask_pair()
         spacing = (2.0, 1.0, 1.0)
-        numpy_backend = {"preferred_input_type": "numpy"}
+        numpy_backend = {"preferred_input_type": "np.ndarray"}
         config = MaskOverlapCalculatorConfig(
             builder=MaskStackBuilderConfig(**numpy_backend),
             area_calculator=MaskAreaCalculatorConfig(**numpy_backend),
@@ -250,7 +250,7 @@ class TestOverlapCalculatorMasks:
         masks_a, masks_b = _mask_pair()
         positive_spacing = (2.0, 1.0, 1.0)
         signed_spacing = (-2.0, 1.0, -1.0)
-        numpy_backend = {"preferred_input_type": "numpy"}
+        numpy_backend = {"preferred_input_type": "np.ndarray"}
         config = MaskOverlapCalculatorConfig(
             builder=MaskStackBuilderConfig(**numpy_backend),
             area_calculator=MaskAreaCalculatorConfig(**numpy_backend),
@@ -315,7 +315,7 @@ class TestOverlapCalculatorLabels:
     def test_labels_iou_anisotropic_spacing(self):
         labels, other = _label_pair()
         spacing = (2.0, 1.0, 1.0)
-        numpy_backend = {"preferred_input_type": "numpy"}
+        numpy_backend = {"preferred_input_type": "np.ndarray"}
         config = LabelOverlapCalculatorConfig(
             builder=LabelBuilderConfig(**numpy_backend),
             area_calculator=LabelAreaCalculatorConfig(**numpy_backend),
@@ -340,7 +340,7 @@ class TestOverlapCalculatorLabels:
         labels, other = _label_pair()
         positive_spacing = (2.0, 1.0, 1.0)
         signed_spacing = (-2.0, -1.0, 1.0)
-        numpy_backend = {"preferred_input_type": "numpy"}
+        numpy_backend = {"preferred_input_type": "np.ndarray"}
         config = LabelOverlapCalculatorConfig(
             builder=LabelBuilderConfig(**numpy_backend),
             area_calculator=LabelAreaCalculatorConfig(**numpy_backend),
@@ -443,7 +443,7 @@ class TestOverlapCalculatorExtras:
     def test_numpy_backend_requires_child_reconfiguration(self):
         boxes_a, boxes_b = _boxes_pair()
         expected = _reference_box_overlap(boxes_a, boxes_b, overlap_metric="iou")
-        numpy_backend = {"preferred_input_type": "numpy"}
+        numpy_backend = {"preferred_input_type": "np.ndarray"}
         calc = OverlapCalculator(
             BoxOverlapCalculatorConfig(
                 builder=BoxBuilderConfig(**numpy_backend),
@@ -465,7 +465,7 @@ class TestOverlapCalculatorExtras:
         with pytest.raises(ValueError, match="pipeline children must agree"):
             BoxOverlapCalculatorConfig(
                 builder=BoxBuilderConfig(preferred_input_type="torch.Tensor"),
-                area_calculator=BoxAreaCalculatorConfig(preferred_input_type="numpy"),
+                area_calculator=BoxAreaCalculatorConfig(preferred_input_type="np.ndarray"),
             )
 
 
@@ -504,7 +504,7 @@ class TestRegionMap:
             "obj-a1": RegionSpec(label_id=1),
             "obj-a2": RegionSpec(label_id=2),
         }
-        numpy_backend = {"preferred_input_type": "numpy"}
+        numpy_backend = {"preferred_input_type": "np.ndarray"}
         calc = OverlapCalculator(
             LabelOverlapCalculatorConfig(
                 builder=LabelBuilderConfig(**numpy_backend),

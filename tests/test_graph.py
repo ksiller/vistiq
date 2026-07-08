@@ -5,7 +5,6 @@ import pytest
 
 networkx = pytest.importorskip("networkx")
 
-from vistiq.matrix.ops import HierarchicalMatrix, HierarchicalMatrixConfig
 from vistiq.graph import (
     GraphBuilder,
     GraphBuilderConfig,
@@ -15,6 +14,8 @@ from vistiq.graph import (
     GraphFilterConfig,
     GraphQuery,
     GraphQueryConfig,
+    HierarchyBuilder,
+    HierarchyBuilderConfig,
     NXGraph,
     edges_to_matrix,
     graph_to_dataframe,
@@ -49,11 +50,10 @@ def _sample_regions() -> pd.DataFrame:
 def _build_containment_dag(
     matrix: pd.DataFrame,
     regions: pd.DataFrame,
-    **hierarchical_kwargs,
+    **hierarchy_kwargs,
 ):
-    hm_cfg = HierarchicalMatrixConfig(**hierarchical_kwargs)
-    result = HierarchicalMatrix(hm_cfg).run(matrix, regions)
-    return GraphBuilder(GraphBuilderConfig()).run(result.matrix, result.regions)
+    hb_cfg = HierarchyBuilderConfig(**hierarchy_kwargs)
+    return HierarchyBuilder(hb_cfg).run(matrix, regions).graph
 
 
 class TestGraphBuilder:
@@ -104,34 +104,28 @@ class TestGraphBuilder:
         assert dag.edge_attrs("p", "a")["ios"] == pytest.approx(0.9)
         assert dag.edge_attrs("p", "a").get("synthetic") is not True
 
-    def test_regions_indexed_by_object_id(self):
+    def test_nodes_indexed_by_object_id(self):
         regions = _sample_regions()
-        result = HierarchicalMatrix(HierarchicalMatrixConfig()).run(
+        result = HierarchyBuilder(HierarchyBuilderConfig()).run(
             _sample_matrix(), regions
         )
-        dag = GraphBuilder(GraphBuilderConfig()).run(
-            result.matrix, result.regions
-        )
-        assert dag.number_of_nodes() == 4
+        assert result.graph.number_of_nodes() == 4
 
-    def test_regions_object_id_column(self):
+    def test_nodes_object_id_column(self):
         regions = _sample_regions().reset_index()
-        result = HierarchicalMatrix(HierarchicalMatrixConfig()).run(
+        result = HierarchyBuilder(HierarchyBuilderConfig()).run(
             _sample_matrix(), regions
         )
-        dag = GraphBuilder(GraphBuilderConfig()).run(
-            result.matrix, result.regions
-        )
-        assert dag.number_of_nodes() == 4
+        assert result.graph.number_of_nodes() == 4
 
-    def test_requires_matrix_and_regions(self):
+    def test_requires_matrix_and_nodes(self):
         with pytest.raises(TypeError):
             GraphBuilder(GraphBuilderConfig()).run(
                 matrix=_sample_matrix(),
             )
         with pytest.raises(TypeError):
             GraphBuilder(GraphBuilderConfig()).run(
-                regions=_sample_regions(),
+                nodes=_sample_regions(),
             )
 
 

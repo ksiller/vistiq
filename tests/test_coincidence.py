@@ -21,7 +21,7 @@ def _label_overlap(
     labels_b: np.ndarray,
     *,
     intersection_mode: str = "auto",
-    preferred_input_type: str = "numpy",
+    preferred_input_type: str = "np.ndarray",
 ) -> np.ndarray:
     backend = {"preferred_input_type": preferred_input_type}
     calc = OverlapCalculator(

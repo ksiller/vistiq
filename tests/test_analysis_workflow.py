@@ -4,18 +4,17 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from vistiq.matrix.ops import (
-    HierarchicalMatrixConfig,
-    MatrixAggregatorConfig,
-    MatrixCombinerConfig,
-)
 from vistiq.analysis.overlap import (
     LabelOverlapCalculatorConfig,
     metrics_calculator_configs,
 )
 from vistiq.analysis.workflow import AnalysisFlow, AnalysisFlowConfig
+from vistiq.graph import GraphBuilderConfig, GraphQueryConfig, HierarchyBuilderConfig
+from vistiq.matrix.ops import (
+    MatrixAggregatorConfig,
+    MatrixCombinerConfig,
+)
 from vistiq.matrix.types import UPPER
-from vistiq.graph import GraphBuilderConfig, GraphQueryConfig
 from vistiq.analysis.spatial import KnnAnalysisConfig
 from vistiq.segment import ValueFilterConfig
 from vistiq.segment.analysis import RegionAnalyzerConfig
@@ -104,7 +103,7 @@ def _flow_config(**updates) -> AnalysisFlowConfig:
     defaults: dict = {
         "pairing_mode": "combinations",
         "matrix_combiner": None,
-        "hierarchical_matrix": None,
+        "hierarchy_builder": None,
         "graph_builder": None,
         "graph_query": None,
         "knn_analysis": None,
@@ -293,7 +292,7 @@ def test_analysis_flow_overlap_aggregated_returns_labeled_series_axis_0(
         overlap_aggregator=MatrixAggregatorConfig(
             operation="max",
             axis=0,
-            preferred_input_type="numpy",
+            preferred_input_type="np.ndarray",
         ),
     )
     measurements = _run_flow(cfg, overlapping_label_pair)
@@ -322,7 +321,7 @@ def test_analysis_flow_overlap_aggregated_returns_labeled_series_axis_1(
         overlap_aggregator=MatrixAggregatorConfig(
             operation="max",
             axis=1,
-            preferred_input_type="numpy",
+            preferred_input_type="np.ndarray",
         ),
     )
     measurements = _run_flow(cfg, overlapping_label_pair)
@@ -351,7 +350,7 @@ def test_analysis_flow_aggregated_axis_0_labels_columns_on_rectangular_matrix(
         overlap_aggregator=MatrixAggregatorConfig(
             operation="max",
             axis=0,
-            preferred_input_type="numpy",
+            preferred_input_type="np.ndarray",
         ),
     )
     measurements = _run_flow(cfg, multi_object_label_pair)
@@ -379,7 +378,7 @@ def test_analysis_flow_aggregated_axis_1_labels_rows_on_rectangular_matrix(
         overlap_aggregator=MatrixAggregatorConfig(
             operation="max",
             axis=1,
-            preferred_input_type="numpy",
+            preferred_input_type="np.ndarray",
         ),
     )
     measurements = _run_flow(cfg, multi_object_label_pair)
@@ -425,7 +424,7 @@ def test_analysis_flow_hierarchical_analysis(hierarchical_label_pair):
             symmetrize=True,
             triangle=UPPER,
         ),
-        hierarchical_matrix=HierarchicalMatrixConfig(
+        hierarchy_builder=HierarchyBuilderConfig(
             orphan_strategy="as_roots",
             rank_attribute="volume",
             threshold=0.2,
@@ -467,7 +466,7 @@ def test_analysis_flow_knn_analysis(multi_object_label_pair):
             symmetrize=True,
             triangle=UPPER,
         ),
-        hierarchical_matrix=HierarchicalMatrixConfig(
+        hierarchy_builder=HierarchyBuilderConfig(
             orphan_strategy="as_roots",
             rank_attribute="volume",
             threshold=0.2,

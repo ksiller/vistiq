@@ -1,20 +1,6 @@
 """Matrix types, masking, and operations."""
 
 from vistiq.matrix.mask import prepare_matrix_values, triangle_valid_mask
-from vistiq.matrix.ops import (
-    HierarchicalMatrix,
-    HierarchicalMatrixConfig,
-    MatrixAggregator,
-    MatrixAggregatorConfig,
-    MatrixCombiner,
-    MatrixCombinerConfig,
-    MatrixFormatter,
-    MatrixFormatterConfig,
-    MatrixTransformer,
-    MatrixTransformerConfig,
-    group_matrix_indices,
-    upper_triangle_adjacency,
-)
 from vistiq.matrix.types import (
     DIAGONAL,
     FULL,
@@ -24,7 +10,7 @@ from vistiq.matrix.types import (
     UPPER,
     UPPER_ND,
     AnnotationFactory,
-    HierarchicalResult,
+    ArrayBackend,
     MatrixAnnotations,
     MatrixArray,
     MatrixContainer,
@@ -40,6 +26,39 @@ from vistiq.matrix.types import (
     square_matrix,
 )
 
+_CALC_EXPORTS = frozenset(
+    {
+        "MatrixCalculator",
+        "MatrixCalculatorConfig",
+    }
+)
+
+_OPS_EXPORTS = frozenset(
+    {
+        "MatrixAggregator",
+        "MatrixAggregatorConfig",
+        "MatrixCombiner",
+        "MatrixCombinerConfig",
+        "MatrixFormatter",
+        "MatrixFormatterConfig",
+        "group_matrix_indices",
+        "upper_triangle_adjacency",
+    }
+)
+
+
+def __getattr__(name: str):
+    if name in _CALC_EXPORTS:
+        from vistiq.matrix import calc
+
+        return getattr(calc, name)
+    if name in _OPS_EXPORTS:
+        from vistiq.matrix import ops
+
+        return getattr(ops, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = [
     "DIAGONAL",
     "FULL",
@@ -49,13 +68,13 @@ __all__ = [
     "UPPER",
     "UPPER_ND",
     "AnnotationFactory",
-    "HierarchicalMatrix",
-    "HierarchicalMatrixConfig",
-    "HierarchicalResult",
+    "ArrayBackend",
     "MatrixAggregator",
     "MatrixAggregatorConfig",
     "MatrixAnnotations",
     "MatrixArray",
+    "MatrixCalculator",
+    "MatrixCalculatorConfig",
     "MatrixCombiner",
     "MatrixCombinerConfig",
     "MatrixContainer",
@@ -63,8 +82,6 @@ __all__ = [
     "MatrixFormatOutput",
     "MatrixFormatter",
     "MatrixFormatterConfig",
-    "MatrixTransformer",
-    "MatrixTransformerConfig",
     "annotations_at_coords",
     "as_matrix_data",
     "composite_matrix_annotations",

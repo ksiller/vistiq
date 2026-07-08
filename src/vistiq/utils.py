@@ -25,6 +25,8 @@ import cv2
 import uuid
 import torch
 
+from vistiq.matrix.types import ArrayBackend
+
 try:
     from bioio_ome_tiff.writers import OmeTiffWriter
     OME_TIFF_AVAILABLE = True
@@ -65,7 +67,7 @@ def _torch_to_device(
 
 def convert_array_like(
     arr: Union[np.ndarray, torch.Tensor, Sequence[float], float, int],
-    dtype: Literal["numpy", "torch.Tensor"] = "numpy",
+    dtype: ArrayBackend = "np.ndarray",
     device: Optional[Union[torch.device, str]] = None,
 ) -> Union[np.ndarray, torch.Tensor]:
     """Convert an array-like object to the requested dtype and device."""
@@ -916,7 +918,7 @@ def resolve_preferred_device(
 def resolve_torch_device(
     device: Optional[Union[torch.device, str]] = None,
     *,
-    preferred_input_type: Literal["numpy", "torch.Tensor"] = "torch.Tensor",
+    preferred_input_type: ArrayBackend = "torch.Tensor",
     preferred_device: Optional[Literal["cuda", "mps", "cpu"]] = None,
 ) -> Optional[torch.device]:
     """Resolve the torch device for array-backed calculations at runtime.

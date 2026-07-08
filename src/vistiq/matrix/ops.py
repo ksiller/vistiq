@@ -1,9 +1,8 @@
-"""Matrix formatters, combiners, aggregators, and hierarchical transforms."""
+"""Matrix formatters, combiners, and aggregators."""
 
 from __future__ import annotations
 
 import logging
-import uuid
 from typing import Any, Literal, Optional, Union
 
 import numpy as np
@@ -19,8 +18,8 @@ from vistiq.core import Configurable, Configuration, generate_name
 from vistiq.matrix.mask import mask_triangle, prepare_matrix_values
 from vistiq.matrix.types import (
     FULL,
+    ArrayBackend,
     AnnotationFactory,
-    HierarchicalResult,
     MatrixArray,
     MatrixAnnotations,
     MatrixContainer,
@@ -38,8 +37,6 @@ from vistiq.matrix.types import (
 from vistiq.utils import convert_array_like, resolve_torch_device
 
 logger = logging.getLogger(__name__)
-
-ORPHAN_GROUP_UNKNOWN = "unknown"
 
 
 class MatrixFormatterConfig(Configuration):
@@ -360,7 +357,7 @@ class MatrixAggregatorConfig(Configuration):
     axis: Optional[int] = 0
     ignore_nan: bool = True
     triangle: int = FULL
-    preferred_input_type: Literal["numpy", "torch.Tensor"] = "torch.Tensor"
+    preferred_input_type: ArrayBackend = "torch.Tensor"
     preferred_device: Optional[Literal["cuda", "mps", "cpu"]] = None
 
 
@@ -404,7 +401,7 @@ class MatrixAggregator(Configurable[MatrixAggregatorConfig]):
         if not isinstance(values, torch.Tensor):
             values = convert_array_like(values, dtype="torch.Tensor", device=device)
         result = self._aggregate(values)
-        if as_numpy or self.config.preferred_input_type == "numpy":
+        if as_numpy or self.config.preferred_input_type == "np.ndarray":
             result_array: MatrixArray = result.detach().cpu().numpy()
         else:
             result_array = result
@@ -478,333 +475,3 @@ class MatrixAggregator(Configurable[MatrixAggregatorConfig]):
             return torch.where(valid.any(dim=axis), result, nan)
 
         raise ValueError(f"Invalid operation: {operation}")
-
-
-def _pairwise_value(table: Union[MatrixData, pd.DataFrame], left: Any, right: Any) -> float:
-    """Return the symmetric matrix weight between left and right."""
-    if isinstance(table, MatrixData):
-        if table.ndim != 2 or table.annotations is None:
-            raise ValueError("pairwise lookup requires a labeled 2-D MatrixData")
-        values = matrix_to_numpy(table)
-        rows, cols = table.annotations
-        row_map = label_index(rows)
-        col_map = label_index(cols)
-        candidates: list[float] = []
-        if left in row_map and right in col_map:
-            candidates.append(float(values[row_map[left], col_map[right]]))
-        if right in row_map and left in col_map:
-            candidates.append(float(values[row_map[right], col_map[left]]))
-        if not candidates:
-            return float("nan")
-        return float(np.nanmax(candidates))
-
-    values_list: list[float] = []
-    if left in table.index and right in table.columns:
-        values_list.append(float(table.loc[left, right]))
-    if right in table.index and left in table.columns:
-        values_list.append(float(table.loc[right, left]))
-    if not values_list:
-        return float("nan")
-    return float(np.nanmax(values_list))
-
-
-def _normalize_index(table: pd.DataFrame, index_name: str = "object_id") -> pd.DataFrame:
-    if table.index.name == index_name:
-        return table
-    if isinstance(table.index, pd.MultiIndex) and index_name in table.index.names:
-        return table.reset_index().set_index(index_name, drop=False)
-    if index_name in table.columns:
-        return table.set_index(index_name, drop=False)
-    raise KeyError(
-        f"table must be indexed by {index_name} or include a {index_name} column; "
-        f"index={table.index.name!r}, columns={list(table.columns)}"
-    )
-
-
-def _assign_parents(
-    weight_matrix: MatrixData,
-    region_table: pd.DataFrame,
-    *,
-    rank_attribute: str,
-    threshold: float,
-    parent_strategy: Literal["smallest_enclosing", "max_weight"],
-) -> tuple[dict[Any, Optional[Any]], Any]:
-    if rank_attribute not in region_table.columns:
-        raise KeyError(
-            f"rank_attribute {rank_attribute!r} not in regions; "
-            f"available: {list(region_table.columns)}"
-        )
-
-    ranks = region_table[rank_attribute].astype(float)
-    ordered = ranks.sort_values(ascending=False).index.tolist()
-    primary_root = ordered[0]
-
-    parents: dict[Any, Optional[Any]] = {primary_root: None}
-    for child in ordered[1:]:
-        child_rank = float(ranks[child])
-        candidates = [
-            parent for parent in ordered if float(ranks[parent]) > child_rank
-        ]
-        candidates = [
-            parent
-            for parent in candidates
-            if _pairwise_value(weight_matrix, parent, child) >= threshold
-        ]
-        if not candidates:
-            parents[child] = None
-            continue
-        if parent_strategy == "max_weight":
-            parent = max(
-                candidates,
-                key=lambda candidate: _pairwise_value(
-                    weight_matrix, candidate, child
-                ),
-            )
-        else:
-            parent = min(candidates, key=lambda candidate: float(ranks[candidate]))
-        parents[child] = parent
-
-    return parents, primary_root
-
-
-def _orphan_group_key(orphan: Any, region_table: pd.DataFrame, groupby: str) -> str:
-    if groupby not in region_table.columns:
-        return ORPHAN_GROUP_UNKNOWN
-    value = region_table.loc[orphan, groupby]
-    if pd.isna(value):
-        return ORPHAN_GROUP_UNKNOWN
-    return str(value)
-
-
-def _drop_orphan_subtrees(
-    nodes: list[Any],
-    parents: dict[Any, Optional[Any]],
-    orphans: list[Any],
-) -> set[Any]:
-    drop = set(orphans)
-    while True:
-        added = {
-            child
-            for child, parent in parents.items()
-            if child not in drop and parent in drop
-        }
-        if not added:
-            break
-        drop |= added
-    return {node for node in nodes if node not in drop}
-
-
-def _append_region_row(regions: pd.DataFrame, node_id: str, attributes: dict[str, Any]) -> pd.DataFrame:
-    attrs = dict(attributes)
-    attrs["object_id"] = node_id
-    row = pd.DataFrame([attrs]).set_index("object_id", drop=False)
-    return pd.concat([regions, row])
-
-
-def _finalize_region_table(region_table: pd.DataFrame) -> pd.DataFrame:
-    region_table = region_table.copy()
-    if "object_id" in region_table.columns:
-        region_table["object_id"] = region_table.index
-    if "synthetic" in region_table.columns:
-        region_table["synthetic"] = (
-            region_table["synthetic"].fillna(False).astype(bool)
-        )
-    return region_table
-
-
-def _apply_orphan_grouping(
-    parents: dict[Any, Optional[Any]],
-    regions: pd.DataFrame,
-    *,
-    orphans: list[Any],
-    primary_root: Any,
-    orphan_groupby: Optional[str],
-    orphan_attach: Literal["separate_root", "unify"],
-    orphan_node: dict[str, Any],
-    all_node: dict[str, Any],
-) -> tuple[dict[Any, Optional[Any]], pd.DataFrame]:
-    if not orphans:
-        return parents, regions
-
-    orphan_id = uuid.uuid4().hex
-    regions = _append_region_row(regions, orphan_id, orphan_node)
-    parents[orphan_id] = None
-
-    if orphan_groupby is None:
-        for orphan in orphans:
-            parents[orphan] = orphan_id
-    else:
-        groups: dict[str, list[Any]] = {}
-        for orphan in orphans:
-            key = _orphan_group_key(orphan, regions, orphan_groupby)
-            groups.setdefault(key, []).append(orphan)
-
-        for group_key, group_orphans in groups.items():
-            group_id = uuid.uuid4().hex
-            regions = _append_region_row(
-                regions,
-                group_id,
-                {
-                    "name": f"orphans:{group_key}",
-                    "synthetic": True,
-                    "orphan_group": group_key,
-                },
-            )
-            parents[group_id] = orphan_id
-            for orphan in group_orphans:
-                parents[orphan] = group_id
-
-    if orphan_attach == "unify":
-        all_id = uuid.uuid4().hex
-        regions = _append_region_row(regions, all_id, all_node)
-        parents[all_id] = None
-        parents[orphan_id] = all_id
-        parents[primary_root] = all_id
-
-    return parents, regions
-
-
-def _parents_to_matrix(
-    parents: dict[Any, Optional[Any]],
-    weight_matrix: MatrixData,
-    nodes: list[Any],
-    *,
-    synthetic_weight: float,
-) -> MatrixData:
-    matrix = np.full((len(nodes), len(nodes)), np.nan, dtype=float)
-    node_map = label_index(nodes)
-    for child, parent in parents.items():
-        if parent is None or child not in node_map or parent not in node_map:
-            continue
-        weight = _pairwise_value(weight_matrix, parent, child)
-        if np.isnan(weight):
-            weight = synthetic_weight
-        matrix[node_map[parent], node_map[child]] = weight
-    return MatrixData(matrix=matrix, annotations=(tuple(nodes), tuple(nodes)))
-
-
-class MatrixTransformerConfig(Configuration):
-    """Base configuration for matrix transformers."""
-
-
-class MatrixTransformer(Configurable[MatrixTransformerConfig]):
-    """Transform a labeled matrix without recomputing overlap metrics."""
-
-    def __init__(self, config: MatrixTransformerConfig):
-        super().__init__(config)
-
-    @classmethod
-    def from_config(cls, config: MatrixTransformerConfig) -> "MatrixTransformer":
-        return cls(config)
-
-    @task(name="MatrixTransformer.run", task_run_name=generate_name)
-    def run(
-        self,
-        matrix: Union[MatrixData, pd.DataFrame],
-        regions: pd.DataFrame,
-    ) -> HierarchicalResult:
-        raise NotImplementedError
-
-
-class HierarchicalMatrixConfig(MatrixTransformerConfig):
-    """Configuration for :class:`HierarchicalMatrix`.
-
-    Shapes a filtered overlap matrix into a sparse parent→child adjacency matrix
-    and optionally extends ``regions`` with synthetic orphan-group nodes.
-    """
-
-    rank_attribute: str = "volume"
-    threshold: float = 0.5
-    parent_strategy: Literal["smallest_enclosing", "max_weight"] = "smallest_enclosing"
-    orphan_strategy: Literal["drop", "as_roots", "group"] = "as_roots"
-    orphan_groupby: Optional[str] = None
-    orphan_attach: Literal["separate_root", "unify"] = "separate_root"
-    synthetic_weight: float = Field(
-        default=1.0,
-        description=(
-            "Fallback matrix weight when a hierarchical edge has no IoS value "
-            "(orphan/synthetic links). GraphBuilder marks those edges synthetic=True "
-            "when either endpoint is a synthetic node."
-        ),
-    )
-    orphan_node: dict[str, Any] = Field(
-        default_factory=lambda: {"name": "Orphans", "synthetic": True}
-    )
-    all_node: dict[str, Any] = Field(
-        default_factory=lambda: {"name": "all", "synthetic": True}
-    )
-
-
-class HierarchicalMatrix(MatrixTransformer):
-    """Convert a matrix into a hierarchical adjacency matrix (directed edges only)."""
-
-    def __init__(self, config: HierarchicalMatrixConfig):
-        super().__init__(config)
-
-    @classmethod
-    def from_config(cls, config: HierarchicalMatrixConfig) -> "HierarchicalMatrix":
-        return cls(config)
-
-    @task(name="HierarchicalMatrix.run", task_run_name=generate_name)
-    def run(
-        self,
-        matrix: Union[MatrixData, pd.DataFrame],
-        regions: pd.DataFrame,
-    ) -> HierarchicalResult:
-        weight_matrix = square_matrix(as_matrix_data(matrix))
-        assert weight_matrix.annotations is not None
-        nodes = list(weight_matrix.annotations[0])
-        node_table = _normalize_index(regions).reindex(nodes)
-        missing = node_table.index[node_table.isna().all(axis=1)]
-        if len(missing) > 0:
-            missing_ids = ", ".join(str(value) for value in missing[:5])
-            raise KeyError(
-                f"regions missing metrics for {len(missing)} object_id(s), "
-                f"including: {missing_ids}"
-            )
-
-        parents, primary_root = _assign_parents(
-            weight_matrix,
-            node_table,
-            rank_attribute=self.config.rank_attribute,
-            threshold=self.config.threshold,
-            parent_strategy=self.config.parent_strategy,
-        )
-        orphans = [
-            node
-            for node in nodes
-            if parents.get(node) is None and node != primary_root
-        ]
-
-        if self.config.orphan_strategy == "drop":
-            keep_nodes = sorted(_drop_orphan_subtrees(nodes, parents, orphans))
-            region_table = node_table.loc[keep_nodes]
-            parents = {
-                child: parent
-                for child, parent in parents.items()
-                if child in keep_nodes and (parent is None or parent in keep_nodes)
-            }
-        else:
-            keep_nodes = list(nodes)
-            region_table = node_table
-            if self.config.orphan_strategy == "group":
-                parents, region_table = _apply_orphan_grouping(
-                    parents,
-                    node_table,
-                    orphans=orphans,
-                    primary_root=primary_root,
-                    orphan_groupby=self.config.orphan_groupby,
-                    orphan_attach=self.config.orphan_attach,
-                    orphan_node=self.config.orphan_node,
-                    all_node=self.config.all_node,
-                )
-                keep_nodes = list(region_table.index)
-
-        hierarchical = _parents_to_matrix(
-            parents,
-            weight_matrix,
-            keep_nodes,
-            synthetic_weight=self.config.synthetic_weight,
-        )
-        region_table = _finalize_region_table(region_table)
-        return HierarchicalResult(matrix=hierarchical, regions=region_table)

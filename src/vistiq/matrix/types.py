@@ -22,6 +22,7 @@ OFF_DIAGONAL = LOWER_ND | UPPER_ND
 FULL = DIAGONAL | LOWER_ND | UPPER_ND
 
 MatrixArray = Union[np.ndarray, torch.Tensor]
+ArrayBackend = Literal["np.ndarray", "torch.Tensor"]
 MatrixAnnotations = tuple[tuple[Any, ...], ...]
 AnnotationFactory = Callable[[tuple[int, ...]], MatrixAnnotations]
 MatrixFormatOutput = Literal["np.ndarray", "torch.Tensor", "dataframe"]
@@ -77,14 +78,6 @@ class MatrixData:
     @property
     def ndim(self) -> int:
         return len(self.shape)
-
-
-@dataclass(frozen=True)
-class HierarchicalResult:
-    """Hierarchical adjacency matrix and updated region metadata."""
-
-    matrix: MatrixData
-    regions: pd.DataFrame
 
 
 def matrix_to_numpy(value: MatrixArray | MatrixData | pd.DataFrame | ArrayLike) -> np.ndarray:
