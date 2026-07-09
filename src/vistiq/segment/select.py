@@ -326,7 +326,7 @@ class MinFilterConfig(FilterConfig):
         minimum: Lower bound; a value must meet this floor to count as passing.
         operator: ``"gte"`` or ``"gt"`` comparison against ``minimum``.
     """
-    minimum: float = None
+    minimum: Optional[float] = None
     operator: Literal["gte", "gt"] = "gte"
 
 
@@ -361,7 +361,7 @@ class MaxFilterConfig(FilterConfig):
         maximum: Upper bound; a value must meet this ceiling to count as passing.
         operator: ``"lte"`` or ``"lt"`` comparison against ``maximum``.
     """
-    maximum: float = None
+    maximum: Optional[float] = None
     operator: Literal["lte", "lt"] = "lte"
 
 
@@ -400,7 +400,7 @@ class RangeFilterConfig(FilterConfig):
         range: Tuple of (min, max) values, or "all" to accept all values.
     """
 
-    range: Union[tuple[float, float], str] = None
+    range: Optional[Union[tuple[float, float], str]] = None
 
 
 class RangeFilter(Filter):

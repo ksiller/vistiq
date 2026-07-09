@@ -17,12 +17,14 @@ class TestConfiguration:
     def test_configuration_creation(self):
         """Test creating a basic Configuration."""
         config = Configuration()
-        assert config.classname is None
+        assert config.classname == "vistiq.core.Configurable"
 
     def test_configuration_with_classname(self):
         """Test Configuration with classname."""
-        config = Configuration(classname="TestClass")
-        assert config.classname == "TestClass"
+        from vistiq.core import Configurable
+
+        config = Configuration(classname="vistiq.core.Configurable")
+        assert config.classname is Configurable
 
     def test_configuration_extra_fields_forbidden(self):
         """Test that extra fields are forbidden."""

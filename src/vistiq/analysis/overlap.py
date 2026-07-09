@@ -1473,22 +1473,6 @@ class OverlapResult:
                 return matrix.annotations  # type: ignore[return-value]
         return None
 
-    @property
-    def area_a(self) -> Optional[MatrixData]:
-        return self.matrices.get("area_a")
-
-    @property
-    def area_b(self) -> Optional[MatrixData]:
-        return self.matrices.get("area_b")
-
-    @property
-    def intersection(self) -> Optional[MatrixData]:
-        return self.matrices.get("intersection")
-
-    @property
-    def union(self) -> Optional[MatrixData]:
-        return self.matrices.get("union")
-
     def metric(
         self, name: Optional[str] = None
     ) -> MatrixData:

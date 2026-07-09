@@ -15,8 +15,9 @@ from typing import (
     get_origin,
     get_type_hints,
 )
+import importlib
 import inspect
-from pydantic import BaseModel, PositiveInt, Field, field_validator, ImportString
+from pydantic import BaseModel, PositiveInt, Field, field_serializer, field_validator, ImportString
 
 # from pydantic.dataclasses import dataclass
 import numpy as np
@@ -37,6 +38,67 @@ from vistiq.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+_SLICE_TAG = "__slice__"
+_DEFAULT_CLASSNAME = "vistiq.core.Configurable"
+_LEGACY_CLASSNAME = "Configurable"
+
+
+def deserialize_callable(value: Any, *, field_name: str = "value") -> Any:
+    """Resolve import-path strings to callables for config validation."""
+    if isinstance(value, str):
+        module_name, _, qualname = value.rpartition(".")
+        if not module_name or not qualname:
+            raise ValueError(
+                f"{field_name} must be a callable or import path like "
+                f"'some.module.function'; got {value!r}"
+            )
+        obj = importlib.import_module(module_name)
+        for part in qualname.split("."):
+            obj = getattr(obj, part)
+        return obj
+    return value
+
+
+def serialize_callable(value: Any) -> Any:
+    """Serialize callables as ``module.qualname`` strings for JSON dumps."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if callable(value) and not isinstance(value, type):
+        module = getattr(value, "__module__", None)
+        qualname = getattr(value, "__qualname__", None)
+        if module and qualname:
+            return f"{module}.{qualname}"
+    return value
+
+
+def serialize_index_tuple(value: tuple[Any, ...]) -> list[Any]:
+    """Serialize tuples that may contain ``slice`` objects for JSON dumps."""
+    out: list[Any] = []
+    for item in value:
+        if isinstance(item, slice):
+            out.append({_SLICE_TAG: [item.start, item.stop, item.step]})
+        else:
+            out.append(item)
+    return out
+
+
+def resolve_index_tuple(value: Any) -> Any:
+    """Restore tuples that may contain ``slice`` objects from JSON payloads."""
+    if not isinstance(value, list):
+        return value
+    out: list[Any] = []
+    for item in value:
+        if isinstance(item, dict) and _SLICE_TAG in item:
+            parts = item[_SLICE_TAG]
+            if not isinstance(parts, list) or len(parts) != 3:
+                raise ValueError(f"Invalid slice payload: {item!r}")
+            out.append(slice(*parts))
+        else:
+            out.append(item)
+    return tuple(out)
 
 
 def labels_to_masks(labels: np.ndarray) -> np.ndarray:
@@ -250,10 +312,25 @@ class Configuration(BaseModel):
     Subclasses should extend this to define specific configuration parameters.
     """
 
-    classname: ImportString = Field(default="Configurable")
+    classname: ImportString = Field(default=_DEFAULT_CLASSNAME)
     package: ImportString = Field(default="vistiq.core")
-    version: str = Field(default=None)
-    command_group: str = Field(default=None)
+    version: Optional[str] = None
+    command_group: Optional[str] = None
+
+    @field_validator("classname", mode="before")
+    @classmethod
+    def _normalize_classname(cls, value: Any) -> Any:
+        if value in (None, _LEGACY_CLASSNAME):
+            return _DEFAULT_CLASSNAME
+        return value
+
+    @field_serializer("classname", when_used="json")
+    def _serialize_classname(self, value: Any) -> str:
+        if isinstance(value, type):
+            return f"{value.__module__}.{value.__qualname__}"
+        if value in (None, _LEGACY_CLASSNAME, _DEFAULT_CLASSNAME):
+            return _DEFAULT_CLASSNAME
+        return str(value)
 
     class Config:
         """Pydantic configuration.
@@ -1078,8 +1155,8 @@ class TilerConfig(StackProcessorConfig):
     """
 
     factor: Tuple[int, ...]
-    pad_width: Union[
-        int, Tuple[Tuple[int, int]], dict[int, Union[int, Tuple[int, int]]]
+    pad_width: Optional[
+        Union[int, Tuple[Tuple[int, int]], dict[int, Union[int, Tuple[int, int]]]]
     ] = None
     pad_kwargs: dict[str, Any] = {"mode": "constant", "constant_values": 0}
     alt_flip: bool = False

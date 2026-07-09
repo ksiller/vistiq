@@ -253,7 +253,7 @@ class Configuration(BaseModel):
     Attributes:
         classname: Optional class name identifier.
     """
-    classname: str = None
+    classname: Optional[str] = None
 
 
 class ArrayIteratorConfig(Configuration):

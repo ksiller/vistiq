@@ -1506,7 +1506,7 @@ class SegmentationFlowConfig(WorkflowConfig):
             :class:`Relabeler` is built from ``segmenter.iterator_config``.
     """
 
-    segmenter: SegmenterConfig = None
+    segmenter: Optional[SegmenterConfig] = None
     merger: Optional[MergerConfig] = None
     # include_mask_detector: OverlapDetector
     # exclude_mask_detector: OverlapDetector
@@ -1711,7 +1711,6 @@ class TiledSegmentationFlow(SegmentationFlow):
         t_proj =  np.sum(untiled>0, axis=0)>0
 
         olcfg = MaskOverlapCalculatorConfig(
-            annotate=False,
             triangle=LOWER_ND,
         )
         ol_calc = OverlapCalculator(olcfg)

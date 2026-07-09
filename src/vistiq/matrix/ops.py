@@ -10,11 +10,17 @@ import pandas as pd
 import torch
 from numpy.typing import ArrayLike
 from prefect import task
-from pydantic import Field
+from pydantic import Field, field_serializer, field_validator
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 
-from vistiq.core import Configurable, Configuration, generate_name
+from vistiq.core import (
+    Configurable,
+    Configuration,
+    generate_name,
+    deserialize_callable,
+    serialize_callable,
+)
 from vistiq.matrix.mask import mask_triangle, prepare_matrix_values
 from vistiq.matrix.types import (
     FULL,
@@ -57,6 +63,15 @@ class MatrixFormatterConfig(Configuration):
     annotate: bool = True
     annotation_factory: AnnotationFactory = default_matrix_annotations
     preferred_device: Optional[Literal["cuda", "mps", "cpu"]] = None
+
+    @field_validator("annotation_factory", mode="before")
+    @classmethod
+    def _resolve_annotation_factory(cls, v: Any) -> Any:
+        return deserialize_callable(v, field_name="annotation_factory")
+
+    @field_serializer("annotation_factory", when_used="json")
+    def _dump_annotation_factory(self, v: Any) -> Any:
+        return serialize_callable(v)
 
 
 class MatrixFormatter(Configurable[MatrixFormatterConfig]):

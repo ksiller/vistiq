@@ -7,13 +7,20 @@ from torch_em.transform.label import PerObjectDistanceTransform
 from torchvision.transforms import v2
 import micro_sam.training as sam_training
 from pathlib import Path
-from typing import Literal, Tuple, List, Optional, Union, Callable
+from typing import Literal, Tuple, List, Optional, Union, Callable, Any
 from micro_sam.util import export_custom_sam_model
 from bioio import BioImage
-from vistiq.core import Configuration, Configurable
+from vistiq.core import (
+    Configuration,
+    Configurable,
+    deserialize_callable,
+    resolve_index_tuple,
+    serialize_callable,
+    serialize_index_tuple,
+)
 from prefect import task
 from vistiq.utils import find_matching_file_pairs, collect_all_files
-from pydantic import Field, PositiveInt, field_validator, model_validator
+from pydantic import Field, PositiveInt, field_serializer, field_validator, model_validator
 from bioio_ome_tiff.writers import OmeTiffWriter
 
 logger = logging.getLogger(__name__)
@@ -189,7 +196,27 @@ class TrainerConfig(Configuration):
     device: str = "cuda"
     split_ratio: float = 0.8
     transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
-    checkpoint: Optional[Path] = None  
+    checkpoint: Optional[Path] = None
+
+    @field_validator("roi_def", mode="before")
+    @classmethod
+    def _resolve_roi_def(cls, v: Any) -> Any:
+        return resolve_index_tuple(v)
+
+    @field_serializer("roi_def", when_used="json")
+    def _dump_roi_def(self, v: tuple[Union[int, slice], ...]) -> list[Any]:
+        return serialize_index_tuple(v)
+
+    @field_validator("transform", mode="before")
+    @classmethod
+    def _resolve_transform(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        return deserialize_callable(v, field_name="transform")
+
+    @field_serializer("transform", when_used="json")
+    def _dump_transform(self, v: Optional[Callable[[torch.Tensor], torch.Tensor]]) -> Any:
+        return serialize_callable(v)
 
     @field_validator('export_path', 'save_root', mode='after')
     @classmethod

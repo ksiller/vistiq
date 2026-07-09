@@ -33,15 +33,15 @@ import vistiq
 from vistiq.analysis import (
     AnalysisFlow,
     AnalysisFlowConfig,
-    HierarchicalMatrixConfig,
     IoSMetricsCalculatorConfig,
     KnnAnalysisConfig,
     LabelOverlapCalculatorConfig,
-    MatrixAggregatorConfig,
     RnnAnalysisConfig,
     SpatialScopeConfig,
 )
-from vistiq.constant import FULL
+from vistiq.graph import HierarchyBuilderConfig
+from vistiq.matrix.ops import MatrixAggregatorConfig
+from vistiq.matrix.types import FULL
 from vistiq.io import (
     DataFrameWriter,
     DataFrameWriterConfig,
@@ -215,8 +215,13 @@ def resolve_channel_names(
     )
 
 
-def discover_lif_files(input_dir: Path, *, recursive: bool) -> list[Path]:
-    """Find ``.lif`` files under *input_dir* using :class:`FileList`."""
+def discover_image_files(
+    input_dir: Path,
+    *,
+    recursive: bool,
+    include: str = LIF_PATTERN,
+) -> list[Path]:
+    """Find image files under *input_dir* matching *include* using :class:`FileList`."""
     input_dir = input_dir.expanduser().resolve()
     if not input_dir.is_dir():
         raise NotADirectoryError(f"Input path is not a directory: {input_dir}")
@@ -224,7 +229,7 @@ def discover_lif_files(input_dir: Path, *, recursive: bool) -> list[Path]:
     files = FileList(
         FileListConfig(
             paths=input_dir,
-            include=LIF_PATTERN,
+            include=include,
             recursive=recursive,
         )
     ).run()
@@ -366,7 +371,7 @@ def build_analysis_config() -> AnalysisFlowConfig:
             index_on="object_id",
             map_axes=True,
         ),
-        hierarchical_matrix=HierarchicalMatrixConfig(orphan_strategy="drop"),
+        hierarchy_builder=HierarchyBuilderConfig(orphan_strategy="drop"),
         overlap_calculator=LabelOverlapCalculatorConfig(
             metrics_calculators=[IoSMetricsCalculatorConfig()],
             output_type="dataframe",
@@ -421,7 +426,7 @@ def expand_2d_tissue_labels(
     return tissue_labels, tissue_metadata
 
 
-def build_brain_label(tissue_labels: np.ndarray) -> np.ndarray:
+def build_organ_label(tissue_labels: np.ndarray) -> np.ndarray:
     brain_mask = (tissue_labels > 0).astype(np.uint16)
     for i in range(len(brain_mask)):
         brain_mask[i] = binary_dilation(brain_mask[i], iterations=1)
@@ -574,7 +579,7 @@ def run_full_pipeline(
     tissue_metadata["channel_names"] = ["Lobe"]
 
     logger.info("Building brain mask")
-    brain_label = build_brain_label(tissue_labels)
+    brain_label = build_organ_label(tissue_labels)
     brain_metadata = copy.deepcopy(tissue_metadata)
     brain_metadata["channel_names"] = ["Brain"]
 
@@ -658,7 +663,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        image_paths = discover_lif_files(args.input, recursive=args.recursive)
+        image_paths = discover_image_files(args.input, recursive=args.recursive)
     except NotADirectoryError as exc:
         logger.error("%s", exc)
         return 2

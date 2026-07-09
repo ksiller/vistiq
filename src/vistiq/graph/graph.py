@@ -18,9 +18,15 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 from prefect import task
-from pydantic import Field, field_validator
+from pydantic import Field, field_serializer, field_validator
 
-from vistiq.core import Configurable, Configuration, generate_name
+from vistiq.core import (
+    Configurable,
+    Configuration,
+    generate_name,
+    deserialize_callable,
+    serialize_callable,
+)
 
 from vistiq.matrix.types import default_matrix_annotations
 
@@ -589,6 +595,17 @@ class GraphBuilderConfig(Configuration):
     graph_type: Literal["directed", "undirected"] = "directed"
     annotation_factory: Any = default_matrix_annotations
 
+    @field_validator("annotation_factory", mode="before")
+    @classmethod
+    def _resolve_annotation_factory(cls, v: Any) -> Any:
+        """Allow `annotation_factory` to be given as an import path string."""
+        return deserialize_callable(v, field_name="annotation_factory")
+
+    @field_serializer("annotation_factory", when_used="json")
+    def _dump_annotation_factory(self, v: Any) -> Any:
+        """Serialize callables as `module.qualname` strings for JSON mode."""
+        return serialize_callable(v)
+
 
 class GraphBuilder(Configurable[GraphBuilderConfig]):
     """Materialize a labeled matrix into a graph with node attributes.
@@ -1011,8 +1028,8 @@ class GraphQuery(Configurable["GraphQueryConfig"]):
         "roots",
         "n_leaves",
         "leaves",
-        "parent_of",
-        "children_of",
+        "predecessor_of",
+        "successors_of",
         "edges",
     )
 
@@ -1054,8 +1071,8 @@ class GraphQuery(Configurable["GraphQueryConfig"]):
         "subgraph_density": "_summary_subgraph_density",
         "subgraph_average_degree": "_summary_subgraph_average_degree",
         "subgraph_global_efficiency": "_summary_subgraph_global_efficiency",
-        "parent_of": "_summary_parent_of",
-        "children_of": "_summary_children_of",
+        "predecessor_of": "_summary_predecessor_of",
+        "successors_of": "_summary_successors_of",
         "node_attributes": "_summary_node_attributes",
         "edges": "_summary_edges",
         "filtered_edges": "_summary_filtered_edges",
@@ -1273,13 +1290,10 @@ class GraphQuery(Configurable["GraphQueryConfig"]):
             return 0.0
         return subgraph.global_efficiency()
 
-    def _summary_parent_of(self, graph: GraphLike, node: Any) -> dict[Any, Any | None]:
-        parent_of = {node_id: None for node_id in graph.nodes()}
-        for parent, child in graph.edges():
-            parent_of[child] = parent
-        return parent_of
+    def _summary_predecessor_of(self, graph: GraphLike, node: Any) -> dict[Any, list[Any]]:
+        return {node_id: list(graph.predecessors(node_id)) for node_id in graph.nodes()}
 
-    def _summary_children_of(self, graph: GraphLike, node: Any) -> dict[Any, list[Any]]:
+    def _summary_successors_of(self, graph: GraphLike, node: Any) -> dict[Any, list[Any]]:
         return {node_id: list(graph.successors(node_id)) for node_id in graph.nodes()}
 
     def _summary_node_attributes(

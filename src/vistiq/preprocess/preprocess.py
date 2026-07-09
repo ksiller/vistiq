@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 from typing import Optional, Literal, Any, Union, Sequence
-from pydantic import Field, ImportString, field_validator, model_validator
+from pydantic import Field, ImportString, field_serializer, field_validator, model_validator
 from bioio import Dimensions, Scale
 from scipy.ndimage import uniform_filter1d, gaussian_filter, distance_transform_edt
 from skimage.exposure import rescale_intensity
@@ -61,6 +61,35 @@ class PreprocessorConfig(StackProcessorConfig):
         default=None,
         description="dtype of processed stack. If None, same as input dtype.",
     )
+
+    @field_validator("dtype", mode="before")
+    @classmethod
+    def _resolve_dtype(cls, value: Any) -> Any:
+        if value is None or isinstance(value, type):
+            return value
+        if value == "bool":
+            return bool
+        if value == "int":
+            return int
+        if value == "float":
+            return float
+        if isinstance(value, str) and hasattr(np, value):
+            return getattr(np, value)
+        return value
+
+    @field_serializer("dtype", when_used="json")
+    def _serialize_dtype(self, value: Any) -> Any:
+        if value is None:
+            return None
+        if value is bool:
+            return "bool"
+        if value is int:
+            return "int"
+        if value is float:
+            return "float"
+        if isinstance(value, type) and issubclass(value, np.generic):
+            return value.__name__
+        return value
 
 
 class Preprocessor(StackProcessor):

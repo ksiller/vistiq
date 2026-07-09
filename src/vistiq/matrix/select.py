@@ -359,7 +359,7 @@ class TopKFilter(MatrixFilter):
 class ValueFilterConfig(MatrixFilterConfig):
     """Configuration for :class:`ValueFilter`."""
 
-    ref_value: float = None
+    ref_value: Optional[float] = None
     operator: Literal["<", "<=", ">", ">=", "==", "!="] = "<="
 
 

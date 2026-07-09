@@ -237,8 +237,8 @@ class TestGraphQuery:
         assert set(summary["leaves"]) == {"a", "b", "c"}
         assert summary["max_depth"] == 1
         assert summary["depths"]["a"] == 1
-        assert summary["parent_of"]["a"] == "p"
-        assert set(summary["children_of"]["p"]) == {"a", "b"}
+        assert summary["predecessor_of"]["a"] == ["p"]
+        assert set(summary["successors_of"]["p"]) == {"a", "b"}
         assert len(summary["edges"]) == 2
         ios_values = sorted(edge["ios"] for edge in summary["edges"])
         assert ios_values == pytest.approx([0.8, 0.9])

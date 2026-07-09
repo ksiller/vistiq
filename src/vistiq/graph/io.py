@@ -8,6 +8,7 @@ without rerunning the pipeline.
 from __future__ import annotations
 
 import json
+import logging
 import pickle
 from pathlib import Path
 from typing import Any, Optional
@@ -15,6 +16,86 @@ from typing import Any, Optional
 import pandas as pd
 
 from vistiq.graph.graph import subtree_origin_key
+
+logger = logging.getLogger(__name__)
+
+
+def _scope_snapshot(scope: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    if scope.match is not None:
+        payload["match"] = scope.match
+    if scope.exclude is not None:
+        payload["exclude"] = scope.exclude
+    if scope.auto_root:
+        payload["auto_root"] = scope.auto_root
+    return payload
+
+
+def _knn_cfg_snapshot(cfg: Any) -> dict[str, Any]:
+    return {
+        "k": cfg.k,
+        "mode": cfg.mode,
+        "scope": _scope_snapshot(cfg.scope),
+    }
+
+
+def _rnn_cfg_snapshot(cfg: Any) -> dict[str, Any]:
+    return {
+        "radius": cfg.radius,
+        "mode": cfg.mode,
+        "scope": _scope_snapshot(cfg.scope),
+    }
+
+
+def _load_scope(payload: dict[str, Any]) -> Any:
+    from vistiq.analysis import SpatialScopeConfig
+
+    allowed = {
+        key: payload[key]
+        for key in ("match", "exclude", "auto_root")
+        if key in payload
+    }
+    return SpatialScopeConfig.model_validate(allowed)
+
+
+def _load_knn_cfg(payload: dict[str, Any]) -> Any:
+    from vistiq.analysis import KnnAnalysisConfig
+
+    scope = _load_scope(payload.get("scope", {}))
+    try:
+        return KnnAnalysisConfig.model_validate(
+            {
+                "k": payload.get("k", 5),
+                "mode": payload.get("mode", "homotypic"),
+                "scope": scope,
+            }
+        )
+    except Exception:
+        return KnnAnalysisConfig(
+            k=payload.get("k", 5),
+            mode=payload.get("mode", "homotypic"),
+            scope=scope,
+        )
+
+
+def _load_rnn_cfg(payload: dict[str, Any]) -> Any:
+    from vistiq.analysis import RnnAnalysisConfig
+
+    scope = _load_scope(payload.get("scope", {}))
+    try:
+        return RnnAnalysisConfig.model_validate(
+            {
+                "radius": payload.get("radius", 15.0),
+                "mode": payload.get("mode", "homotypic"),
+                "scope": scope,
+            }
+        )
+    except Exception:
+        return RnnAnalysisConfig(
+            radius=payload.get("radius", 15.0),
+            mode=payload.get("mode", "homotypic"),
+            scope=scope,
+        )
 
 
 def save_analysis(
@@ -109,13 +190,23 @@ def load_analysis(
 
     knn_cfg = rnn_cfg = None
     if "knn_analysis" in meta:
-        from vistiq.analysis import KnnAnalysisConfig
-
-        knn_cfg = KnnAnalysisConfig.model_validate(meta["knn_analysis"])
+        try:
+            knn_cfg = _load_knn_cfg(meta["knn_analysis"])
+        except Exception as exc:
+            logger.warning(
+                "Skipping knn_analysis config in %s: %s",
+                root / "meta.json",
+                exc,
+            )
     if "rnn_analysis" in meta:
-        from vistiq.analysis import RnnAnalysisConfig
-
-        rnn_cfg = RnnAnalysisConfig.model_validate(meta["rnn_analysis"])
+        try:
+            rnn_cfg = _load_rnn_cfg(meta["rnn_analysis"])
+        except Exception as exc:
+            logger.warning(
+                "Skipping rnn_analysis config in %s: %s",
+                root / "meta.json",
+                exc,
+            )
 
     return {
         "containment_graph": containment_graph,
