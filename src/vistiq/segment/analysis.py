@@ -1,7 +1,7 @@
 import logging
 import uuid
 from functools import wraps
-from typing import Any, Callable, ClassVar, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Callable, ClassVar, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -23,6 +23,29 @@ def _normalize_attribute_list(
     if attributes is None:
         return []
     return attributes if isinstance(attributes, list) else [attributes]
+
+
+def _reorder_columns_by_axes(
+    columns: list[str], axes: Sequence[str]
+) -> Optional[list[str]]:
+    """Order *columns* by axis suffix; suffix matching is case-insensitive."""
+    suffix_to_col = {str(col).rsplit("-", 1)[-1].lower(): str(col) for col in columns}
+    ordered: list[str] = []
+    for axis in axes:
+        col = suffix_to_col.get(str(axis).lower())
+        if col is None:
+            return None
+        ordered.append(col)
+    if len(ordered) != len(columns):
+        return None
+    return ordered
+
+
+def _as_2d(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim == 1:
+        return arr.reshape(-1, 1)
+    return arr
 
 
 def _is_scalar(value: Any) -> bool:
@@ -219,6 +242,8 @@ def dataframe_to_numpy(
     df: pd.DataFrame,
     attributes: Optional[Union[str, List[str]]] = None,
     strict: bool = True,
+    axes: Optional[Sequence[str]] = None,
+    reset_index: bool = True,
 ) -> Optional[np.ndarray]:
     """Select DataFrame column(s) and return them as a NumPy array.
 
@@ -229,6 +254,15 @@ def dataframe_to_numpy(
     :meth:`~pandas.DataFrame.to_numpy`. String selectors name columns; integer
     selectors choose by position via ``iloc``.
 
+    When *axes* is set (e.g. ``metadata["axes"]``), prefix-matched columns are
+    reordered by axis suffix with case-insensitive matching (``"Z"`` matches
+    ``centroid-z``, ``bbox-start-z``, …). If reordering fails, columns keep
+    dataframe order and a warning is logged.
+
+    When *reset_index* is ``True`` (default), a non-default index (e.g.
+    ``label`` from :class:`RegionAnalyzer`) is promoted to columns before
+    selection. Plain :class:`~pandas.RangeIndex` frames are left unchanged.
+
     Args:
         df: Region property table.
         attributes: Column name(s) or integer position(s) to select.
@@ -236,6 +270,8 @@ def dataframe_to_numpy(
             names exactly. When ``False``, string selectors match any column
             whose name starts with the selector (useful for prefixes such as
             ``centroid`` matching ``centroid-y``, ``centroid-z``, …).
+        axes: Optional axis names for reordering prefix-matched columns.
+        reset_index: Promote a named/non-range index to columns before select.
 
     Returns:
         NumPy array of selected values, or ``None`` when no matching columns
@@ -245,6 +281,10 @@ def dataframe_to_numpy(
     Raises:
         ValueError: If attribute entries are neither strings nor integers.
     """
+    if reset_index and not (
+        isinstance(df.index, pd.RangeIndex) and df.index.name is None
+    ):
+        df = df.reset_index()
     attribute_list = _normalize_attribute_list(attributes)
     if not attribute_list:
         return df.to_numpy()
@@ -252,9 +292,24 @@ def dataframe_to_numpy(
         if strict:
             existing = [col for col in attribute_list if col in df.columns]
         else:
-            existing = [col for col in df.columns if any(col.startswith(attr) for attr in attribute_list)]
+            existing = [
+                col
+                for col in df.columns
+                if any(str(col).startswith(attr) for attr in attribute_list)
+            ]
         if not existing:
             return None
+        if axes is not None:
+            reordered = _reorder_columns_by_axes([str(col) for col in existing], axes)
+            if reordered is None:
+                logger.warning(
+                    "Could not reorder columns for axes %s; using dataframe order. "
+                    "Available columns: %s",
+                    list(axes),
+                    list(df.columns),
+                )
+            else:
+                existing = reordered
         if len(existing) == 1:
             return df[existing[0]].to_numpy()
         return df[existing].to_numpy()
@@ -271,6 +326,60 @@ def dataframe_to_numpy(
         selected = df.iloc[:, existing] if len(existing) > 1 else df.iloc[:, existing[0]]
         return selected.to_numpy()
     raise ValueError(f"Invalid attribute list type: {type(attribute_list[0])}")
+
+
+def bbox_array_from_dataframe(
+    df: pd.DataFrame,
+    *,
+    bbox_cols: Optional[Sequence[str]] = None,
+    axes: Optional[Sequence[str]] = None,
+    reset_index: bool = True,
+) -> Optional[np.ndarray]:
+    """Extract bbox bounds as ``(n_rows, 2 * ndim)`` from a RegionAnalyzer table.
+
+    Supports mapped columns ``bbox-start-{axis}`` / ``bbox-end-{axis}`` and
+    unmapped ``bbox-0`` … ``bbox-{2 * ndim - 1}`` layouts.
+    """
+    if reset_index and not (
+        isinstance(df.index, pd.RangeIndex) and df.index.name is None
+    ):
+        df = df.reset_index()
+    if bbox_cols is not None:
+        if all(col in df.columns for col in bbox_cols):
+            return df[list(bbox_cols)].to_numpy(dtype=np.float64)
+        return None
+
+    columns = [str(col) for col in df.columns]
+    if any(col.lower().startswith("bbox-start-") for col in columns):
+        starts = dataframe_to_numpy(
+            df,
+            attributes=["bbox-start"],
+            strict=False,
+            axes=axes,
+            reset_index=False,
+        )
+        ends = dataframe_to_numpy(
+            df,
+            attributes=["bbox-end"],
+            strict=False,
+            axes=axes,
+            reset_index=False,
+        )
+        if starts is None or ends is None:
+            return None
+        return np.hstack([_as_2d(starts), _as_2d(ends)])
+
+    unmapped = sorted(
+        (
+            col
+            for col in df.columns
+            if str(col).startswith("bbox-") and str(col).split("-")[-1].isdigit()
+        ),
+        key=lambda col: int(str(col).split("-")[-1]),
+    )
+    if unmapped:
+        return df[unmapped].to_numpy(dtype=np.float64)
+    return None
 
 
 class RegionAnalyzer(StackProcessor):
@@ -319,6 +428,10 @@ class RegionAnalyzer(StackProcessor):
         indices from the stack iterator are attached as dataframe columns or list
         attributes. Keys use lowercase axis labels (``c``, ``z``, …).
 
+    Object naming
+        When ``metadata['channel_names']`` is set, each region also gets
+        ``channel`` and ``object_name`` (``'{channel} {label}'``).
+
     Metadata
         Optional. ``metadata['scale']`` supplies voxel spacing; ``metadata['axes']``
         (or ``axis`` / ``dim_order``) drives axis renaming. If metadata is
@@ -341,7 +454,7 @@ class RegionAnalyzer(StackProcessor):
     )
     default_properties: ClassVar[tuple[str, ...]] = mandatory_properties + ("centroid",)
     postcomputed_properties: ClassVar[frozenset[str]] = frozenset(
-        {"object_id", "slice_id", "stack_id", "slice_annotations"}
+        {"object_id", "slice_id", "stack_id", "slice_annotations", "channel", "object_name"}
     )
 
     @classmethod
@@ -781,6 +894,18 @@ class RegionAnalyzer(StackProcessor):
                 results = results.copy()
                 results["object_id"] = [self.new_object_id() for _ in range(n)]
         return results
+
+    def _set_result_index(self, results: pd.DataFrame) -> pd.DataFrame:
+        """Index the result table by :attr:`~RegionAnalyzerConfig.index_on`."""
+        index_col = self.config.index_on
+        if results.index.name == index_col:
+            return results
+        if index_col not in results.columns:
+            raise ValueError(
+                f"Cannot index RegionAnalyzer output on {index_col!r}; "
+                f"available columns: {list(results.columns)}"
+            )
+        return results.set_index(index_col)
 
     def _assign_stack_and_slice_ids(
         self,
@@ -1263,9 +1388,85 @@ class RegionAnalyzer(StackProcessor):
 
         return pixel_count
 
+    @staticmethod
+    def _channel_names_string(
+        channel_names: Optional[Union[List[str], str]],
+    ) -> Optional[str]:
+        """Format ``metadata['channel_names']`` as a comma-separated string."""
+        if channel_names is None:
+            return None
+        if isinstance(channel_names, str):
+            return channel_names or None
+        names = [str(name) for name in channel_names if str(name)]
+        if not names:
+            return None
+        return ",".join(names)
+
+    def _assign_channel_names(
+        self,
+        results: List[Any] | pd.DataFrame,
+        channel_names: Optional[Union[List[str], str]],
+        channel_col: Optional[str] = "channel",
+    ) -> List[Any] | pd.DataFrame:
+        """Attach ``metadata['channel_names']`` to each region as *channel_col*."""
+        channel_str = self._channel_names_string(channel_names)
+        if channel_str is None:
+            return results
+        if isinstance(results, list):
+            for region in results:
+                setattr(region, channel_col, channel_str)
+        elif isinstance(results, pd.DataFrame) and len(results):
+            results = results.copy()
+            results[channel_col] = channel_str
+        return results
+
+    @staticmethod
+    def _dataframe_field_values(
+        df: pd.DataFrame, name: str
+    ) -> Optional[pd.Series]:
+        """Return a field from DataFrame columns or named index."""
+        if name in df.columns:
+            return df[name]
+        if df.index.name == name:
+            return pd.Series(df.index, index=df.index)
+        return None
+
+    def _assign_object_names(
+        self,
+        results: List[Any] | pd.DataFrame,
+    ) -> List[Any] | pd.DataFrame:
+        """Set ``object_name`` to ``'{channel} {label}'`` when channel is present."""
+
+        def _object_name(channel: str, label: Any) -> str:
+            try:
+                label_value = int(label)
+            except (TypeError, ValueError):
+                label_value = label
+            return f"{channel} {label_value}"
+
+        if isinstance(results, pd.DataFrame):
+            if not len(results) or "channel" not in results.columns:
+                return results
+            labels = self._dataframe_field_values(results, "label")
+            if labels is None:
+                return results
+            results = results.copy()
+            results["object_name"] = [
+                _object_name(channel, label)
+                for channel, label in zip(results["channel"], labels)
+            ]
+            return results
+
+        for region in results:
+            channel = getattr(region, "channel", None)
+            if channel is not None:
+                setattr(region, "object_name", _object_name(channel, region.label))
+        return results
+
     def _process_slice(
         self,
         labels: np.ndarray,
+        intensity_image: Optional[np.ndarray] = None,
         slice_annotations: Optional[dict[str, Any]] = None,
         metadata: Optional[dict[str, Any]] = None,
         stack_id: Optional[str] = None,
@@ -1275,6 +1476,11 @@ class RegionAnalyzer(StackProcessor):
 
         Args:
             labels: Labeled array for one iterator step (2D plane or ND sub-volume).
+            intensity_image: Optional intensity slice matching ``labels`` for this
+                iterator step (already sliced in lock-step by
+                :meth:`StackProcessor.run` via its ``coiterate`` argument).
+                Forwarded to ``regionprops``/``regionprops_table``; ``None`` for
+                geometry-only measurements.
             slice_annotations: Optional axis→index map from the stack iterator.
             metadata: Optional stack metadata; ``scale`` sets spacing, ``axes``
                 drives ``map_axes`` renaming. Safe to pass ``None``.
@@ -1282,8 +1488,9 @@ class RegionAnalyzer(StackProcessor):
             **kwargs: Forwarded from :class:`StackProcessor` (ignored here).
 
         Returns:
-            List of :class:`RegionProperties` or a DataFrame indexed by ``label``,
-            depending on :attr:`RegionAnalyzerConfig.output_type`.
+            List of :class:`RegionProperties` or a DataFrame indexed by
+            :attr:`~RegionAnalyzerConfig.index_on`, depending on
+            :attr:`RegionAnalyzerConfig.output_type`.
 
         Raises:
             ValueError: If ``output_type`` is not ``list`` or ``dataframe``.
@@ -1295,7 +1502,7 @@ class RegionAnalyzer(StackProcessor):
         if spacing is not None:
             spacing = spacing[-labels.ndim :]
         debug_mask_labels("RegionAnalyzer._process_slice", labels)
-        channel_names = metadata.get("channel_names") if metadata else None
+        channel_names = metadata.get("channel_names", None) if metadata else None
         logger.info(
             f"RegionAnalyzer: Applying scale: {spacing}, labels.shape={labels.shape}, "
             f"channel_names={channel_names}"
@@ -1306,7 +1513,7 @@ class RegionAnalyzer(StackProcessor):
 
         if self.config.output_type == "list":
             results = regionprops(
-                labels, extra_properties=extra_props_funcs, spacing=spacing
+                labels, intensity_image=intensity_image, extra_properties=extra_props_funcs, spacing=spacing
             )
             results = self._expand_mapped_property_attributes(
                 results, labels.ndim, metadata
@@ -1315,11 +1522,12 @@ class RegionAnalyzer(StackProcessor):
             results = pd.DataFrame(
                 regionprops_table(
                     labels,
+                    intensity_image=intensity_image,
                     properties=self.used_builtin_properties(),
                     extra_properties=extra_props_funcs,
                     spacing=spacing,
                 )
-            ).set_index("label")
+            )
             if self.config.map_axes:
                 slice_axes = self._slice_axis_labels(labels.ndim, metadata)
                 results = self.map_dataframe_axis_columns(results, slice_axes)
@@ -1330,6 +1538,7 @@ class RegionAnalyzer(StackProcessor):
 
         results = self._relabel_area_as_volume(results, labels.ndim)
         results = self._ensure_positive_extent_values(results)
+        results = self._assign_channel_names(results, channel_names)
 
         stack_id = stack_id or self.new_stack_id()
         slice_id = self.new_slice_id()
@@ -1341,13 +1550,26 @@ class RegionAnalyzer(StackProcessor):
 
         if self.config.output_type == "list":
             results = self._assign_property_names(results)
+            results = self._assign_object_names(results)
+        elif isinstance(results, pd.DataFrame) and len(results):
+            results = self._set_result_index(results)
+            results = self._assign_object_names(results)
 
         if isinstance(results, list):
             logger.debug(
                 "DEBUG RegionAnalyzer labels:", [r.label for r in results[:10]]
             )
-        elif hasattr(results, "columns") and "label" in results.columns:
-            logger.debug("DEBUG RegionAnalyzer labels:", results["label"].tolist()[:10])
+        elif isinstance(results, pd.DataFrame):
+            if "label" in results.columns:
+                logger.debug(
+                    "DEBUG RegionAnalyzer labels:", results["label"].tolist()[:10]
+                )
+            elif results.index.name == "label":
+                logger.debug(
+                    "DEBUG RegionAnalyzer labels:", results.index.tolist()[:10]
+                )
+            else:
+                logger.debug("DEBUG RegionAnalyzer result type:", type(results))
         else:
             logger.debug("DEBUG RegionAnalyzer result type:", type(results))
 
@@ -1356,6 +1578,34 @@ class RegionAnalyzer(StackProcessor):
             f"Identified {len(results)} regions, return as {self.config.output_type}"
         )
         return results
+
+    def _reshape_slice_results(
+        self,
+        results: list[Any],
+        slice_indices: list[tuple[int, ...]],
+        input_shape: tuple[int, ...],
+        output_shape: Optional[tuple[int, ...]] = None,
+    ) -> List["RegionProperties"] | pd.DataFrame:
+        """Concatenate per-slice tables, preserving :attr:`~RegionAnalyzerConfig.index_on`."""
+        if self.config.output_type != "dataframe":
+            return super()._reshape_slice_results(
+                results,
+                slice_indices=slice_indices,
+                input_shape=input_shape,
+                output_shape=output_shape,
+            )
+
+        index_col = self.config.index_on
+        frames = []
+        for frame in results:
+            if hasattr(frame, "index") and frame.index.name == index_col:
+                frames.append(frame.reset_index())
+            else:
+                frames.append(frame)
+        combined = pd.concat(frames, ignore_index=True)
+        if len(combined) and index_col in combined.columns:
+            combined = combined.set_index(index_col)
+        return combined
 
     def _reshape_slice_results_OBSOLETE(
         self,
@@ -1380,6 +1630,7 @@ class RegionAnalyzer(StackProcessor):
     def run(
         self,
         labels: np.ndarray,
+        intensity_image: Optional[np.ndarray] = None,
         metadata: Optional[dict[str, Any]] = None,
         **kwargs,
     ) -> List["RegionProperties"] | pd.DataFrame:
@@ -1387,6 +1638,12 @@ class RegionAnalyzer(StackProcessor):
 
         Args:
             labels: Labeled array (any dimensionality supported by the iterator).
+            intensity_image: Optional grayscale image with the same shape as
+                ``labels``. When given, it is iterated in lock-step with
+                ``labels`` and forwarded to ``regionprops``/``regionprops_table``
+                so intensity-based properties (``mean_intensity``, weighted
+                centroids, etc.) can be computed. ``None`` computes
+                geometry-only properties.
             metadata: Optional stack metadata (spacing, axes, etc.). May be ``None``.
             **kwargs: Passed to :class:`StackProcessor` (``workers``, ``verbose``,
                 optional ``stack_id``).
@@ -1398,8 +1655,11 @@ class RegionAnalyzer(StackProcessor):
         logger.debug("DEBUG: labels shape =", getattr(labels, "shape", None))
         # debug_mask_labels("RegionAnalyzer.run", labels)
         stack_id = kwargs.pop("stack_id", None) or self.new_stack_id()
+        # Iterate the intensity image in lock-step with the labels so per-slice
+        # regionprops sees matching label/intensity sub-volumes.
+        coiterate = [intensity_image] if intensity_image is not None else None
         results, _ = super().run(
-            labels, metadata=metadata, stack_id=stack_id, **kwargs
+            labels, metadata=metadata, stack_id=stack_id, coiterate=coiterate, **kwargs
         )
         logger.debug(f"RegionAnalyzer.run(): Results = {results}")
         return results
@@ -1414,7 +1674,9 @@ class RegionAnalyzerConfig(StackProcessorConfig):
     Attributes:
         output_type: ``"list"`` returns :class:`RegionProperties` objects (for
             filtering and downstream Python code). ``"dataframe"`` returns a
-            pandas table indexed by ``label``.
+            pandas table indexed by :attr:`index_on`.
+        index_on: Column to use as the DataFrame index when ``output_type`` is
+            ``"dataframe"``. ``"label"`` (default) or ``"object_id"``.
         properties: Names to compute. Built-in scikit-image properties, custom
             extras (:meth:`RegionAnalyzer.extra_properties_funcs`), postcomputed
             ``slice_annotations``, and mapped identifiers (``centroid-y``,
@@ -1439,6 +1701,7 @@ class RegionAnalyzerConfig(StackProcessorConfig):
     """
 
     output_type: Literal["list", "dataframe"] = "list"
+    index_on: Literal["object_id", "label"] = "label"
     properties: List[str] = Field(
         default_factory=lambda: list(RegionAnalyzer.default_properties)
     )

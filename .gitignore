@@ -99,3 +99,6 @@ results/
 
 # dask performance reports
 *report.html
+
+# pyvis / networkx graph exports
+nx_graph.html

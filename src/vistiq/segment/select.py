@@ -7,9 +7,9 @@ import torch
 from prefect import task
 from pydantic import field_validator, model_validator
 
-from vistiq.constant.matrix import FULL
 from vistiq.core import Configurable, Configuration, generate_name
-from vistiq.utils import convert_array_like, prepare_matrix_values, resolve_torch_device
+from vistiq.matrix.types import ArrayBackend
+from vistiq.utils import convert_array_like
 from vistiq.segment.analysis import (
     RegionAnalyzer,
     dataframe_to_numpy,
@@ -40,14 +40,14 @@ class FilterConfig(Configuration):
         strict: When ``True``, :meth:`Filter.run` raises if the number of
             configured attributes does not match the width of the value array.
         preferred_input_type: Value array backend passed to
-            :meth:`Filter._convert_input` (``"numpy"`` or ``"torch.Tensor"``).
+            :meth:`Filter._convert_input` (``"np.ndarray"`` or ``"torch.Tensor"``).
             Torch-backed filters should set this and implement
             :meth:`accept_indices` against :class:`torch.Tensor`.
     """
     attribute: Optional[Union[str, List[str]]] = None
     axis: Optional[Union[int, tuple[int, ...]]] = None
     strict: bool = True
-    preferred_input_type: Literal["numpy", "torch.Tensor"] = "numpy"
+    preferred_input_type: ArrayBackend = "np.ndarray"
 
     def attribute_list(self) -> List[str]:
         """Return configured attribute selector(s) as a list.
@@ -167,7 +167,7 @@ class Filter(Configurable[FilterConfig]):
     def _convert_input(
         self,
         data: Union[np.ndarray, "torch.Tensor", List[float], List["RegionProperties"], pd.Series, pd.DataFrame],
-        dtype: Literal["numpy", "torch.Tensor"] = "numpy",
+        dtype: ArrayBackend = "np.ndarray",
         device: Optional[torch.device] = None,
     ) -> Union[np.ndarray, "torch.Tensor"]:
         """Normalize supported containers to the requested array backend."""
@@ -309,345 +309,15 @@ class FilterOps(Configurable[FilterOpsConfig]):
         order = sorted(selected)
         return values[order]
 
-class MatrixFilterConfig(FilterConfig):
-    """Shared settings for torch-backed matrix filters.
 
-    Attributes:
-        ignore_nan: When ``True``, NaN entries are excluded from selection.
-        triangle: Bitmask of selectable regions on square 2-D matrices
-            (row index = ``i``, column index = ``j``). Atomic flags combine with
-            bitwise OR; named presets are sums of atoms:
-
-            - ``DIAGONAL`` (``1``): ``i == j``
-            - ``LOWER_ND`` (``2``): ``i > j``
-            - ``UPPER_ND`` (``4``): ``i < j``
-            - ``LOWER`` (``3``): ``DIAGONAL | LOWER_ND`` → ``i >= j``
-            - ``UPPER`` (``5``): ``DIAGONAL | UPPER_ND`` → ``i <= j``
-            - ``OFF_DIAGONAL`` (``6``): ``LOWER_ND | UPPER_ND`` → ``i != j``
-            - ``FULL`` (``7``): ``DIAGONAL | LOWER_ND | UPPER_ND`` → entire matrix
-        output: Result shape from :meth:`MatrixFilter.run` / :meth:`MatrixFilter.apply`:
-
-            - ``"indices"`` — integer index coordinates (default).
-            - ``"values"`` — selected matrix entries as a 1-D
-              :class:`torch.Tensor`.
-            - ``"mask"`` — boolean :class:`torch.Tensor` with ``True`` at
-              selected positions.
-            - ``"masked_values"`` — same shape as the input matrix; selected
-              entries keep their value, all other entries are ``NaN``.
-    """
-    ignore_nan: bool = True
-    triangle: int = FULL
-    preferred_input_type: Literal["torch.Tensor"] = "torch.Tensor"
-    preferred_device: Optional[Literal["cuda", "mps", "cpu"]] = None
-    output: Literal["indices", "values", "mask", "masked_values"] = "indices"
-
-
-class MatrixFilter(Filter):
-    """Base class for filters that operate on :class:`torch.Tensor` matrices.
-
-    Subclasses implement :meth:`accept_indices` against tensors already
-    converted via :meth:`~Filter._convert_input`. Shared masking for NaNs and
-    triangle regions lives here. Use :meth:`run` or :meth:`apply` —
-    not :meth:`~Filter.accept`, which only supports simple fancy indexing.
-    """
-
-    def __init__(self, config: MatrixFilterConfig):
-        super().__init__(config)
-
-    @classmethod
-    def from_config(cls, config: MatrixFilterConfig) -> "MatrixFilter":
-        return cls(config)
-
-    def apply(self, values: torch.Tensor) -> Union[np.ndarray, torch.Tensor]:
-        """Select from *values* and return the configured :attr:`~MatrixFilterConfig.output`."""
-        return self._format_output(values, self.accept_indices(values))
-
-    def _format_output(
-        self, values: torch.Tensor, indices: np.ndarray
-    ) -> Union[np.ndarray, torch.Tensor]:
-        """Map raw index coordinates to the configured output representation."""
-        if self.config.output == "indices":
-            return indices
-
-        if indices.size == 0:
-            if self.config.output == "mask":
-                return torch.zeros(values.shape, dtype=torch.bool, device=values.device)
-            if self.config.output == "masked_values":
-                return torch.full_like(values, float("nan"))
-            return torch.tensor([], dtype=values.dtype, device=values.device)
-
-        if indices.ndim == 1:
-            idx = torch.as_tensor(indices, dtype=torch.long, device=values.device)
-            if self.config.output == "values":
-                return values[idx]
-            if self.config.output == "masked_values":
-                result = torch.full_like(values, float("nan"))
-                result[idx] = values[idx]
-                return result
-            mask = torch.zeros(values.shape, dtype=torch.bool, device=values.device)
-            mask[idx] = True
-            return mask
-
-        idx_cols = tuple(
-            torch.as_tensor(indices[:, dim], dtype=torch.long, device=values.device)
-            for dim in range(indices.shape[1])
-        )
-        if self.config.output == "values":
-            return values[idx_cols]
-        if self.config.output == "masked_values":
-            result = torch.full_like(values, float("nan"))
-            result[idx_cols] = values[idx_cols]
-            return result
-        mask = torch.zeros(values.shape, dtype=torch.bool, device=values.device)
-        mask[idx_cols] = True
-        return mask
-
-    @task(name="MatrixFilter.run", task_run_name=generate_name)
-    def run(
-        self,
-        data: Union[np.ndarray, "torch.Tensor", List[float], List["RegionProperties"], pd.Series, pd.DataFrame],
-        *args: Any,
-        device: Optional[torch.device] = None,
-    ) -> Union[np.ndarray, torch.Tensor]:
-        """Normalize *data* to a tensor and return the configured output."""
-        device = resolve_torch_device(
-            device,
-            preferred_input_type=self.config.preferred_input_type,
-            preferred_device=self.config.preferred_device,
-        )
-        values = self._convert_input(
-            data, dtype=self.config.preferred_input_type, device=device
-        )
-        attribute_list = self.config.attribute_list()
-        if (
-            attribute_list
-            and len(attribute_list) != _value_column_count(values)
-        ):
-            if self.config.strict:
-                raise ValueError(
-                    f"Length of attribute list {attribute_list} and data shape "
-                    "do not match; Filter failed."
-                )
-            logger.warning(
-                "Length of attribute list %s and data shape do not match; "
-                "strict mode is disabled, ignoring filters.",
-                attribute_list,
-            )
-        return self.apply(values)
-
-    def _prepare_values(
-        self, values: torch.Tensor, exclude: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return *(masked values, validity mask)* for matrix selection."""
-        return prepare_matrix_values(
-            values,
-            exclude,
-            ignore_nan=self.config.ignore_nan,
-            triangle=self.config.triangle,
-        )
-
-    @staticmethod
-    def _filter_flat_indices(
-        flat_idx: np.ndarray, valid: torch.Tensor
-    ) -> np.ndarray:
-        """Drop flat indices that point at masked positions."""
-        if flat_idx.size == 0:
-            return flat_idx
-        valid_flat = valid.reshape(-1).cpu().numpy()
-        return flat_idx[valid_flat[flat_idx]]
-
-    def _filter_coords(
-        self, coords: np.ndarray, valid: torch.Tensor
-    ) -> np.ndarray:
-        """Drop coordinate rows that point at masked positions."""
-        if coords.size == 0:
-            return coords
-        valid_np = valid.cpu().numpy()
-        kept = [coord for coord in coords if valid_np[tuple(coord)]]
-        return np.asarray(kept, dtype=np.int64)
-
-    def accept_indices(self, values: torch.Tensor) -> np.ndarray:
-        """Return indices of matrix elements selected by this filter."""
-        raise NotImplementedError("MatrixFilter.accept_indices is not implemented")
-
-
-class TopKFilterConfig(MatrixFilterConfig):
-    """Configuration for :class:`TopKFilter`.
-
-    Attributes:
-        k: Number of values to select (default ``1``).
-        axis: Axis for :func:`torch.topk` (``None`` selects globally over the
-            flattened array). Defaults to ``1`` for row-wise selection on 2-D
-            matrices.
-        largest: When ``True``, keep the *k* largest values; when ``False``, the
-            *k* smallest.
-        sort: When ``True``, returned indices are sorted within each top-*k*
-            group.
-    """
-    k: int = 1
-    axis: Optional[int] = 1
-    largest: bool = True
-    sort: bool = False
-
-class TopKFilter(MatrixFilter):
-    """Select indices of the top-*k* values along an axis (via :func:`torch.topk`)."""
-
-    def __init__(self, config: TopKFilterConfig):
-        super().__init__(config)
-
-    @classmethod
-    def from_config(cls, config: TopKFilterConfig) -> "TopKFilter":
-        return cls(config)
-
-    def _exclude_value(self, values: torch.Tensor) -> torch.Tensor:
-        """Sentinel written over masked positions so :func:`torch.topk` skips them."""
-        fill = float("-inf") if self.config.largest else float("inf")
-        return torch.full((), fill, dtype=values.dtype, device=values.device)
-
-    def _effective_k(
-        self, valid: torch.Tensor, axis: Optional[int], ndim: int
-    ) -> int:
-        """Cap *k* by the number of selectable elements along *axis*."""
-        if axis is None or ndim == 1:
-            count = int(valid.sum().item())
-        else:
-            counts = valid.sum(dim=axis)
-            # Use max valid count per slice; rows/cols with no valid entries
-            # are dropped in :meth:`_filter_coords` after topk.
-            count = int(counts.max().item()) if counts.numel() else 0
-        return min(self.config.k, count) if count > 0 else 0
-
-    def accept_indices(self, values: torch.Tensor) -> np.ndarray:
-        """Return index coordinates of the top-*k* elements in *values*.
-
-        *values* must be a :class:`torch.Tensor` (set
-        :attr:`~FilterConfig.preferred_input_type` to ``"torch.Tensor"`` and
-        convert via :meth:`~Filter._convert_input` before calling).
-
-        Return shape depends on *values* dimensionality and ``axis``:
-
-        - 1-D or global (``axis is None``): ``(k,)`` flat indices.
-        - Global on *n*-D (``axis is None``, ``ndim > 1``): ``(k, ndim)``
-          coordinate pairs.
-        - Along ``axis`` on *n*-D: ``(k * prod(other_dims), ndim)`` coordinates
-          (e.g. ``(n_rows * k, 2)`` for a matrix with ``axis=1``).
-        """
-        if values.ndim == 0 or values.numel() == 0:
-            return np.array([], dtype=np.int64)
-
-        prepared, valid = self._prepare_values(values, self._exclude_value(values))
-        axis = self.config.axis
-        global_select = values.ndim == 1 or axis is None
-
-        if global_select:
-            k = self._effective_k(valid, axis=None, ndim=values.ndim)
-            if k <= 0:
-                return np.array([], dtype=np.int64)
-            flat = prepared.reshape(-1)
-            _, idx = torch.topk(
-                flat,
-                k=k,
-                largest=self.config.largest,
-                sorted=self.config.sort,
-            )
-            flat_idx = self._filter_flat_indices(
-                idx.detach().cpu().numpy(), valid
-            )
-            if values.ndim == 1:
-                return flat_idx
-            return self._filter_coords(
-                np.column_stack(
-                    np.unravel_index(
-                        flat_idx, tuple(int(s) for s in values.shape)
-                    )
-                ),
-                valid,
-            )
-
-        if axis < 0:
-            axis += values.ndim
-        if axis < 0 or axis >= values.ndim:
-            raise ValueError(
-                f"axis {self.config.axis!r} is out of bounds for ndim={values.ndim}"
-            )
-
-        k = self._effective_k(valid, axis=axis, ndim=values.ndim)
-        if k <= 0:
-            return np.array([], dtype=np.int64)
-
-        _, indices = torch.topk(
-            prepared,
-            k=k,
-            dim=axis,
-            largest=self.config.largest,
-            sorted=self.config.sort,
-        )
-        indices_np = indices.detach().cpu().numpy()
-        coords: list[list[int]] = []
-        for position, selected in np.ndenumerate(indices_np):
-            coord = list(position)
-            coord[axis] = int(selected)
-            coords.append(coord)
-        return self._filter_coords(np.asarray(coords, dtype=np.int64), valid)
-
-
-class ValueFilterConfig(MatrixFilterConfig):
-    """Configuration for :class:`ValueFilter`.
-
-    Attributes:
-        ref_value: Reference value for the comparison.
-        operator: Comparison operator (``"<"``, ``"<="``, ``">"``, ``">="``,
-            ``"=="``, ``"!="``).
-    """
-    ref_value: float = None
-    operator: Literal["<", "<=", ">", ">=", "==", "!="] = "<="
-
-
-class ValueFilter(MatrixFilter):
-    """Keep matrix entries that satisfy a scalar threshold comparison.
-
-    Compares each element to :attr:`ValueFilterConfig.ref_value` using the
-    configured ``operator``. Respects :attr:`~MatrixFilterConfig.ignore_nan` and
-    :attr:`~MatrixFilterConfig.triangle`.
-    """
-
-    def __init__(self, config: ValueFilterConfig):
-        super().__init__(config)
-
-    @classmethod
-    def from_config(cls, config: ValueFilterConfig) -> "ValueFilter":
-        return cls(config)
-
-    def _value_mask(self, values: torch.Tensor) -> torch.Tensor:
-        """Return a boolean mask of elements passing the configured comparison."""
-        ref_value = self.config.ref_value
-        if ref_value is None:
-            raise ValueError("ValueFilterConfig.ref_value must be set")
-        operator = self.config.operator
-        if operator == ">":
-            return values > ref_value
-        if operator == ">=":
-            return values >= ref_value
-        if operator == "<":
-            return values < ref_value
-        if operator == "<=":
-            return values <= ref_value
-        if operator == "==":
-            return values == ref_value
-        if operator == "!=":
-            return values != ref_value
-        raise ValueError(f"Invalid operator: {operator}")
-
-    def accept_indices(self, values: torch.Tensor) -> np.ndarray:
-        """Return coordinates of elements that pass the threshold and validity mask."""
-        passed = self._value_mask(values)
-        exclude = torch.zeros((), dtype=values.dtype, device=values.device)
-        _, valid = self._prepare_values(values, exclude)
-        passed &= valid
-        if values.ndim == 1:
-            return torch.where(passed)[0].detach().cpu().numpy().astype(np.int64)
-        coords = torch.stack(torch.where(passed), dim=1)
-        return coords.detach().cpu().numpy().astype(np.int64)
+from vistiq.matrix.select import (  # noqa: E402
+    MatrixFilter,
+    MatrixFilterConfig,
+    TopKFilter,
+    TopKFilterConfig,
+    ValueFilter,
+    ValueFilterConfig,
+)
 
 class MinFilterConfig(FilterConfig):
     """Configuration for :class:`MinFilter`.
@@ -656,7 +326,7 @@ class MinFilterConfig(FilterConfig):
         minimum: Lower bound; a value must meet this floor to count as passing.
         operator: ``"gte"`` or ``"gt"`` comparison against ``minimum``.
     """
-    minimum: float = None
+    minimum: Optional[float] = None
     operator: Literal["gte", "gt"] = "gte"
 
 
@@ -691,7 +361,7 @@ class MaxFilterConfig(FilterConfig):
         maximum: Upper bound; a value must meet this ceiling to count as passing.
         operator: ``"lte"`` or ``"lt"`` comparison against ``maximum``.
     """
-    maximum: float = None
+    maximum: Optional[float] = None
     operator: Literal["lte", "lt"] = "lte"
 
 
@@ -730,7 +400,7 @@ class RangeFilterConfig(FilterConfig):
         range: Tuple of (min, max) values, or "all" to accept all values.
     """
 
-    range: Union[tuple[float, float], str] = None
+    range: Optional[Union[tuple[float, float], str]] = None
 
 
 class RangeFilter(Filter):

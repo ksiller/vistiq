@@ -1,0 +1,781 @@
+"""Tests for vistiq.analysis.overlap."""
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from vistiq.analysis.overlap import (
+    BoxAreaCalculatorConfig,
+    BoxBuilderConfig,
+    BoxIntersectionCalculatorConfig,
+    BoxOverlapCalculatorConfig,
+    LabelAreaCalculatorConfig,
+    LabelBuilderConfig,
+    LabelIntersectionCalculatorConfig,
+    LabelOverlapCalculatorConfig,
+    MaskAreaCalculatorConfig,
+    MaskIntersectionCalculatorConfig,
+    MaskOverlapCalculatorConfig,
+    MaskStackBuilderConfig,
+    OverlapCalculator,
+    RegionSpec,
+    resolve_intersection_mode,
+    box_intersection_nd,
+    label_areas,
+    label_intersection_linear,
+    label_intersection_sparse,
+    mask_areas_numpy,
+    mask_intersection_numpy_split,
+    metrics_calculator_configs,
+    region_map_from_dataframe,
+    union_matrix,
+    _box_volumes,
+)
+from vistiq.analysis.overlap import IoUMetricsCalculator
+from vistiq.matrix.ops import MatrixFormatter, MatrixFormatterConfig
+from vistiq.matrix.types import UPPER, matrix_to_numpy
+
+
+def _format_overlap(
+    result,
+    *,
+    output_type: str = "dataframe",
+    annotate: bool = True,
+):
+    formatter = MatrixFormatter(
+        MatrixFormatterConfig(output_type=output_type, annotate=annotate)
+    )
+    if len(result.metrics) == 1:
+        return formatter.run(result.metric())
+    return {
+        name: formatter.run(matrix)
+        for name, matrix in result.metrics.items()
+    }
+
+
+def _boxes_pair() -> tuple[np.ndarray, np.ndarray]:
+    boxes_a = np.array(
+        [[0.0, 0.0, 0.0, 4.0, 4.0, 4.0], [10.0, 10.0, 10.0, 14.0, 14.0, 14.0]],
+        dtype=np.float32,
+    )
+    boxes_b = np.array(
+        [[2.0, 2.0, 2.0, 6.0, 6.0, 6.0], [12.0, 12.0, 12.0, 16.0, 16.0, 16.0]],
+        dtype=np.float32,
+    )
+    return boxes_a, boxes_b
+
+
+def _reference_box_overlap(
+    boxes_a: np.ndarray,
+    boxes_b: np.ndarray,
+    overlap_metric: str = "iou",
+) -> np.ndarray:
+    inter = box_intersection_nd(boxes_a, boxes_b)
+    area_a = _box_volumes(boxes_a)
+    area_b = _box_volumes(boxes_b)
+    metric = overlap_metric.lower()
+    if metric == "iou":
+        numer = inter
+        denom = area_a[:, None] + area_b[None, :] - inter
+    elif metric == "ios":
+        numer = inter
+        denom = np.minimum(area_a[:, None], area_b[None, :])
+    elif metric == "dice":
+        numer = 2 * inter
+        denom = area_a[:, None] + area_b[None, :]
+    else:
+        raise ValueError(f"unsupported metric {overlap_metric!r}")
+    out = np.zeros_like(inter, dtype=np.float32)
+    np.divide(numer, denom, out=out, where=denom > 0)
+    return out
+
+
+def _reference_mask_overlap(
+    masks_a: np.ndarray,
+    masks_b: np.ndarray,
+    overlap_metric: str = "iou",
+) -> np.ndarray:
+    inter = mask_intersection_numpy_split(masks_a, masks_b)
+    area_a = mask_areas_numpy(masks_a)
+    area_b = mask_areas_numpy(masks_b)
+    metric = overlap_metric.lower()
+    if metric == "iou":
+        numer = inter
+        denom = area_a[:, None] + area_b[None, :] - inter
+    elif metric == "ios":
+        numer = inter
+        denom = np.minimum(area_a[:, None], area_b[None, :])
+    elif metric == "dice":
+        numer = 2 * inter
+        denom = area_a[:, None] + area_b[None, :]
+    else:
+        raise ValueError(f"unsupported metric {overlap_metric!r}")
+    out = np.zeros_like(inter, dtype=np.float32)
+    np.divide(numer, denom, out=out, where=denom > 0)
+    return out
+
+
+def _mask_pair() -> tuple[np.ndarray, np.ndarray]:
+    shape = (4, 8, 8)
+    masks_a = np.zeros((2,) + shape, dtype=bool)
+    masks_a[0, 0:2, 0:2, 0:2] = True
+    masks_a[1, 2:4, 4:6, 4:6] = True
+    masks_b = np.zeros((2,) + shape, dtype=bool)
+    masks_b[0, 1:3, 1:3, 1:3] = True
+    masks_b[1, 3:5, 5:7, 5:7] = True
+    return masks_a, masks_b
+
+
+def _label_pair() -> tuple[np.ndarray, np.ndarray]:
+    labels = np.zeros((8, 16, 16), dtype=np.int32)
+    labels[1:4, 2:6, 2:6] = 1
+    labels[4:7, 10:14, 10:14] = 2
+
+    other = np.zeros_like(labels)
+    other[2:5, 3:7, 3:7] = 1
+    other[5:8, 11:15, 11:15] = 2
+    return labels, other
+
+
+def _label_pair_2d() -> tuple[np.ndarray, np.ndarray]:
+    labels = np.zeros((16, 16), dtype=np.int32)
+    labels[2:6, 2:6] = 1
+    labels[10:14, 10:14] = 2
+
+    other = np.zeros_like(labels)
+    other[3:7, 3:7] = 1
+    other[11:15, 11:15] = 2
+    return labels, other
+
+
+def _boxes_for_labels(
+    labels: np.ndarray, label_ids: tuple[int, ...]
+) -> np.ndarray:
+    width = 2 * labels.ndim
+    boxes = np.zeros((len(label_ids), width), dtype=np.float32)
+    half = labels.ndim
+    for index, label_id in enumerate(label_ids):
+        coords = np.argwhere(labels == label_id)
+        if coords.size == 0:
+            continue
+        mins = coords.min(axis=0)
+        maxs = coords.max(axis=0) + 1
+        boxes[index, :half] = mins
+        boxes[index, half:] = maxs
+    return boxes
+
+
+def _reference_label_intersection(
+    labels_a: np.ndarray,
+    labels_b: np.ndarray,
+    label_ids_a: tuple[int, ...],
+    label_ids_b: tuple[int, ...],
+) -> np.ndarray:
+    out = np.zeros((len(label_ids_a), len(label_ids_b)), dtype=np.float32)
+    for i, label_a in enumerate(label_ids_a):
+        for j, label_b in enumerate(label_ids_b):
+            out[i, j] = float(
+                np.count_nonzero((labels_a == label_a) & (labels_b == label_b))
+            )
+    return out
+
+
+class TestOverlapCalculatorBoxes:
+    def test_box_iou_matches_coincidence(self):
+        boxes_a, boxes_b = _boxes_pair()
+        expected = _reference_box_overlap(boxes_a, boxes_b, overlap_metric="iou")
+        calc = OverlapCalculator(BoxOverlapCalculatorConfig())
+        result = calc.run(boxes_a, boxes_b)
+        np.testing.assert_allclose(
+            _format_overlap(result, output_type="np.ndarray", annotate=False),
+            expected,
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+    def test_box_multi_metric(self):
+        boxes_a, boxes_b = _boxes_pair()
+        calc = OverlapCalculator(
+            BoxOverlapCalculatorConfig(
+                metrics_calculators=metrics_calculator_configs(
+                    ("iou", "ios", "dice")
+                )
+            )
+        )
+        result = calc.run(boxes_a, boxes_b)
+        formatted = _format_overlap(result, output_type="np.ndarray", annotate=False)
+        assert set(formatted.keys()) == {"iou", "ios", "dice"}
+        for matrix in formatted.values():
+            assert matrix.shape == (2, 2)
+
+
+class TestOverlapCalculatorMasks:
+    def test_mask_iou_matches_reference(self):
+        masks_a, masks_b = _mask_pair()
+        expected = _reference_mask_overlap(masks_a, masks_b, overlap_metric="iou")
+        calc = OverlapCalculator(MaskOverlapCalculatorConfig())
+        result = calc.run(masks_a, masks_b)
+        np.testing.assert_allclose(
+            _format_overlap(result, output_type="np.ndarray", annotate=False),
+            expected,
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+    def test_mask_iou_invariant_under_anisotropic_spacing(self):
+        masks_a, masks_b = _mask_pair()
+        spacing = (2.0, 1.0, 1.0)
+        numpy_backend = {"preferred_input_type": "np.ndarray"}
+        config = MaskOverlapCalculatorConfig(
+            builder=MaskStackBuilderConfig(**numpy_backend),
+            area_calculator=MaskAreaCalculatorConfig(**numpy_backend),
+            intersection_calculator=MaskIntersectionCalculatorConfig(**numpy_backend),
+            return_components=True,
+        )
+        calc = OverlapCalculator(config)
+        without = calc.run(masks_a, masks_b)
+        with_spacing = calc.run(masks_a, masks_b, spacing=spacing)
+        np.testing.assert_allclose(
+            without.metrics["iou"].matrix,
+            with_spacing.metrics["iou"].matrix, rtol=1e-5, atol=1e-5
+        )
+        voxel_volume = 2.0
+        np.testing.assert_allclose(
+            matrix_to_numpy(with_spacing.intersection),
+            matrix_to_numpy(without.intersection) * voxel_volume,
+        )
+        np.testing.assert_allclose(
+            matrix_to_numpy(with_spacing.area_a),
+            matrix_to_numpy(without.area_a) * voxel_volume,
+        )
+        np.testing.assert_allclose(
+            matrix_to_numpy(with_spacing.area_b),
+            matrix_to_numpy(without.area_b) * voxel_volume,
+        )
+
+    def test_mask_metrics_with_signed_spacing(self):
+        masks_a, masks_b = _mask_pair()
+        positive_spacing = (2.0, 1.0, 1.0)
+        signed_spacing = (-2.0, 1.0, -1.0)
+        numpy_backend = {"preferred_input_type": "np.ndarray"}
+        config = MaskOverlapCalculatorConfig(
+            builder=MaskStackBuilderConfig(**numpy_backend),
+            area_calculator=MaskAreaCalculatorConfig(**numpy_backend),
+            intersection_calculator=MaskIntersectionCalculatorConfig(**numpy_backend),
+            metrics_calculators=metrics_calculator_configs(
+                ("iou", "ios", "dice")
+            ),
+            return_components=True,
+        )
+        calc = OverlapCalculator(config)
+        without = calc.run(masks_a, masks_b)
+        positive = calc.run(masks_a, masks_b, spacing=positive_spacing)
+        signed = calc.run(masks_a, masks_b, spacing=signed_spacing)
+        for metric in ("iou", "ios", "dice"):
+            np.testing.assert_allclose(
+                without.metrics[metric].matrix,
+                positive.metrics[metric].matrix,
+                rtol=1e-5,
+                atol=1e-5,
+            )
+            np.testing.assert_allclose(
+                positive.metrics[metric].matrix,
+                signed.metrics[metric].matrix,
+                rtol=1e-5,
+                atol=1e-5,
+            )
+        assert np.all(matrix_to_numpy(signed.area_a) > 0)
+        assert np.all(matrix_to_numpy(signed.area_b) > 0)
+        assert np.all(matrix_to_numpy(signed.intersection) >= 0)
+
+
+class TestOverlapCalculatorLabels:
+    def _expected_iou(
+        self,
+        labels: np.ndarray,
+        other: np.ndarray,
+        label_ids: tuple[int, ...] = (1, 2),
+    ) -> np.ndarray:
+        inter = label_intersection_linear(labels, other, label_ids, label_ids)
+        area_a = label_areas(labels, label_ids)
+        area_b = label_areas(other, label_ids)
+        union = union_matrix(area_a, area_b, inter=inter)
+        return IoUMetricsCalculator.from_config(
+            metrics_calculator_configs(("iou",))[0]
+        ).compute(inter=inter, union=union)
+
+    def test_labels_iou_linear_path(self):
+        labels, other = _label_pair()
+        expected = self._expected_iou(labels, other)
+        result = OverlapCalculator(
+            LabelOverlapCalculatorConfig(
+                builder=LabelBuilderConfig(),
+                intersection_calculator=LabelIntersectionCalculatorConfig(
+                    mode="linear"
+                ),
+            )
+        ).run(labels, other)
+        np.testing.assert_allclose(
+            result.metric().matrix, expected, rtol=1e-5, atol=1e-5
+        )
+
+    def test_labels_iou_anisotropic_spacing(self):
+        labels, other = _label_pair()
+        spacing = (2.0, 1.0, 1.0)
+        numpy_backend = {"preferred_input_type": "np.ndarray"}
+        config = LabelOverlapCalculatorConfig(
+            builder=LabelBuilderConfig(**numpy_backend),
+            area_calculator=LabelAreaCalculatorConfig(**numpy_backend),
+            intersection_calculator=LabelIntersectionCalculatorConfig(
+                mode="linear", **numpy_backend
+            ),
+            return_components=True,
+        )
+        calc = OverlapCalculator(config)
+        without = calc.run(labels, other)
+        with_spacing = calc.run(labels, other, spacing=spacing)
+        np.testing.assert_allclose(
+            without.metrics["iou"].matrix,
+            with_spacing.metrics["iou"].matrix, rtol=1e-5, atol=1e-5
+        )
+        voxel_volume = 2.0
+        np.testing.assert_allclose(
+            matrix_to_numpy(with_spacing.intersection),
+            matrix_to_numpy(without.intersection) * voxel_volume,
+        )
+
+    def test_labels_metrics_with_signed_spacing(self):
+        labels, other = _label_pair()
+        positive_spacing = (2.0, 1.0, 1.0)
+        signed_spacing = (-2.0, -1.0, 1.0)
+        numpy_backend = {"preferred_input_type": "np.ndarray"}
+        config = LabelOverlapCalculatorConfig(
+            builder=LabelBuilderConfig(**numpy_backend),
+            area_calculator=LabelAreaCalculatorConfig(**numpy_backend),
+            intersection_calculator=LabelIntersectionCalculatorConfig(
+                mode="linear", **numpy_backend
+            ),
+            metrics_calculators=metrics_calculator_configs(
+                ("iou", "ios", "dice")
+            ),
+            return_components=True,
+        )
+        calc = OverlapCalculator(config)
+        without = calc.run(labels, other)
+        positive = calc.run(labels, other, spacing=positive_spacing)
+        signed = calc.run(labels, other, spacing=signed_spacing)
+        for metric in ("iou", "ios", "dice"):
+            np.testing.assert_allclose(
+                without.metrics[metric].matrix,
+                positive.metrics[metric].matrix,
+                rtol=1e-5,
+                atol=1e-5,
+            )
+            np.testing.assert_allclose(
+                positive.metrics[metric].matrix,
+                signed.metrics[metric].matrix,
+                rtol=1e-5,
+                atol=1e-5,
+            )
+        assert np.all(matrix_to_numpy(signed.area_a) > 0)
+        assert np.all(matrix_to_numpy(signed.area_b) > 0)
+        assert np.all(matrix_to_numpy(signed.intersection) >= 0)
+
+    def test_labels_sparse_matches_linear(self):
+        labels, other = _label_pair()
+        linear = OverlapCalculator(
+            LabelOverlapCalculatorConfig(
+                builder=LabelBuilderConfig(),
+                intersection_calculator=LabelIntersectionCalculatorConfig(
+                    mode="linear"
+                ),
+            )
+        ).run(labels, other)
+        sparse = OverlapCalculator(
+            LabelOverlapCalculatorConfig(
+                builder=LabelBuilderConfig(),
+                intersection_calculator=LabelIntersectionCalculatorConfig(
+                    mode="sparse",
+                ),
+            )
+        ).run(labels, other)
+        np.testing.assert_allclose(
+            sparse.metric().matrix, linear.metric().matrix, rtol=1e-5, atol=1e-5
+        )
+
+
+class TestOverlapCalculatorExtras:
+    def test_overlap_result_metrics_only_by_default(self):
+        boxes_a, boxes_b = _boxes_pair()
+        result = OverlapCalculator(BoxOverlapCalculatorConfig()).run(
+            boxes_a, boxes_b
+        )
+        assert result.metrics["iou"].shape == (2, 2)
+        assert result.intersection is None
+        assert result.union is None
+        assert result.area_a is None
+        assert result.area_b is None
+
+    def test_overlap_result_with_components(self):
+        boxes_a, boxes_b = _boxes_pair()
+        result = OverlapCalculator(
+            BoxOverlapCalculatorConfig(return_components=True)
+        ).run(boxes_a, boxes_b)
+        assert result.metrics["iou"].shape == (2, 2)
+        assert result.intersection.shape == (2, 2)
+        assert result.union.shape == (2, 2)
+        assert result.area_a.shape == (2,)
+        assert result.area_b.shape == (2,)
+
+    def test_triangle_mask(self):
+        boxes = _boxes_pair()[0]
+        calc = OverlapCalculator(BoxOverlapCalculatorConfig(triangle=UPPER))
+        result = calc.run(boxes, boxes)
+        matrix = _format_overlap(result, output_type="np.ndarray", annotate=False)
+        assert np.isnan(matrix[1, 0])
+        assert not np.isnan(matrix[0, 1])
+
+    def test_torch_backend_default(self):
+        pytest.importorskip("torch")
+        boxes_a, boxes_b = _boxes_pair()
+        expected = _reference_box_overlap(boxes_a, boxes_b, overlap_metric="iou")
+        calc = OverlapCalculator(BoxOverlapCalculatorConfig())
+        result = calc.run(boxes_a, boxes_b)
+        np.testing.assert_allclose(
+            _format_overlap(result, output_type="np.ndarray", annotate=False),
+            expected,
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+    def test_numpy_backend_requires_child_reconfiguration(self):
+        boxes_a, boxes_b = _boxes_pair()
+        expected = _reference_box_overlap(boxes_a, boxes_b, overlap_metric="iou")
+        numpy_backend = {"preferred_input_type": "np.ndarray"}
+        calc = OverlapCalculator(
+            BoxOverlapCalculatorConfig(
+                builder=BoxBuilderConfig(**numpy_backend),
+                area_calculator=BoxAreaCalculatorConfig(**numpy_backend),
+                intersection_calculator=BoxIntersectionCalculatorConfig(
+                    **numpy_backend
+                ),
+            )
+        )
+        result = calc.run(boxes_a, boxes_b)
+        np.testing.assert_allclose(
+            _format_overlap(result, output_type="np.ndarray", annotate=False),
+            expected,
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+    def test_backend_mismatch_rejected(self):
+        with pytest.raises(ValueError, match="pipeline children must agree"):
+            BoxOverlapCalculatorConfig(
+                builder=BoxBuilderConfig(preferred_input_type="torch.Tensor"),
+                area_calculator=BoxAreaCalculatorConfig(preferred_input_type="np.ndarray"),
+            )
+
+
+class TestRegionMap:
+    def _box_region_maps(self) -> tuple[dict[str, RegionSpec], dict[str, RegionSpec]]:
+        map_a = {
+            "obj-a0": RegionSpec(bbox=(0.0, 0.0, 0.0, 4.0, 4.0, 4.0)),
+            "obj-a1": RegionSpec(bbox=(10.0, 10.0, 10.0, 14.0, 14.0, 14.0)),
+        }
+        map_b = {
+            "obj-b0": RegionSpec(bbox=(2.0, 2.0, 2.0, 6.0, 6.0, 6.0)),
+            "obj-b1": RegionSpec(bbox=(12.0, 12.0, 12.0, 16.0, 16.0, 16.0)),
+        }
+        return map_a, map_b
+
+    def test_box_region_map_auto_annotations(self):
+        map_a, map_b = self._box_region_maps()
+        boxes_a, boxes_b = _boxes_pair()
+        expected = _reference_box_overlap(boxes_a, boxes_b, overlap_metric="iou")
+        calc = OverlapCalculator(
+            BoxOverlapCalculatorConfig()
+        )
+        result = calc.run(region_map=(map_a, map_b))
+        df = _format_overlap(result, output_type="dataframe", annotate=True)
+        assert list(df.index) == list(map_a.keys())
+        assert list(df.columns) == list(map_b.keys())
+        np.testing.assert_allclose(df.to_numpy(), expected, rtol=1e-5, atol=1e-5)
+
+    def test_label_region_map_auto_annotations(self):
+        labels, other = _label_pair()
+        map_a = {
+            "obj-l1": RegionSpec(label_id=1),
+            "obj-l2": RegionSpec(label_id=2),
+        }
+        map_b = {
+            "obj-a1": RegionSpec(label_id=1),
+            "obj-a2": RegionSpec(label_id=2),
+        }
+        numpy_backend = {"preferred_input_type": "np.ndarray"}
+        calc = OverlapCalculator(
+            LabelOverlapCalculatorConfig(
+                builder=LabelBuilderConfig(**numpy_backend),
+                area_calculator=LabelAreaCalculatorConfig(**numpy_backend),
+                intersection_calculator=LabelIntersectionCalculatorConfig(
+                    mode="linear", **numpy_backend
+                ),
+            )
+        )
+        result = calc.run(labels, other, region_map=(map_a, map_b))
+        df = _format_overlap(result, output_type="dataframe", annotate=True)
+        assert list(df.index) == ["obj-l1", "obj-l2"]
+        assert list(df.columns) == ["obj-a1", "obj-a2"]
+
+    def test_annotate_false_ignores_stored_annotations(self):
+        map_a, map_b = self._box_region_maps()
+        calc = OverlapCalculator(BoxOverlapCalculatorConfig())
+        result = calc.run(region_map=(map_a, map_b))
+        df = _format_overlap(result, output_type="dataframe", annotate=False)
+        assert list(df.index) == [0, 1]
+        assert list(df.columns) == [0, 1]
+
+    def test_region_map_from_dataframe(self):
+        df = pd.DataFrame(
+            {
+                "object_id": ["obj-1", "obj-2"],
+                "label": [1, 2],
+                "bbox-start-x": [0.0, 10.0],
+                "bbox-start-y": [0.0, 10.0],
+                "bbox-start-z": [0.0, 10.0],
+                "bbox-end-x": [4.0, 14.0],
+                "bbox-end-y": [4.0, 14.0],
+                "bbox-end-z": [4.0, 14.0],
+            }
+        )
+        region_map = region_map_from_dataframe(df)
+        assert tuple(region_map.keys()) == ("obj-1", "obj-2")
+        assert region_map["obj-1"].label_id == 1
+        assert region_map["obj-1"].bbox == (0.0, 0.0, 0.0, 4.0, 4.0, 4.0)
+
+    def test_region_map_from_dataframe_axis_named_bbox_cols(self):
+        df = pd.DataFrame(
+            {
+                "object_id": ["obj-1"],
+                "label": [1],
+                "bbox-start-z": [0.0],
+                "bbox-start-y": [1.0],
+                "bbox-start-x": [2.0],
+                "bbox-end-z": [3.0],
+                "bbox-end-y": [4.0],
+                "bbox-end-x": [5.0],
+            }
+        )
+        region_map = region_map_from_dataframe(df)
+        assert region_map["obj-1"].bbox == (0.0, 1.0, 2.0, 3.0, 4.0, 5.0)
+
+    def test_region_map_from_dataframe_axes_reorders_bbox_cols(self):
+        df = pd.DataFrame(
+            {
+                "object_id": ["obj-1"],
+                "label": [1],
+                "bbox-start-x": [2.0],
+                "bbox-end-X": [5.0],
+                "bbox-start-Z": [0.0],
+                "bbox-end-z": [3.0],
+                "bbox-start-y": [1.0],
+                "bbox-end-y": [4.0],
+            }
+        )
+        region_map = region_map_from_dataframe(df, axes=["Z", "Y", "X"])
+        assert region_map["obj-1"].bbox == (0.0, 1.0, 2.0, 3.0, 4.0, 5.0)
+
+    def test_region_map_from_dataframe_2d_bbox_cols(self):
+        df = pd.DataFrame(
+            {
+                "object_id": ["obj-1"],
+                "label": [1],
+                "bbox-start-y": [1.0],
+                "bbox-start-x": [2.0],
+                "bbox-end-y": [4.0],
+                "bbox-end-x": [5.0],
+            }
+        )
+        region_map = region_map_from_dataframe(df, axes=["Y", "X"])
+        assert region_map["obj-1"].bbox == (1.0, 2.0, 4.0, 5.0)
+
+    def test_region_map_from_dataframe_single_axis_bbox(self):
+        df = pd.DataFrame(
+            {
+                "object_id": ["obj-1"],
+                "label": [1],
+                "bbox-start-x": [2.0],
+                "bbox-end-x": [5.0],
+            }
+        )
+        region_map = region_map_from_dataframe(df)
+        assert region_map["obj-1"].bbox == (2.0, 5.0)
+
+    def test_region_map_from_dataframe_label_in_index(self):
+        df = pd.DataFrame(
+            {
+                "object_id": ["obj-1", "obj-2"],
+                "bbox-start-z": [0.0, 10.0],
+                "bbox-start-y": [0.0, 10.0],
+                "bbox-start-x": [0.0, 10.0],
+                "bbox-end-z": [4.0, 14.0],
+                "bbox-end-y": [4.0, 14.0],
+                "bbox-end-x": [4.0, 14.0],
+            },
+            index=pd.Index([1, 2], name="label"),
+        )
+        region_map = region_map_from_dataframe(df, axes=["Z", "Y", "X"])
+        assert region_map["obj-1"].label_id == 1
+        assert region_map["obj-2"].label_id == 2
+
+    def test_region_map_from_dataframe_named_range_index(self):
+        df = pd.DataFrame(
+            {
+                "object_id": ["obj-1", "obj-2"],
+                "bbox-start-z": [0.0, 10.0],
+                "bbox-start-y": [0.0, 10.0],
+                "bbox-start-x": [0.0, 10.0],
+                "bbox-end-z": [4.0, 14.0],
+                "bbox-end-y": [4.0, 14.0],
+                "bbox-end-x": [4.0, 14.0],
+            },
+            index=pd.RangeIndex(start=1, stop=3, name="label"),
+        )
+        region_map = region_map_from_dataframe(df, axes=["Z", "Y", "X"])
+        assert region_map["obj-1"].label_id == 1
+        assert region_map["obj-2"].label_id == 2
+
+    def test_region_map_from_dataframe_unmapped_bbox_cols(self):
+        df = pd.DataFrame(
+            {
+                "object_id": ["obj-1"],
+                "label": [1],
+                "bbox-0": [0.0],
+                "bbox-1": [1.0],
+                "bbox-2": [2.0],
+                "bbox-3": [3.0],
+                "bbox-4": [4.0],
+                "bbox-5": [5.0],
+            }
+        )
+        region_map = region_map_from_dataframe(df)
+        assert region_map["obj-1"].bbox == (0.0, 1.0, 2.0, 3.0, 4.0, 5.0)
+
+
+class TestLabelOverlapPrimitives:
+    def test_label_areas_matches_manual_counts_3d(self):
+        labels, _ = _label_pair()
+        ids = (1, 2)
+        areas = label_areas(labels, ids)
+        expected = np.array(
+            [np.count_nonzero(labels == 1), np.count_nonzero(labels == 2)],
+            dtype=np.float64,
+        )
+        np.testing.assert_allclose(areas, expected)
+
+    def test_label_areas_matches_manual_counts_2d(self):
+        labels, _ = _label_pair_2d()
+        ids = (1, 2)
+        areas = label_areas(labels, ids, spacing=(2.0, 1.0))
+        expected = np.array(
+            [np.count_nonzero(labels == 1), np.count_nonzero(labels == 2)],
+            dtype=np.float64,
+        ) * 2.0
+        np.testing.assert_allclose(areas, expected)
+
+    def test_label_intersection_linear_matches_reference_3d(self):
+        labels, other = _label_pair()
+        ids = (1, 2)
+        expected = _reference_label_intersection(labels, other, ids, ids)
+        linear = label_intersection_linear(labels, other, ids, ids)
+        np.testing.assert_allclose(linear, expected, rtol=1e-5, atol=1e-5)
+
+    def test_label_intersection_linear_matches_reference_2d(self):
+        labels, other = _label_pair_2d()
+        ids = (1, 2)
+        expected = _reference_label_intersection(labels, other, ids, ids)
+        linear = label_intersection_linear(labels, other, ids, ids)
+        np.testing.assert_allclose(linear, expected, rtol=1e-5, atol=1e-5)
+
+    def test_label_intersection_linear_discontinuous_ids(self):
+        labels = np.zeros((8, 8), dtype=np.int32)
+        labels[1:4, 1:4] = 1
+        labels[4:7, 4:7] = 5
+        other = np.zeros_like(labels)
+        other[2:5, 2:5] = 2
+        other[5:8, 5:8] = 6
+        ids_a = (1, 5)
+        ids_b = (2, 6)
+        expected = _reference_label_intersection(labels, other, ids_a, ids_b)
+        linear = label_intersection_linear(labels, other, ids_a, ids_b)
+        np.testing.assert_allclose(linear, expected, rtol=1e-5, atol=1e-5)
+
+    def test_label_intersection_sparse_matches_linear_3d(self):
+        labels, other = _label_pair()
+        ids = (1, 2)
+        boxes_a = _boxes_for_labels(labels, ids)
+        boxes_b = _boxes_for_labels(other, ids)
+        linear = label_intersection_linear(labels, other, ids, ids)
+        sparse = label_intersection_sparse(
+            labels, other, ids, ids, boxes_a, boxes_b
+        )
+        np.testing.assert_allclose(sparse, linear, rtol=1e-5, atol=1e-5)
+
+    def test_label_intersection_sparse_matches_linear_2d(self):
+        labels, other = _label_pair_2d()
+        ids = (1, 2)
+        boxes_a = _boxes_for_labels(labels, ids)
+        boxes_b = _boxes_for_labels(other, ids)
+        linear = label_intersection_linear(labels, other, ids, ids)
+        sparse = label_intersection_sparse(
+            labels, other, ids, ids, boxes_a, boxes_b
+        )
+        np.testing.assert_allclose(sparse, linear, rtol=1e-5, atol=1e-5)
+
+    def test_resolve_intersection_mode_auto_prefers_linear_for_large_volume(self):
+        strategy = resolve_intersection_mode(
+            shape=(204, 512, 512),
+            n_objects_a=1,
+            n_objects_b=204,
+            mode="auto",
+        )
+        assert strategy.mode == "linear"
+
+    def test_resolve_intersection_mode_auto_prefers_sparse_for_small_separated(self):
+        labels = np.zeros((32, 32), dtype=np.int32)
+        labels[0:4, 0:4] = 1
+        labels[0:4, 28:32] = 2
+        other = np.zeros_like(labels)
+        other[28:32, 0:4] = 1
+        other[28:32, 28:32] = 2
+        ids = (1, 2)
+        boxes_a = _boxes_for_labels(labels, ids)
+        boxes_b = _boxes_for_labels(other, ids)
+        strategy = resolve_intersection_mode(
+            shape=labels.shape,
+            n_objects_a=2,
+            n_objects_b=2,
+            boxes_a=boxes_a,
+            boxes_b=boxes_b,
+            mode="auto",
+            total_memory_limit=10_000,
+        )
+        assert strategy.mode == "sparse"
+
+    def test_resolve_intersection_mode_honors_explicit_linear(self):
+        strategy = resolve_intersection_mode(
+            shape=(8, 16, 16),
+            n_objects_a=2,
+            n_objects_b=2,
+            mode="linear",
+        )
+        assert strategy.mode == "linear"
+
+    def test_resolve_intersection_mode_honors_explicit_sparse(self):
+        strategy = resolve_intersection_mode(
+            shape=(204, 512, 512),
+            n_objects_a=1,
+            n_objects_b=204,
+            mode="sparse",
+        )
+        assert strategy.mode == "sparse"

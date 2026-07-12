@@ -39,13 +39,15 @@ from vistiq.utils import (
 from vistiq.preprocess import (
     Resize, 
     ResizeConfig, 
+    UpsampleConfig,
+    Upsample,
 )
 
 from vistiq.workflow import Workflow, WorkflowConfig
 
 from vistiq.analysis.overlap import OverlapCalculator, MaskOverlapCalculatorConfig
-from vistiq.analysis.matrix import group_matrix_indices
-from vistiq.constant.matrix import LOWER_ND
+from vistiq.matrix.types import LOWER_ND
+from vistiq.matrix.ops import MatrixFormatter, MatrixFormatterConfig, group_matrix_indices
 
 from vistiq.segment._debug import debug_mask_labels
 from vistiq.segment.analysis import RegionAnalyzer, RegionAnalyzerConfig
@@ -1121,7 +1123,10 @@ class Labeller(StackProcessor):
             - labels: Labeled array with unique integer labels.
             - regions: List of region properties.
         """
-        labels, regions = super().run(mask, workers=workers, verbose=verbose)
+        slice_results, _ = super().run(
+            mask, workers=workers, verbose=verbose, metadata=metadata, **kwargs
+        )
+        labels, regions = slice_results
         # print (f"type(labels)={type(labels)}, type(regions)={type(regions)}")
         # if len(labels) > 1:
         #    iterator = ArrayIterator(labels, self.config.iterator_config)
@@ -1501,7 +1506,7 @@ class SegmentationFlowConfig(WorkflowConfig):
             :class:`Relabeler` is built from ``segmenter.iterator_config``.
     """
 
-    segmenter: SegmenterConfig = None
+    segmenter: Optional[SegmenterConfig] = None
     merger: Optional[MergerConfig] = None
     # include_mask_detector: OverlapDetector
     # exclude_mask_detector: OverlapDetector
@@ -1706,12 +1711,14 @@ class TiledSegmentationFlow(SegmentationFlow):
         t_proj =  np.sum(untiled>0, axis=0)>0
 
         olcfg = MaskOverlapCalculatorConfig(
-            annotate=False,
             triangle=LOWER_ND,
-            #output_type="dataframe",
         )
-        ol = OverlapCalculator(olcfg).run(t_proj, t_proj)
-        groups = group_matrix_indices(ol, threshold=self.config.iou_threshold)
+        ol_calc = OverlapCalculator(olcfg)
+        ol_result = ol_calc.run(t_proj, t_proj)
+        iou = MatrixFormatter(
+            MatrixFormatterConfig(output_type="np.ndarray", annotate=False)
+        ).run(ol_result.metric("iou"))
+        groups = group_matrix_indices(iou, threshold=self.config.iou_threshold)
         logger.info(f"TiledSegmentationFlow: groups={groups}")
         # label grouped mask
         stacks = np.array([(t_proj[g].mean(axis=0)>self.config.consensus_threshold) * (i+1) for i,g in enumerate(groups)])
@@ -1722,8 +1729,10 @@ class TiledSegmentationFlow(SegmentationFlow):
         cropped_width = labels.shape[-1]-self.config.pad_width[-1][1]
         cropped_labels = labels[..., 0:cropped_height, 0:cropped_width]
 
-        ecfg = ResizeConfig(width=orig_width, height=orig_height, anti_aliasing=False, order=0, preserve_range=True, normalize=False, dtype=np.uint16)
-        resized_labels, _ = Resize(ecfg).run(cropped_labels, metadata=r_metadata,  **kwargs)
+        #ecfg = ResizeConfig(width=orig_width, height=orig_height, anti_aliasing=False, order=0, preserve_range=True, normalize=False, dtype=np.uint16)
+        #resized_labels, _ = Resize(ecfg).run(cropped_labels, metadata=r_metadata,  **kwargs)
+        ecfg = UpsampleConfig(width=orig_width, height=orig_height, sigma=3.0)
+        resized_labels, _ = Upsample(ecfg).run(cropped_labels, metadata=r_metadata, **kwargs)
 
         if resized_labels.shape != stack.shape:
             logging.error(f"resized_labels.shape: {resized_labels.shape} != stack.shape: {stack.shape}")

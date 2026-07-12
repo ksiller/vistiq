@@ -184,7 +184,7 @@ class BinaryProcessor(Configurable[BinaryProcessorConfig]):
 
 
 class WatershedConfig(BinaryProcessorConfig):
-    footprint: Tuple[int, ...] = None
+    footprint: Optional[Tuple[int, ...]] = None
     clear_border: bool = False
     h: float = 1.0
     min_distance: float = 1

@@ -26,7 +26,7 @@ class RangeThresholdConfig(ThresholderConfig):
             If False, threshold values are absolute.
     """
 
-    threshold: tuple[float, float] = (0.0, 1.0)
+    threshold: tuple[Optional[float], Optional[float]] = (0.0, 1.0)
     relative: bool = True
 
 

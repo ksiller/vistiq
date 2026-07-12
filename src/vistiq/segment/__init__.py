@@ -23,27 +23,17 @@ from vistiq.segment.postprocess import (
 from vistiq.segment.analysis import (
     RegionAnalyzer,
     RegionAnalyzerConfig,
+    bbox_array_from_dataframe,
     dataframe_to_numpy,
     region_column_names,
     region_to_numpy,
     regions_to_numpy,
-)
-from vistiq.constant.matrix import (
-    DIAGONAL,
-    FULL,
-    LOWER,
-    LOWER_ND,
-    OFF_DIAGONAL,
-    UPPER,
-    UPPER_ND,
 )
 from vistiq.segment.select import (
     Filter,
     FilterConfig,
     FilterOps,
     FilterOpsConfig,
-    MatrixFilter,
-    MatrixFilterConfig,
     MaxFilter,
     MaxFilterConfig,
     MinFilter,
@@ -52,10 +42,14 @@ from vistiq.segment.select import (
     RangeFilterConfig,
     RegionFilter,
     RegionFilterConfig,
-    ValueFilter,
-    ValueFilterConfig,
+)
+from vistiq.matrix.select import (
+    MatrixFilter,
+    MatrixFilterConfig,
     TopKFilter,
     TopKFilterConfig,
+    ValueFilter,
+    ValueFilterConfig,
 )
 from vistiq.segment.label import (
     SegmentationFlow,
@@ -140,13 +134,7 @@ __all__ = [
     "TopKFilter",
     "TopKFilterConfig",
     "dataframe_to_numpy",
-    "DIAGONAL",
-    "FULL",
-    "LOWER",
-    "LOWER_ND",
-    "OFF_DIAGONAL",
-    "UPPER",
-    "UPPER_ND",
+    "bbox_array_from_dataframe",
     "debug_mask_labels",
     "dilate_regions",
     "region_column_names",

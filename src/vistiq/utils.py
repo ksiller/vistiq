@@ -25,7 +25,7 @@ import cv2
 import uuid
 import torch
 
-from vistiq.constant.matrix import DIAGONAL, FULL, LOWER_ND, UPPER_ND
+from vistiq.matrix.types import ArrayBackend
 
 try:
     from bioio_ome_tiff.writers import OmeTiffWriter
@@ -67,7 +67,7 @@ def _torch_to_device(
 
 def convert_array_like(
     arr: Union[np.ndarray, torch.Tensor, Sequence[float], float, int],
-    dtype: Literal["numpy", "torch.Tensor"] = "numpy",
+    dtype: ArrayBackend = "np.ndarray",
     device: Optional[Union[torch.device, str]] = None,
 ) -> Union[np.ndarray, torch.Tensor]:
     """Convert an array-like object to the requested dtype and device."""
@@ -87,6 +87,30 @@ def convert_array_like(
     if dtype == "torch.Tensor":
         return _numpy_to_torch(arr, device)
     return arr
+
+
+SpacingLike = Optional[Union[dict[str, float], tuple[float, ...], Sequence[float]]]
+
+
+def abs_spacing(spacing: SpacingLike) -> Optional[tuple[float, ...]]:
+    if spacing is None:
+        return None
+    if isinstance(spacing, dict):
+        values = tuple(float(spacing[k]) for k in sorted(spacing.keys()))
+    else:
+        values = tuple(float(v) for v in spacing)
+    return tuple(abs(value) for value in values)
+
+
+def voxel_size(spacing: SpacingLike) -> float:
+    sp = abs_spacing(spacing)
+    if sp is None:
+        return 1.0
+    size = 1.0
+    for value in sp:
+        size *= value
+    return size
+
 
 def resolve_futures(value: Any) -> Any:
     """Resolve Prefect futures/states into concrete values.
@@ -229,7 +253,7 @@ class Configuration(BaseModel):
     Attributes:
         classname: Optional class name identifier.
     """
-    classname: str = None
+    classname: Optional[str] = None
 
 
 class ArrayIteratorConfig(Configuration):
@@ -894,7 +918,7 @@ def resolve_preferred_device(
 def resolve_torch_device(
     device: Optional[Union[torch.device, str]] = None,
     *,
-    preferred_input_type: Literal["numpy", "torch.Tensor"] = "torch.Tensor",
+    preferred_input_type: ArrayBackend = "torch.Tensor",
     preferred_device: Optional[Literal["cuda", "mps", "cpu"]] = None,
 ) -> Optional[torch.device]:
     """Resolve the torch device for array-backed calculations at runtime.
@@ -1692,44 +1716,3 @@ def find_matching_file_pairs(
         raise ValueError(f"Invalid strategy: {strategy}. Must be one of (0,0), (1,0), (0,1), or (1,1)")
     
     return matches
-
-
-def triangle_valid_mask(
-    values: torch.Tensor, flags: int
-) -> Optional[torch.Tensor]:
-    """Return a boolean mask of allowed triangle regions, or ``None`` if unrestricted."""
-    if flags == FULL:
-        return None
-    if values.ndim != 2 or values.shape[0] != values.shape[1]:
-        return None
-
-    n = values.shape[0]
-    row_idx = torch.arange(n, device=values.device).unsqueeze(1)
-    col_idx = torch.arange(n, device=values.device).unsqueeze(0)
-
-    valid = torch.zeros((n, n), dtype=torch.bool, device=values.device)
-    if flags & DIAGONAL:
-        valid |= row_idx == col_idx
-    if flags & LOWER_ND:
-        valid |= row_idx > col_idx
-    if flags & UPPER_ND:
-        valid |= row_idx < col_idx
-    return valid
-
-
-def prepare_matrix_values(
-    values: torch.Tensor,
-    exclude: torch.Tensor,
-    *,
-    ignore_nan: bool,
-    triangle: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Return *(masked values, validity mask)* for matrix reduction or selection."""
-    valid = torch.ones(values.shape, dtype=torch.bool, device=values.device)
-    if ignore_nan:
-        valid &= ~torch.isnan(values)
-    triangle_mask = triangle_valid_mask(values, triangle)
-    if triangle_mask is not None:
-        valid &= triangle_mask
-    prepared = torch.where(valid, values, exclude)
-    return prepared, valid

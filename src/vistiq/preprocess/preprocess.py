@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import numpy as np
-from typing import Optional, Literal, Any, Union
-from pydantic import Field, ImportString, field_validator, model_validator
-from scipy.ndimage import uniform_filter1d
+from typing import Optional, Literal, Any, Union, Sequence
+from pydantic import Field, ImportString, field_serializer, field_validator, model_validator
+from bioio import Dimensions, Scale
+from scipy.ndimage import uniform_filter1d, gaussian_filter, distance_transform_edt
 from skimage.exposure import rescale_intensity
 
 # segmentation, draw
 from skimage.filters import gaussian
-from skimage.transform import resize
+from skimage.transform import resize, rescale
 import logging
 
 from vistiq.core import (
@@ -60,6 +61,35 @@ class PreprocessorConfig(StackProcessorConfig):
         default=None,
         description="dtype of processed stack. If None, same as input dtype.",
     )
+
+    @field_validator("dtype", mode="before")
+    @classmethod
+    def _resolve_dtype(cls, value: Any) -> Any:
+        if value is None or isinstance(value, type):
+            return value
+        if value == "bool":
+            return bool
+        if value == "int":
+            return int
+        if value == "float":
+            return float
+        if isinstance(value, str) and hasattr(np, value):
+            return getattr(np, value)
+        return value
+
+    @field_serializer("dtype", when_used="json")
+    def _serialize_dtype(self, value: Any) -> Any:
+        if value is None:
+            return None
+        if value is bool:
+            return "bool"
+        if value is int:
+            return "int"
+        if value is float:
+            return "float"
+        if isinstance(value, type) and issubclass(value, np.generic):
+            return value.__name__
+        return value
 
 
 class Preprocessor(StackProcessor):
@@ -495,6 +525,153 @@ class Noise2Stack(Preprocessor):
         return (denoised, metadata)
 
 
+def _target_spatial_shape(
+    original_shape: tuple[int, ...],
+    *,
+    width: Optional[int],
+    height: Optional[int],
+) -> tuple[int, ...]:
+    """Compute output stack shape from optional target width/height."""
+    target_shape = list(original_shape)
+    if width is not None and height is not None:
+        target_shape[-2] = height
+        target_shape[-1] = width
+    elif width is not None:
+        aspect_ratio = original_shape[-1] / original_shape[-2]
+        target_shape[-1] = width
+        target_shape[-2] = int(width / aspect_ratio)
+    elif height is not None:
+        aspect_ratio = original_shape[-1] / original_shape[-2]
+        target_shape[-2] = height
+        target_shape[-1] = int(height * aspect_ratio)
+    else:
+        raise ValueError("At least one of width or height must be specified")
+    return tuple(target_shape)
+
+
+class UpsampleConfig(PreprocessorConfig):
+    """Configuration for label-mask upsampling via signed distance fields.
+
+    Target spatial size follows the same ``width`` / ``height`` convention as
+    :class:`ResizeConfig` (Y = height, X = width). Upsampling is applied along
+    the spatial axes kept by ``iterator_config.slice_def`` (by default the last
+    two axes).
+    """
+
+    width: Optional[int] = Field(
+        default=None,
+        description="Target width in pixels (None to maintain aspect ratio)",
+    )
+    height: Optional[int] = Field(
+        default=None,
+        description="Target height in pixels (None to maintain aspect ratio)",
+    )
+    sigma: float = Field(
+        default=1.0, description="Gaussian sigma for smoothing", ge=0.0
+    )
+    recompute_scale: bool = Field(
+        default=True,
+        description="Recompute scale/physical dimensions of upsampled pixels/voxels",
+    )
+
+    @field_validator("width", "height")
+    @classmethod
+    def validate_dimension(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v < 1:
+            raise ValueError("width and height must be >= 1 if specified")
+        return v
+
+    @model_validator(mode="after")
+    def validate_dimensions(self) -> "UpsampleConfig":
+        if self.width is None and self.height is None:
+            raise ValueError("At least one of width or height must be specified")
+        return self
+
+
+class Upsample(Preprocessor):
+    """SDT-based upsampler for label-mask stacks.
+
+    Each non-zero label is upsampled independently using a signed distance field,
+    optional Gaussian smoothing, and thresholding at zero. Intended for segmentation
+    label masks, not intensity images.
+    """
+
+    def __init__(self, config: UpsampleConfig):
+        super().__init__(config)
+
+    @classmethod
+    def from_config(cls, config: UpsampleConfig) -> "Upsample":
+        return cls(config)
+
+    def _process_slice(
+        self, slice: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs
+    ) -> np.ndarray:
+        """Upsample a single label slice to the configured spatial size."""
+        if self.config.output_shape is None:
+            raise ValueError(
+                "Upsample.output_shape must be set before processing slices; call run()"
+            )
+        target_shape = self.config.output_shape[-slice.ndim :]
+        scale = tuple(
+            target / current for target, current in zip(target_shape, slice.shape)
+        )
+        upsampled_mask = np.zeros(target_shape, dtype=slice.dtype)
+
+        label_values = np.unique(slice)
+        label_values = label_values[label_values != 0]
+
+        for label in label_values:
+            mask = slice == label
+            dist_inside = distance_transform_edt(mask)
+            dist_outside = distance_transform_edt(~mask)
+            sdt = dist_inside - dist_outside
+            upsampled_sdt = rescale(
+                sdt,
+                scale=scale,
+                order=3,
+                anti_aliasing=False,
+            )
+
+            if self.config.sigma > 0:
+                upsampled_sdt = gaussian_filter(upsampled_sdt, self.config.sigma)
+
+            upsampled_mask[upsampled_sdt > 0] = label
+
+        return upsampled_mask
+
+    @task(name="Upsample.run")
+    def run(
+        self,
+        stack: np.ndarray,
+        metadata: Optional[dict[str, Any]] = None,
+        **kwargs,
+    ) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
+        """Upsample a label stack, preserving label IDs and dtype."""
+        original_shape = stack.shape
+        target_shape = _target_spatial_shape(
+            original_shape,
+            width=self.config.width,
+            height=self.config.height,
+        )
+        if hasattr(self.config, "model_copy"):
+            self.config = self.config.model_copy(
+                update={"output_shape": target_shape}
+            )
+        else:
+            self.config.output_shape = target_shape
+        logger.info(f"Upsampling stack from {original_shape} to {target_shape}")
+
+        input_dtype = stack.dtype
+        upsampled, updated_metadata = super(Preprocessor, self).run(
+            stack, metadata=metadata, **kwargs
+        )
+
+        output_dtype = self.config.dtype if self.config.dtype is not None else input_dtype
+        if upsampled.dtype != output_dtype:
+            upsampled = upsampled.astype(output_dtype, copy=False)
+        return upsampled, updated_metadata
+
+
 class ResizeConfig(PreprocessorConfig):
     """Configuration for image resizing operations.
 
@@ -612,21 +789,11 @@ class Resize(Preprocessor):
     ) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
         """Resize an image stack."""
         original_shape = stack.shape
-        target_shape = list(original_shape)
-        if self.config.width is not None and self.config.height is not None:
-            # Both specified: use both
-            target_shape[-2] = self.config.height  # Y dimension
-            target_shape[-1] = self.config.width  # X dimension
-        elif self.config.width is not None:
-            # Only width specified: maintain aspect ratio
-            aspect_ratio = original_shape[-1] / original_shape[-2]
-            target_shape[-1] = self.config.width
-            target_shape[-2] = int(self.config.width / aspect_ratio)
-        elif self.config.height is not None:
-            # Only height specified: maintain aspect ratio
-            aspect_ratio = original_shape[-1] / original_shape[-2]
-            target_shape[-2] = self.config.height
-            target_shape[-1] = int(self.config.height * aspect_ratio)
+        target_shape = _target_spatial_shape(
+            original_shape,
+            width=self.config.width,
+            height=self.config.height,
+        )
 
         # Update config.output_shape using model_copy to ensure Pydantic validation
         # This allows _reshape_slice_results to use the correct output dimensions
@@ -673,6 +840,15 @@ class FuncProcessorConfig(PreprocessorConfig):
     func: ImportString | None = None
     args: list[Any] = Field(default_factory=list)
     kwargs: dict[str, Any] = Field(default_factory=dict)
+    output_dims: Optional[Union[Sequence[str], dict[str, int]]] = Field(
+        default=None,
+        description=(
+            "Optional output axis layout after processing. A sequence of axis "
+            "letters relabels metadata to match the result rank. A mapping of "
+            "axis letter to size reshapes the result and updates metadata "
+            "(for example {'Z': 99, 'Y': 512, 'X': 512})."
+        ),
+    )
 
 
 class FuncProcessor(Preprocessor):
@@ -685,6 +861,100 @@ class FuncProcessor(Preprocessor):
     def from_config(cls, config: FuncProcessorConfig) -> "FuncProcessor":
         return cls(config)
 
+    @staticmethod
+    def _parse_output_dims(
+        spec: Union[Sequence[str], dict[str, int]],
+    ) -> tuple[list[str], Optional[tuple[int, ...]]]:
+        if isinstance(spec, dict):
+            axes = list(spec.keys())
+            shape = tuple(int(spec[axis]) for axis in axes)
+            return axes, shape
+        axes = list(spec)
+        return axes, None
+
+    def _apply_output_dims(self, array: np.ndarray) -> np.ndarray:
+        spec = self.config.output_dims
+        if spec is None:
+            return array
+        axes, shape = self._parse_output_dims(spec)
+        if shape is not None:
+            if array.size != int(np.prod(shape)):
+                raise ValueError(
+                    f"output_dims shape {shape} does not match result size "
+                    f"{array.size} (shape {array.shape})"
+                )
+            return array.reshape(shape)
+        if len(axes) != array.ndim:
+            raise ValueError(
+                f"output_dims length {len(axes)} does not match result ndim "
+                f"{array.ndim} (shape {array.shape})"
+            )
+        return array
+
+    def _update_metadata_for_output_dims(
+        self,
+        metadata: dict[str, Any],
+        new_shape: tuple[int, ...],
+    ) -> dict[str, Any]:
+        spec = self.config.output_dims
+        assert spec is not None
+        axes, expected_shape = self._parse_output_dims(spec)
+        if expected_shape is not None and tuple(new_shape) != expected_shape:
+            raise ValueError(
+                f"output_dims shape {expected_shape} does not match result shape "
+                f"{new_shape}"
+            )
+
+        new_metadata = metadata.copy()
+        old_axes = list(metadata.get("axes", []))
+        new_metadata["axes"] = axes
+        new_metadata["shape"] = tuple(new_shape)
+        new_metadata["dims"] = Dimensions(axes, tuple(new_shape))
+        new_metadata["dim_order"] = "".join(axes)
+
+        if "scale" in new_metadata and new_metadata["scale"] is not None:
+            scale_dict = new_metadata["scale"]._asdict()
+            for axis in axes:
+                if axis not in scale_dict:
+                    scale_dict[axis] = None
+            new_metadata["scale"] = Scale(**scale_dict)
+
+        if (
+            "physical_pixel_sizes" in new_metadata
+            and new_metadata["physical_pixel_sizes"] is not None
+        ):
+            pps = new_metadata["physical_pixel_sizes"]
+            if hasattr(pps, "_asdict"):
+                pps_dict = pps._asdict()
+                new_metadata["physical_pixel_sizes"] = type(pps)(
+                    **{axis: pps_dict.get(axis) for axis in axes}
+                )
+
+        added_axes = [axis for axis in axes if axis not in old_axes]
+        if added_axes:
+            logger.info(
+                "Applied output_dims %s; added metadata axes: %s",
+                spec,
+                added_axes,
+            )
+        return new_metadata
+
+    def _update_metadata(
+        self,
+        stack,
+        results,
+        *args,
+        metadata: Optional[dict[str, Any]] = None,
+        **kwargs,
+    ) -> Optional[dict[str, Any]]:
+        if self.config.output_dims is None:
+            return super()._update_metadata(
+                stack, results, *args, metadata=metadata, **kwargs
+            )
+        if metadata is None:
+            return None
+        return self._update_metadata_for_output_dims(metadata, tuple(results.shape))
+
     def _process_slice(
         self, slice: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs
     ) -> np.ndarray:
@@ -692,24 +962,36 @@ class FuncProcessor(Preprocessor):
         args = self.config.args
         proc_kwargs = self.config.kwargs.copy()
         if "axis" in proc_kwargs:
-            axis_letters = proc_kwargs["axis"]
+            axis_spec = proc_kwargs["axis"]
+            if isinstance(axis_spec, (int, np.integer)):
+                axis_items = (int(axis_spec),)
+            elif isinstance(axis_spec, str):
+                axis_items = axis_spec
+            else:
+                axis_items = axis_spec
+
             axis_indices = tuple(
                 (
                     self._axis_index(metadata, letter)
                     if isinstance(letter, str)
                     else letter
                 )
-                for letter in axis_letters
+                for letter in axis_items
             )
             axis_indices = tuple(i for i in axis_indices if i is not None)
-            proc_kwargs["axis"] = axis_indices
+            if len(axis_indices) == 1:
+                proc_kwargs["axis"] = axis_indices[0]
+            elif len(axis_indices) == 0:
+                proc_kwargs.pop("axis")
+            else:
+                proc_kwargs["axis"] = axis_indices
             logger.info(
-                "Mapped axis letters %s to axis indices %s",
-                axis_letters,
-                axis_indices,
+                "Mapped axis %s to axis index %s",
+                axis_spec,
+                proc_kwargs.get("axis"),
             )
         results = func(slice, *args, **proc_kwargs)
         if self.config.dtype is not None and isinstance(results, np.ndarray):
             results = results.astype(self.config.dtype)
             logger.info("Converted results to %s", results.dtype)
-        return results
+        return self._apply_output_dims(results)

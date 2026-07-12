@@ -3,6 +3,11 @@ try:
 except Exception:
     __version__ = "0.0.0"
 
+import os
+
+# Suppress Prefect API log warnings when tasks run outside a flow context (e.g. notebooks).
+os.environ.setdefault("PREFECT_LOGGING_TO_API_WHEN_MISSING_FLOW", "ignore")
+
 # Automatically configure logging when package is imported
 # This ensures logging works in Jupyter notebooks and interactive environments
 import logging

@@ -1,100 +1,714 @@
-from typing import Any, Optional
-
-import numpy as np
-from pydantic import Field
-
-from vistiq.analysis.coincidence import CoincidenceDetectorConfig
-from vistiq.analysis.distance import DistanceCalculatorConfig
-from vistiq.core import ArrayIteratorConfig, Configurable
-from vistiq.workflow import Workflow, WorkflowConfig
-from vistiq.segment.analysis import RegionAnalyzer, RegionAnalyzerConfig
-from vistiq.utils import resolve_futures
+from __future__ import annotations
 
 import itertools
 import logging
+import numpy as np
+import pandas as pd
+from numpy.typing import ArrayLike
+from typing import Any, Optional, Union, Literal    
+from pydantic import Field
+from prefect import task, unmapped
+
+from vistiq.analysis import OverlapResult
+from vistiq.analysis.overlap import OverlapCalculatorConfig, region_map_from_dataframe
+from vistiq.analysis.coincidence import CoincidenceDetectorConfig
+from vistiq.matrix.calc import DistanceCalculatorConfig
+from vistiq.matrix import MatrixFilterConfig
+from vistiq.matrix.ops import (
+    MatrixAggregatorConfig,
+    MatrixCombiner,
+    MatrixCombinerConfig,
+    MatrixFormatter,
+    MatrixFormatterConfig,
+)
+from vistiq.matrix.types import MatrixData, UPPER
+from vistiq.analysis.spatial import (
+    KnnAnalysis,
+    KnnAnalysisConfig,
+    RnnAnalysis,
+    RnnAnalysisConfig,
+    SpatialScopeConfig,
+)
+from vistiq.core import ArrayIteratorConfig, Configurable, generate_name
+from vistiq.graph import (
+    GraphBuilderConfig,
+    GraphFormatter,
+    GraphFormatterConfig,
+    HierarchyBuilder,
+    HierarchyBuilderConfig,
+    GraphQuery,
+    GraphQueryConfig,
+    GraphQueryFormatter,
+    GraphQueryFormatterConfig,
+    graph_to_dataframe,
+    resolve_subtree_origins,
+    subtree_origin_key,
+)
+from vistiq.segment.analysis import RegionAnalyzer, RegionAnalyzerConfig
+from vistiq.utils import resolve_futures
+from vistiq.workflow import Workflow, WorkflowConfig
 
 logger = logging.getLogger(__name__)
 
+
+def _stack_name(metadata: Optional[list[dict[str, Any]]], index: int) -> str:
+    if metadata is not None:
+        try:
+            return metadata[index]["channel_names"][0]
+        except (KeyError, IndexError, TypeError):
+            pass
+    return f"stack_{index}"
+
+
+def _pair_stack_names(
+    metadata: Optional[list[dict[str, Any]]],
+    pair: tuple[int, int],
+) -> tuple[str, str]:
+    return _stack_name(metadata, pair[0]), _stack_name(metadata, pair[1])
+
+
+def _spacing_for_labels(
+    metadata: Optional[dict[str, Any]],
+    labels: np.ndarray,
+) -> Optional[tuple[float, ...]]:
+    if metadata is None:
+        return None
+    scale = metadata.get("scale")
+    if scale is None:
+        return None
+    return tuple(scale[-labels.ndim :])
+
+
+def _pair_key(stage: str, stack_names: tuple[str, str]) -> str:
+    return f"{stage}: {stack_names[0]} vs {stack_names[1]}"
+
+
+def _as_numpy(result: ArrayLike) -> np.ndarray:
+    """Convert filter/aggregator outputs to host numpy for pandas labeling."""
+    try:
+        import torch
+
+        if isinstance(result, torch.Tensor):
+            return result.detach().cpu().numpy()
+    except ImportError:
+        pass
+    return np.asarray(result)
+
+
 class AnalysisFlowConfig(WorkflowConfig):
-    """Configuration for the analysis workflow.
+    """Configuration for the analysis workflow."""
 
-    Args:
-        config: Configuration for the analysis workflow.
-    """
-
-    region_analyzer: RegionAnalyzerConfig = Field(default_factory=lambda:RegionAnalyzerConfig(
-        properties=["centroid"], 
-        output_type="dataframe",
-        iterator_config=ArrayIteratorConfig(slice_def=())))
+    region_analyzer: RegionAnalyzerConfig = Field(
+        default_factory=lambda: RegionAnalyzerConfig(
+            properties=["centroid"],
+            output_type="dataframe",
+            index_on="object_id",
+            map_axes=True,
+            iterator_config=ArrayIteratorConfig(slice_def=()),
+        )
+    )
     distance_calculator: Optional[DistanceCalculatorConfig] = None
     coincidence_detector: Optional[CoincidenceDetectorConfig] = None
+    overlap_calculator: Optional[OverlapCalculatorConfig] = None
+    overlap_filter: Optional[MatrixFilterConfig] = None
+    overlap_aggregator: Optional[MatrixAggregatorConfig] = None
+    matrix_formatter: MatrixFormatterConfig = Field(
+        default_factory=lambda: MatrixFormatterConfig(
+            output_type="dataframe",
+            annotate=True,
+        )
+    )
+    matrix_combiner: Optional[MatrixCombinerConfig] = Field(
+        default_factory=lambda: MatrixCombinerConfig(
+            fill_value=float("nan"),
+            symmetrize=True,
+            triangle=UPPER,
+        )
+    )
+    hierarchy_builder: Optional[HierarchyBuilderConfig] = Field(
+        default_factory=lambda: HierarchyBuilderConfig(orphan_strategy="drop")
+    )
+    graph_builder: Optional[GraphBuilderConfig] = Field(
+        default_factory=GraphBuilderConfig
+    )
+    graph_query: Optional[GraphQueryConfig] = Field(
+        default_factory=lambda: GraphQueryConfig(
+            attributes=["descendant_counts", "ancestor_lineage"],
+            filter_attribute="channel",
+            include_attributes=["label", "channel"],
+            lineage_value_attribute="label",
+        )
+    )
+    graph_query_formatter: GraphQueryFormatterConfig = Field(
+        default_factory=GraphQueryFormatterConfig
+    )
+    graph_formatter: Optional[GraphFormatterConfig] = Field(
+        default_factory=GraphFormatterConfig
+    )
+    spatial_graph_query: Optional[GraphQueryConfig] = Field(
+        default_factory=lambda: GraphQueryConfig(
+            attributes=["neighbor_summary"],
+            include_attributes=[],
+            weight_attribute="distance",
+        )
+    )
+    knn_analysis: Optional[KnnAnalysisConfig] = None
+    rnn_analysis: Optional[RnnAnalysisConfig] = None
+    spatial_scope: SpatialScopeConfig = Field(default_factory=SpatialScopeConfig)
+    auto_join: Optional[bool] = True
+    pairing_mode: Literal["combinations", "permutations", "product"] = "permutations"
+
 
 class AnalysisFlow(Workflow):
-    """Workflow that performs a series of analyses on a set of labeledimages.
-
-    Args:
-        config: Configuration for the analysis workflow.
-    """
+    """Workflow that runs region analysis and optional pairwise overlap/coincidence."""
 
     def __init__(self, config: AnalysisFlowConfig):
         super().__init__(config)
-    
-    def _run(self, labels: list[np.ndarray], metadata: Optional[list[dict[str, Any]]] = None) -> np.ndarray:
-        """Run the analysis workflow on a set of labeled images. The labeled images are expected to have the same shape.
 
-        Args:
-            labels: Set of labeled images.
-            metadata: Metadata for the labeled images.
-        """
+    def _pair_indices(self, n_items: int) -> list[tuple[int, int]]:
+        if self.config.pairing_mode == "combinations":
+            return list(itertools.combinations(range(n_items), 2))
+        elif self.config.pairing_mode == "permutations":
+            return list(itertools.permutations(range(n_items), 2))
+        elif self.config.pairing_mode == "product":
+            return list(itertools.product(range(n_items), repeat=2))
+        else:
+            raise ValueError(f"Invalid pairing mode: {self.config.pairing_mode}")
+
+    def _region_analyzer_config(self) -> RegionAnalyzerConfig:
+        required_properties = ["label", "object_id", "centroid"]
+        if self.config.overlap_calculator is not None:
+            required_properties.append("bbox")
+        if self.config.hierarchy_builder is not None:
+            required_properties.append(self.config.hierarchy_builder.rank_attribute)
+        if self.config.knn_analysis is not None:
+            required_properties.append("centroid")
+
+        output_type = "dataframe"
+        index_on = "object_id"
+        basecfg = self.config.region_analyzer
+        if basecfg is not None:
+            properties = list(set(basecfg.properties + required_properties))
+            return basecfg.model_copy(
+                update={
+                    "properties": properties,
+                    "output_type": output_type,
+                    "index_on": index_on,
+                }
+            )
+        return RegionAnalyzerConfig(
+            properties=required_properties,
+            index_on=index_on,
+            output_type=output_type,
+        )
+
+    @task(name="AnalysisFlow._to_matrix_data", task_run_name=generate_name)
+    def _to_matrix_data(
+        self, result: ArrayLike | MatrixData, overlap_result: OverlapResult
+    ) -> MatrixData:
+        if isinstance(result, MatrixData):
+            return result
+        return MatrixData(matrix=result, annotations=overlap_result.annotations)
+
+    @task(name="AnalysisFlow._format_matrix", task_run_name=generate_name)
+    def _format_matrix(self, data: MatrixData) -> pd.DataFrame | pd.Series:
+        formatter = MatrixFormatter(self.config.matrix_formatter)
+        result = formatter.run(data)
+        if not isinstance(result, (pd.DataFrame, pd.Series)):
+            raise TypeError(
+                "matrix_formatter.output_type must be 'dataframe' for workflow export"
+            )
+        return result
+
+    @task(name="AnalysisFlow._to_dataseries", task_run_name=generate_name)
+    def _to_dataseries(
+        self,
+        result: MatrixData,
+        overlap_result: OverlapResult,
+        axis: int,
+        series_name: str,
+    ) -> Union[pd.Series, MatrixData]:
+        filter_cfg = self.config.overlap_filter
+        if (
+            filter_cfg.output in ("masked_values", "mask")
+            and overlap_result.annotations is not None
+            and result.annotations is not None
+        ):
+            values = _as_numpy(result.matrix).ravel()
+            axis = int(axis)
+            if len(result.annotations) == 1:
+                (index,) = result.annotations
+            else:
+                row, col = result.annotations
+                index = col if axis == 0 else row
+            if len(values) != len(index):
+                raise ValueError(
+                    f"aggregated result length {len(values)} does not match "
+                    f"annotation length {len(index)} for axis={axis}"
+                )
+            return pd.Series(values, index=index, name=series_name)
+        return result
+
+    def _concat_region_tables(
+        self, measurements: dict[str, Any]
+    ) -> Optional[pd.DataFrame]:
+        ra_keys = sorted(key for key in measurements if key.startswith("region_analyzer:"))
+        if not ra_keys:
+            return None
+        frames: list[pd.DataFrame] = []
+        for key in ra_keys:
+            frame = measurements[key]
+            if "channel" not in frame.columns:
+                frame = frame.assign(channel=key.removeprefix("region_analyzer:").strip())
+            frames.append(frame)
+        return pd.concat(frames, ignore_index=False)
+
+    def _build_region_analyzer_all(
+        self, measurements: dict[str, Any]
+    ) -> Optional[pd.DataFrame]:
+        graph = measurements.get("containment_graph")
+        if graph is not None and self.config.graph_formatter is not None:
+            return GraphFormatter(self.config.graph_formatter).run(graph)
+        if graph is not None:
+            return graph_to_dataframe(graph)
+        return self._concat_region_tables(measurements)
+
+    @staticmethod
+    def _join_derived_columns(
+        base: pd.DataFrame, derived: list[pd.DataFrame]
+    ) -> pd.DataFrame:
+        result = base
+        for frame in derived:
+            new_cols = frame.columns.difference(result.columns)
+            if len(new_cols):
+                result = result.join(frame[new_cols], how="left")
+        return result
+
+    @staticmethod
+    def _finalize_region_analyzer_all(frame: pd.DataFrame) -> pd.DataFrame:
+        """Drop non-region rows and normalize ``channel`` for downstream grouping."""
+        if "channel" not in frame.columns:
+            return frame
+        present = frame["channel"].notna()
+        if not present.all():
+            frame = frame.loc[present].copy()
+        elif not frame["channel"].map(type).eq(str).all():
+            frame = frame.copy()
+        else:
+            return frame
+        frame["channel"] = frame["channel"].map(str)
+        return frame
+
+    def _hierarchical_analysis(
+        self,
+        ios_matrices: list[Any],
+        regions: pd.DataFrame,
+        stack_names: list[str],
+    ) -> dict[str, Any]:
+        if not ios_matrices:
+            return {}
+        if (
+            self.config.matrix_combiner is None
+            or self.config.hierarchy_builder is None
+        ):
+            return {}
+
+        combiner = MatrixCombiner(self.config.matrix_combiner)
+        ios_global = combiner.run(ios_matrices)
+        hb_cfg = self.config.hierarchy_builder
+        if self.config.graph_builder is not None:
+            hb_cfg = hb_cfg.model_copy(
+                update={"graph_builder": self.config.graph_builder}
+            )
+        hierarchy = HierarchyBuilder(hb_cfg).run(ios_global, regions)
+        formatter = MatrixFormatter(self.config.matrix_formatter)
+        output: dict[str, Any] = {
+            "ios_global": formatter.run(ios_global),
+            "containment_graph": hierarchy.graph,
+        }
+
+        gqcfg = self.config.graph_query
+        if gqcfg is None:
+            return output
+
+        if gqcfg.filter_value is not None:
+            query_configs = [gqcfg]
+        elif "channel" in regions.columns:
+            query_configs = [
+                gqcfg.model_copy(update={"filter_value": channel})
+                for channel in sorted(regions["channel"].dropna().unique())
+            ]
+        else:
+            query_configs = [
+                gqcfg.model_copy(update={"filter_value": name})
+                for name in stack_names
+            ]
+
+        filter_values = [cfg.filter_value for cfg in query_configs]
+        logger.info(f"Running graph query for filter values: {filter_values}")
+        index = (self.config.graph_formatter or GraphFormatterConfig()).index
+        gq = GraphQuery(
+            gqcfg.model_copy(update={"filter_value": None, "row_index": index})
+        )
+        gqfmt = GraphQueryFormatter(
+            self.config.graph_query_formatter.model_copy(
+                update={"output_index": index}
+            )
+        )
+        gq_results = list(
+            gq.run.map(unmapped(hierarchy.graph), node=None, filter_value=filter_values)
+        )
+        counts_frames = [
+            frame
+            for frame in resolve_futures(
+                list(
+                    gqfmt.run.map(
+                        gq_results, attribute=unmapped("descendant_counts")
+                    )
+                )
+            )
+            if isinstance(frame, pd.DataFrame) and not frame.empty
+        ]
+        lineage_frames = [
+            frame
+            for frame in resolve_futures(
+                list(
+                    gqfmt.run.map(
+                        gq_results, attribute=unmapped("ancestor_lineage")
+                    )
+                )
+            )
+            if isinstance(frame, pd.DataFrame) and not frame.empty
+        ]
+
+        graph_parts = [
+            frame
+            for frame in (
+                pd.concat(counts_frames, axis=0) if counts_frames else None,
+                pd.concat(lineage_frames, axis=0) if lineage_frames else None,
+            )
+            if frame is not None and not frame.empty
+        ]
+        if not graph_parts:
+            return output
+
+        graph_df = pd.concat(graph_parts, axis=1)
+        graph_df = graph_df.loc[:, ~graph_df.columns.duplicated()]
+        output["hierarchical_analysis"] = graph_df
+        return output
+
+    def _spatial_analysis(
+        self,
+        containment_graph: Any,
+        metadata: Optional[list[dict[str, Any]]] = None,
+    ) -> dict[str, Any]:
+        if containment_graph is None:
+            return {}
+        if self.config.knn_analysis is None and self.config.rnn_analysis is None:
+            return {}
+
+        scope = self.config.spatial_scope
+        origins = resolve_subtree_origins(
+            containment_graph,
+            match=scope.match,
+            exclude=scope.exclude,
+            auto_root=scope.auto_root,
+        )
+        axes = tuple(metadata[0].get("axes", ())) if metadata else None
+        gqcfg = self.config.spatial_graph_query
+        index = (self.config.graph_formatter or GraphFormatterConfig()).index
+        gqfmt_cfg = self.config.graph_query_formatter.model_copy(
+            update={"output_index": index}
+        )
+        output: dict[str, Any] = {}
+        knn_mapped: Optional[list[Any]] = None
+        knn_results: Optional[list[Any]] = None
+
+        if self.config.knn_analysis is not None:
+            knn = KnnAnalysis(self.config.knn_analysis)
+            knn_mapped = list(
+                knn.run.map(
+                    unmapped(containment_graph),
+                    node=origins,
+                    axes=unmapped(axes),
+                )
+            )
+            if len(origins) > 1:
+                output["knn_analysis"] = {
+                    subtree_origin_key(origin): result
+                    for origin, result in zip(origins, knn_mapped)
+                }
+            else:
+                output["knn_analysis"] = knn_mapped[0]
+
+            if gqcfg is not None:
+                knn_results = resolve_futures(knn_mapped)
+                gq = GraphQuery(
+                    gqcfg.model_copy(
+                        update={
+                            "row_index": index,
+                            "group_attribute": self.config.knn_analysis.grouping_attribute,
+                            "neighbor_analysis": "knn",
+                            "neighbor_k": self.config.knn_analysis.k,
+                        }
+                    )
+                )
+                gqfmt = GraphQueryFormatter(gqfmt_cfg)
+                gq_results = list(
+                    gq.run.map([result.graph for result in knn_results])
+                )
+                frames = [
+                    frame
+                    for frame in resolve_futures(
+                        list(
+                            gqfmt.run.map(
+                                gq_results, attribute=unmapped("neighbor_summary")
+                            )
+                        )
+                    )
+                    if isinstance(frame, pd.DataFrame) and not frame.empty
+                ]
+                if len(origins) > 1:
+                    frames = [
+                        frame.assign(spatial_origin=subtree_origin_key(origin))
+                        for frame, origin in zip(frames, origins)
+                    ]
+                if frames:
+                    output["spatial_analysis"] = pd.concat(frames, axis=0)
+
+        if self.config.rnn_analysis is not None:
+            rnn = RnnAnalysis(self.config.rnn_analysis)
+            if knn_mapped is not None:
+                knn_results = knn_results or resolve_futures(knn_mapped)
+                distance_inputs = [
+                    result.distance_matrix for result in knn_results
+                ]
+            else:
+                distance_inputs = [None] * len(origins)
+            rnn_mapped = list(
+                rnn.run.map(
+                    unmapped(containment_graph),
+                    node=origins,
+                    distance_matrix=distance_inputs,
+                    axes=unmapped(axes),
+                )
+            )
+            if len(origins) > 1:
+                output["rnn_analysis"] = {
+                    subtree_origin_key(origin): result
+                    for origin, result in zip(origins, rnn_mapped)
+                }
+            else:
+                output["rnn_analysis"] = rnn_mapped[0]
+
+            if gqcfg is not None:
+                rnn_results = resolve_futures(rnn_mapped)
+                gq = GraphQuery(
+                    gqcfg.model_copy(
+                        update={
+                            "row_index": index,
+                            "group_attribute": self.config.rnn_analysis.grouping_attribute,
+                            "neighbor_analysis": "rnn",
+                            "neighbor_radius": self.config.rnn_analysis.radius,
+                        }
+                    )
+                )
+                gqfmt = GraphQueryFormatter(gqfmt_cfg)
+                gq_results = list(
+                    gq.run.map([result.graph for result in rnn_results])
+                )
+                frames = [
+                    frame
+                    for frame in resolve_futures(
+                        list(
+                            gqfmt.run.map(
+                                gq_results, attribute=unmapped("neighbor_summary")
+                            )
+                        )
+                    )
+                    if isinstance(frame, pd.DataFrame) and not frame.empty
+                ]
+                if len(origins) > 1:
+                    frames = [
+                        frame.assign(spatial_origin=subtree_origin_key(origin))
+                        for frame, origin in zip(frames, origins)
+                    ]
+                if frames:
+                    output["rnn_spatial_analysis"] = pd.concat(frames, axis=0)
+
+        return output
+
+
+    def _run(
+        self,
+        labels: list[np.ndarray],
+        metadata: Optional[list[dict[str, Any]]] = None,
+    ) -> dict[str, Any]:
+        """Run analysis on labeled image stacks of equal shape."""
+        logger.info(f"Running analysis flow with config: {self.config}")
+        logger.info(f"Number of labels: {len(labels)}")
         if len(labels) == 0:
             raise ValueError("No labels provided")
-        if any(l.shape != labels[0].shape for l in labels):
+        if any(label.shape != labels[0].shape for label in labels):
             raise ValueError("All labels must have the same shape")
         if metadata is not None and len(metadata) != len(labels):
-            raise ValueError("Number of metadata sets must match number of labeled image stacks")
-        results = {}
-        if self.config.coincidence_detector is not None:
-            # do all pairwise combinations of labels
-            label_index_combinations = list(itertools.combinations(range(len(labels)), 2))
-            l1 = [labels[c[0]] for c in label_index_combinations]
-            l2 = [labels[c[1]] for c in label_index_combinations]
-            if metadata is not None:
-                try:
-                    sn = [(metadata[c[0]]["channel_names"][0], metadata[c[1]]["channel_names"][0]) for c in label_index_combinations]
-                except:
-                    sn = [(f"stack_{c[0]}", f"stack_{c[1]}") for c in label_index_combinations]
-            else:
-                sn = [(f"stack_{c[0]}", f"stack_{c[1]}") for c in label_index_combinations]
-            logger.info(f"Setting up coincidence detector for pairs: {sn}")
-            # run asynchronously
-            cd = Configurable.create_from_config(self.config.coincidence_detector)
-            c_results = cd.run.map(l1, l2, stack_names=sn)
-            for s, c_result in zip(sn, c_results):
-                results[f"coincidence: {s[0]} vs {s[1]}"] = c_result
+            raise ValueError(
+                "Number of metadata sets must match number of labeled image stacks"
+            )
 
-        if self.config.region_analyzer is not None:
-            # update config to add "centroid" to properties and set output type to dataframe
-            basecfg = self.config.region_analyzer
-            properties = list(set(basecfg.properties + ["label", "object_id", "centroid"]))
-            racfg = basecfg.model_copy(update={"properties": properties, "output_type": "dataframe"})
-        else:
-            # create new config, region analyzer output is needed for distance calculator
-            racfg = RegionAnalyzerConfig(properties=["label", "object_id", "centroid"], output_type="dataframe")
+        results: dict[str, Any] = {}
+        pair_indices = self._pair_indices(len(labels))
+
+        racfg = self._region_analyzer_config()
         ra = RegionAnalyzer(racfg)
-        r_results = ra.run.map(labels, metadata=metadata) # can't use run.submit because we need to use the dataframe
-        for meta, r_result in zip(metadata, r_results):
-            results[f"region_analyzer: {meta['channel_names'][0]}"] = r_result
-        """
-        if self.config.distance_calculator is not None:
-            # update config to add "centroid" to properties and set output type to dataframe
-            if self.config.distance_calculator is not None:
-                dc = Configurable.create_from_config(self.config.distance_calculator)
-                centroid_cols = [c for c in region_df.columns if c.startswith("centroid")]
-                centroids = region_df[centroid_cols].values
-                if "object_id" in region_df.columns:
-                    object_ids = region_df["object_id"].values
+        r_results = ra.run.map(labels, metadata=metadata)
+        for index, r_result in enumerate(r_results):
+            results[f"region_analyzer: {_stack_name(metadata, index)}"] = r_result
+
+        if self.config.overlap_calculator is not None and pair_indices:
+            resolved_tables = resolve_futures(
+                {str(index): r_result for index, r_result in enumerate(r_results)}
+            )
+            region_tables = [resolved_tables[str(index)] for index in range(len(labels))]
+
+            l1 = [labels[i] for i, _ in pair_indices]
+            l2 = [labels[j] for _, j in pair_indices]
+            stack_names = [_pair_stack_names(metadata, pair) for pair in pair_indices]
+            region_maps = [
+                (
+                    region_map_from_dataframe(
+                        region_tables[i],
+                        axes=metadata[i].get("axes") if metadata else None,
+                    ),
+                    region_map_from_dataframe(
+                        region_tables[j],
+                        axes=metadata[j].get("axes") if metadata else None,
+                    ),
+                )
+                for i, j in pair_indices
+            ]
+            spacings = [
+                _spacing_for_labels(metadata[i] if metadata else None, labels[i])
+                for i, _ in pair_indices
+            ]
+
+            logger.info("Setting up overlap calculator for pairs: %s", stack_names)
+            oc = Configurable.create_from_config(self.config.overlap_calculator)
+            matrix_formatter = MatrixFormatter(self.config.matrix_formatter)
+            overlap_results = oc.run.map(
+                l1,
+                l2,
+                region_map=region_maps,
+                spacing=spacings,
+            )
+            overlap_matrices = oc.matrix.map(overlap_results)
+            formatted_results = matrix_formatter.run.map(overlap_matrices)
+            for stack_name, formatted_result in zip(stack_names, formatted_results):
+                results[_pair_key("overlap", stack_name)] = formatted_result
+
+            if self.config.overlap_filter is not None:
+                overlap_filter = Configurable.create_from_config(
+                    self.config.overlap_filter
+                )
+                filtered_results = overlap_filter.run.map(overlap_matrices)
+                filter_output = self.config.overlap_filter.output
+                if filter_output in ("masked_values", "mask"):
+                    labeled_filtered = self._to_matrix_data.map(
+                        filtered_results, overlap_results
+                    )
+                    exported = self._format_matrix.map(labeled_filtered)
                 else:
-                    object_ids = region_df.index.values
-                results["distance_calculator"] = dc.run.submit(centroids, centroids, point_annotations=tuple(object_ids, object_ids))
-        """
-        return resolve_futures(results)
+                    exported = filtered_results
+                for stack_name, lf_result in zip(stack_names, exported):
+                    results[_pair_key("overlap_filtered", stack_name)] = lf_result
+
+                if self.config.overlap_aggregator is not None:
+                    overlap_aggregator = Configurable.create_from_config(
+                        self.config.overlap_aggregator
+                    )
+                    agg_inputs = self._to_matrix_data.map(
+                        filtered_results, overlap_results
+                    )
+                    agg_results = overlap_aggregator.run.map(agg_inputs)
+                    axis = self.config.overlap_aggregator.axis
+                    operation = self.config.overlap_aggregator.operation
+                    series_names = [
+                        f"{operation} {a} vs {b}" for a, b in stack_names
+                    ]
+                    labeled_agg = self._to_dataseries.map(
+                        agg_results,
+                        overlap_results,
+                        axis=unmapped(axis),
+                        series_name=series_names,
+                    )
+                    for stack_name, la_result in zip(stack_names, labeled_agg):
+                        results[_pair_key("overlap_aggregated", stack_name)] = la_result
+
+        if self.config.coincidence_detector is not None and pair_indices:
+            l1 = [labels[i] for i, _ in pair_indices]
+            l2 = [labels[j] for _, j in pair_indices]
+            stack_names = [_pair_stack_names(metadata, pair) for pair in pair_indices]
+            logger.info("Setting up coincidence detector for pairs: %s", stack_names)
+            cd = Configurable.create_from_config(self.config.coincidence_detector)
+            c_results = cd.run.map(l1, l2, stack_names=stack_names)
+            for stack_name, c_result in zip(stack_names, c_results):
+                results[_pair_key("coincidence", stack_name)] = c_result
+
+        measurements = resolve_futures(results)
+
+        stack_names = [_stack_name(metadata, index) for index in range(len(labels))]
+        regions = self._concat_region_tables(measurements)
+        if regions is not None:
+            ios_matrices = [
+                matrix
+                for key, matrix in measurements.items()
+                if key.startswith("overlap_filtered:")
+            ]
+            measurements = {
+                **measurements,
+                **self._hierarchical_analysis(
+                    ios_matrices, regions, stack_names
+                ),
+            }
+            measurements = {
+                **measurements,
+                **self._spatial_analysis(
+                    measurements.get("containment_graph"),
+                    metadata,
+                ),
+            }
+
+        if self.config.auto_join:
+            measurements = self._auto_join(resolve_futures(measurements))
+
+        return resolve_futures(measurements)
+
+    def _auto_join(self, measurements: dict[str, Any]) -> dict[str, Any]:
+        """Build region_analyzer_all and return a new measurements dict."""
+        base = self._build_region_analyzer_all(measurements)
+        if base is None:
+            return measurements
+
+        derived: list[pd.DataFrame] = []
+        for key in (
+            "hierarchical_analysis",
+            "spatial_analysis",
+            "rnn_spatial_analysis",
+        ):
+            frame = measurements.get(key)
+            if isinstance(frame, pd.DataFrame) and not frame.empty:
+                derived.append(frame)
+
+        drop_keys = {
+            "hierarchical_analysis",
+            "spatial_analysis",
+            "rnn_spatial_analysis",
+        }
+        joined = self._join_derived_columns(base, derived)
+        return {
+            **{key: value for key, value in measurements.items() if key not in drop_keys},
+            "region_analyzer_all": self._finalize_region_analyzer_all(joined),
+        }
+
+
+AnalysisFlowConfig.model_rebuild()
