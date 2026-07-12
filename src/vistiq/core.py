@@ -719,25 +719,52 @@ class StackProcessor(Configurable):
         workers: int = -1,
         verbose: int = 10,
         metadata: Optional[dict[str, Any]] = None,
+        coiterate: Optional[Sequence[np.ndarray]] = None,
         **kwargs,
     ) -> tuple[Any, Optional[dict[str, Any]]]:
         """Run the stack processor on an image.
 
         Args:
-            stack: Input stack array.
-            *args: Additional arguments to pass to _process_slice.
+            stack: Input stack array. Sliced by the :class:`ArrayIterator` and
+                passed as the first positional argument to :meth:`_process_slice`.
+            *args: Extra positional arguments forwarded to :meth:`_process_slice`
+                unchanged (never sliced). Use for scalars, tuples, and arrays
+                that must be seen whole by every slice (e.g. a 1-D id list).
             workers: Number of parallel workers (1 for single process, -1 for all cores).
             verbose: Verbosity level for parallel processing.
             metadata: Optional metadata to pass to the processor.
+            coiterate: Optional companion stacks to iterate in lock-step with
+                ``stack``. Each array must have exactly ``stack.shape`` and is
+                sliced with the same index tuple as ``stack`` on every step,
+                then forwarded to :meth:`_process_slice` positionally,
+                immediately after the primary slice and before ``*args``
+                (i.e. ``_process_slice(stack_slice, *coiterate_slices, *args, ...)``).
             **kwargs: Additional keyword arguments to pass to the processor.
 
         Returns:
             Tuple of (processed result array or tuple of lists depending on output_type, updated metadata or None).
+
+        Raises:
+            TypeError: If any ``coiterate`` entry is not a :class:`numpy.ndarray`.
+            ValueError: If any ``coiterate`` entry does not match ``stack.shape``.
         """
         logger.info(f"Running {type(self).__name__} with config: {self.config}")
         logger.info(
             f"StackProcessor.run: received workers={workers} (type: {type(workers)})"
         )
+        coiterate = tuple(coiterate) if coiterate else ()
+        for pos, companion in enumerate(coiterate):
+            if not isinstance(companion, np.ndarray):
+                raise TypeError(
+                    f"{type(self).__name__}.run: coiterate[{pos}] must be a "
+                    f"numpy.ndarray, got {type(companion).__name__}."
+                )
+            if companion.shape != stack.shape:
+                raise ValueError(
+                    f"{type(self).__name__}.run: coiterate[{pos}] has shape "
+                    f"{companion.shape}, expected {stack.shape} to be iterated "
+                    "in lock-step with the primary stack."
+                )
         iterator = ArrayIterator(stack, self.config.iterator_config)
         n_iterations = len(iterator)
         axis_labels = axis_labels_from_metadata(metadata)
@@ -747,6 +774,7 @@ class StackProcessor(Configurable):
             )
             results = self._process_slice(
                 stack,
+                *coiterate,
                 *args,
                 metadata=metadata,
                 slice_annotations=slice_annotations,
@@ -764,6 +792,7 @@ class StackProcessor(Configurable):
             )(
                 delayed(self._process_slice)(
                     stack[idx_tuple],
+                    *(companion[idx_tuple] for companion in coiterate),
                     *args,
                     metadata=metadata,
                     slice_annotations=index_tuple_to_slice_annotations(

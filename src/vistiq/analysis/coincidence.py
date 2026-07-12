@@ -291,8 +291,10 @@ class CoincidenceDetector(StackProcessor):
         else:
             stack_names = _normalize_stack_names(stack_names)
 
+        # labels2 is iterated in lock-step with labels1; stack_names is a plain
+        # positional argument passed whole to every slice.
         results, _updated_metadata = super().run(
-            labels1, labels2, stack_names, metadata=metadata, **kwargs
+            labels1, stack_names, coiterate=[labels2], metadata=metadata, **kwargs
         )
         consolidated_dfs = self._consolidate_results(results, stack_names)
         return results, consolidated_dfs

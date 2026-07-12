@@ -1466,6 +1466,7 @@ class RegionAnalyzer(StackProcessor):
     def _process_slice(
         self,
         labels: np.ndarray,
+        intensity_image: Optional[np.ndarray] = None,
         slice_annotations: Optional[dict[str, Any]] = None,
         metadata: Optional[dict[str, Any]] = None,
         stack_id: Optional[str] = None,
@@ -1475,6 +1476,11 @@ class RegionAnalyzer(StackProcessor):
 
         Args:
             labels: Labeled array for one iterator step (2D plane or ND sub-volume).
+            intensity_image: Optional intensity slice matching ``labels`` for this
+                iterator step (already sliced in lock-step by
+                :meth:`StackProcessor.run` via its ``coiterate`` argument).
+                Forwarded to ``regionprops``/``regionprops_table``; ``None`` for
+                geometry-only measurements.
             slice_annotations: Optional axis→index map from the stack iterator.
             metadata: Optional stack metadata; ``scale`` sets spacing, ``axes``
                 drives ``map_axes`` renaming. Safe to pass ``None``.
@@ -1507,7 +1513,7 @@ class RegionAnalyzer(StackProcessor):
 
         if self.config.output_type == "list":
             results = regionprops(
-                labels, extra_properties=extra_props_funcs, spacing=spacing
+                labels, intensity_image=intensity_image, extra_properties=extra_props_funcs, spacing=spacing
             )
             results = self._expand_mapped_property_attributes(
                 results, labels.ndim, metadata
@@ -1516,6 +1522,7 @@ class RegionAnalyzer(StackProcessor):
             results = pd.DataFrame(
                 regionprops_table(
                     labels,
+                    intensity_image=intensity_image,
                     properties=self.used_builtin_properties(),
                     extra_properties=extra_props_funcs,
                     spacing=spacing,
@@ -1623,6 +1630,7 @@ class RegionAnalyzer(StackProcessor):
     def run(
         self,
         labels: np.ndarray,
+        intensity_image: Optional[np.ndarray] = None,
         metadata: Optional[dict[str, Any]] = None,
         **kwargs,
     ) -> List["RegionProperties"] | pd.DataFrame:
@@ -1630,6 +1638,12 @@ class RegionAnalyzer(StackProcessor):
 
         Args:
             labels: Labeled array (any dimensionality supported by the iterator).
+            intensity_image: Optional grayscale image with the same shape as
+                ``labels``. When given, it is iterated in lock-step with
+                ``labels`` and forwarded to ``regionprops``/``regionprops_table``
+                so intensity-based properties (``mean_intensity``, weighted
+                centroids, etc.) can be computed. ``None`` computes
+                geometry-only properties.
             metadata: Optional stack metadata (spacing, axes, etc.). May be ``None``.
             **kwargs: Passed to :class:`StackProcessor` (``workers``, ``verbose``,
                 optional ``stack_id``).
@@ -1641,8 +1655,11 @@ class RegionAnalyzer(StackProcessor):
         logger.debug("DEBUG: labels shape =", getattr(labels, "shape", None))
         # debug_mask_labels("RegionAnalyzer.run", labels)
         stack_id = kwargs.pop("stack_id", None) or self.new_stack_id()
+        # Iterate the intensity image in lock-step with the labels so per-slice
+        # regionprops sees matching label/intensity sub-volumes.
+        coiterate = [intensity_image] if intensity_image is not None else None
         results, _ = super().run(
-            labels, metadata=metadata, stack_id=stack_id, **kwargs
+            labels, metadata=metadata, stack_id=stack_id, coiterate=coiterate, **kwargs
         )
         logger.debug(f"RegionAnalyzer.run(): Results = {results}")
         return results
