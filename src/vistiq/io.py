@@ -983,14 +983,23 @@ class ImageWriter(DataWriter):
         from collections import namedtuple
 
         PhysicalPixelSizes = namedtuple("PhysicalPixelSizes", ["Z", "Y", "X"])
+
+        def _physical_pixel_sizes(pps: Any) -> Optional[Any]:
+            """Build PhysicalPixelSizes, abs'ing numeric values and keeping None."""
+            if pps is None:
+                return None
+            sizes = tuple(None if v is None else abs(v) for v in pps)
+            if all(v is None for v in sizes):
+                return None
+            return PhysicalPixelSizes(*sizes)
+
         outpaths = []
         if self.config.split_channels and "C" in metadata.get("axes", []):
             data, metadata = unstack_image(data, metadata, "C", key="axes")
             for img, m in zip(data, metadata):
                 channel_names = m.get("channel_names", [])
-                pps = m.get("physical_pixel_sizes", None)
-                physical_pixel_sizes = (
-                    PhysicalPixelSizes(*map(abs, pps)) if pps is not None else None
+                physical_pixel_sizes = _physical_pixel_sizes(
+                    m.get("physical_pixel_sizes", None)
                 )
                 outpath = path.with_suffix(
                     f".{'-'.join(channel_names)}.{self.config.extension}"
@@ -1009,9 +1018,8 @@ class ImageWriter(DataWriter):
                 outpaths.append(outpath)
         else:
             channel_names = metadata.get("channel_names", [])
-            pps = metadata.get("physical_pixel_sizes", None)
-            physical_pixel_sizes = (
-                PhysicalPixelSizes(*map(abs, pps)) if pps is not None else None
+            physical_pixel_sizes = _physical_pixel_sizes(
+                metadata.get("physical_pixel_sizes", None)
             )
             outpath = path.with_suffix(
                 f".{'-'.join(channel_names)}.{self.config.extension}"

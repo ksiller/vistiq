@@ -525,6 +525,151 @@ class Noise2Stack(Preprocessor):
         return (denoised, metadata)
 
 
+class PeriodicDenoiseConfig(PreprocessorConfig):
+    """Configuration for FFT notch filtering of periodic noise.
+
+    Detects high-magnitude frequency spikes outside a protected DC disk and
+    suppresses them with circular notches before inverse FFT. Optionally
+    restrict notches to spikes whose polar angle from the spectrum center
+    falls within ``mask_angle ± angle_tolerance``.
+
+    Attributes:
+        min_distance: Radius (pixels) of the protected DC neighborhood that is
+            never notched.
+        threshold: Fraction of the magnitude-spectrum maximum used as the peak
+            detection threshold.
+        radius: Radius (pixels) of each notch circle drawn around a peak.
+        mask_angle: Target angles from the spectrum center. Empty means notch
+            every supra-threshold peak outside the DC disk. Units follow
+            ``mode``.
+        angle_tolerance: Angular half-width around each ``mask_angle`` entry.
+            Units follow ``mode``.
+        mode: Angle units for ``mask_angle`` and ``angle_tolerance`` —
+            ``"rads"`` (default) or ``"degree"``.
+    """
+
+    min_distance: int = Field(
+        default=15, description="Protected DC neighborhood radius in pixels"
+    )
+    threshold: float = Field(
+        default=0.1,
+        description="Peak threshold as a fraction of max magnitude spectrum",
+    )
+    radius: int = Field(default=5, description="Notch circle radius in pixels")
+    mask_angle: list[float] = Field(
+        default_factory=list,
+        description="Target polar angles; empty notches all supra-threshold peaks",
+    )
+    angle_tolerance: float = Field(
+        default=0.01, description="Angular half-width around each mask_angle"
+    )
+    mode: Literal["rads", "degree"] = Field(
+        default="rads", description="Units for mask_angle and angle_tolerance"
+    )
+
+    @field_validator("min_distance", "radius")
+    @classmethod
+    def _non_negative_int(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("must be >= 0")
+        return v
+
+    @field_validator("threshold")
+    @classmethod
+    def _valid_threshold(cls, v: float) -> float:
+        if not 0.0 < v <= 1.0:
+            raise ValueError("threshold must be in (0, 1]")
+        return v
+
+    @field_validator("angle_tolerance")
+    @classmethod
+    def _non_negative_tolerance(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("angle_tolerance must be >= 0")
+        return v
+
+
+class PeriodicDenoise(Preprocessor):
+    """Remove periodic noise via FFT magnitude peak detection and notch filters.
+
+    Operates on **2D** slices. For 3D stacks, configure
+    ``iterator_config=ArrayIteratorConfig(slice_def=(-2, -1))`` (or equivalent)
+    so each plane is processed independently.
+
+    When ``mask_angle`` is non-empty, only peaks whose angle from the spectrum
+    center matches a listed angle (± ``angle_tolerance``), including the
+    conjugate direction ``θ + π``, are notched.
+    """
+
+    def __init__(self, config: PeriodicDenoiseConfig):
+        super().__init__(config)
+
+    @classmethod
+    def from_config(cls, config: PeriodicDenoiseConfig) -> "PeriodicDenoise":
+        return cls(config)
+
+    @staticmethod
+    def _angle_matches(theta: float, targets: Sequence[float], tol: float) -> bool:
+        """True if ``theta`` is within ``tol`` of any target or ``target + π``."""
+        for target in targets:
+            for t in (target, target + np.pi):
+                d = (theta - t + np.pi) % (2 * np.pi) - np.pi
+                if abs(d) <= tol:
+                    return True
+        return False
+
+    def _denoise_2d(self, img: np.ndarray) -> np.ndarray:
+        import cv2
+
+        cfg = self.config
+        if cfg.mode == "degree":
+            targets = [np.deg2rad(a) for a in cfg.mask_angle]
+            tol = np.deg2rad(cfg.angle_tolerance)
+        else:
+            targets = list(cfg.mask_angle)
+            tol = cfg.angle_tolerance
+
+        f_shift = np.fft.fftshift(np.fft.fft2(img))
+        magnitude = np.abs(f_shift)
+
+        h, w = img.shape
+        center_y, center_x = h // 2, w // 2
+        yy, xx = np.ogrid[:h, :w]
+        dc_mask = (yy - center_y) ** 2 + (xx - center_x) ** 2 >= cfg.min_distance**2
+
+        thresh = float(magnitude.max()) * cfg.threshold
+        logger.debug(
+            "PeriodicDenoise: max_magnitude=%.4g threshold=%.4g peaks_mode=%s",
+            magnitude.max(),
+            thresh,
+            "angle-gated" if targets else "all",
+        )
+        peak_y, peak_x = np.where((magnitude > thresh) & dc_mask)
+
+        mask = np.ones((h, w), dtype=np.float32)
+        for y, x in zip(peak_y, peak_x):
+            if targets:
+                theta = float(np.atan2(y - center_y, x - center_x))
+                if not self._angle_matches(theta, targets, tol):
+                    continue
+            cv2.circle(mask, (int(x), int(y)), cfg.radius, 0, -1)
+
+        img_back = np.abs(np.fft.ifft2(np.fft.ifftshift(f_shift * mask)))
+        return img_back.astype(np.float32, copy=False)
+
+    def _process_slice(
+        self, slice: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs
+    ) -> np.ndarray:
+        """Notch-filter periodic noise in a single 2D slice."""
+        if slice.ndim != 2:
+            raise ValueError(
+                f"PeriodicDenoise expects 2D slices, got shape {slice.shape}. "
+                "Configure iterator_config with a 2D slice_def "
+                "(e.g. ArrayIteratorConfig(slice_def=(-2, -1)))."
+            )
+        return self._denoise_2d(slice)
+
+
 def _target_spatial_shape(
     original_shape: tuple[int, ...],
     *,
