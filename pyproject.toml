@@ -19,8 +19,8 @@ dependencies = [
     "prefect>=3.0.0",
     "bioio>=3.0.0",
     "bioio-ome-tiff>=1.4.0",
-    "cupy",
-    "cucim",
+    # "cupy",
+    # "cucim",
 ]
 requires-python = ">=3.12"
 description = "Turn complex imaging data into actionable, quantitative insight with modular, multi-step analysis."
