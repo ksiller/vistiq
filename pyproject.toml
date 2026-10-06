@@ -10,9 +10,10 @@ dependencies = [
     "scikit-image",
     "scikit-learn",
     "scipy",
-    "torch>=2.7",
+    "supervision",
+    "torch<=2.5",
     "torchvision",
-    "trackastra<0.4",
+    # "trackastra<0.4",
     # "torch-em",
     "tifffile",
     "typer",
@@ -32,7 +33,21 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-napari = ["vistiq-napari"]
+microsam = [
+    "micro_sam>1.8.0",
+]
+
+notebook = [
+    "jupyterlab", # ipywidgets 
+    "ipycanvas",  # ipympl
+    "stackview",
+]
+
+napari = [
+    "PyQt6<6.9",
+    "napari[pyqt6,optional]>=0.7",
+]
+
 test = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
@@ -132,5 +147,3 @@ exclude_lines = [
     "if TYPE_CHECKING:",
     "@abstractmethod",
 ]
-
-
