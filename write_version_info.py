@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,7 +36,8 @@ def write_version_info(
         "build_date", datetime.now(timezone.utc).isoformat()
     )
     version = template_fields.get("version", "unknown")
-    dirty = "dirty" in version
+    # dirty builds carry a ".d<date>" / "+d<date>" local version suffix
+    dirty = re.search(r"[+.]d\d{8}$", version) is not None
 
     build_info = textwrap.dedent(
         f"""\
