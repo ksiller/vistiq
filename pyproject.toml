@@ -2,16 +2,19 @@
 name = "vistiq"
 dynamic = ["version"]
 dependencies = [
+    "fastparquet",
     "numpy",
     "opencv-python-headless",
     "joblib",
     "pandas",
+    "pyarrow",
     "pydantic>=2.10",
+    "pyvis",
     "scikit-image",
     "scikit-learn",
     "scipy",
     "supervision",
-    "torch<=2.5",
+    "torch>2.7",
     "torchvision",
     # "trackastra<0.4",
     # "torch-em",
@@ -73,6 +76,21 @@ requires = [
     "versioningit",
 ]
 build-backend = "hatchling.build"
+
+[tool.uv.sources]
+# CUDA builds on Windows and Linux x86_64; macOS (Intel and Apple Silicon) and
+# other platforms fall back to the default PyPI wheels (no CUDA builds exist there).
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'win32' or (sys_platform == 'linux' and platform_machine == 'x86_64')" },
+]
+torchvision = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'win32' or (sys_platform == 'linux' and platform_machine == 'x86_64')" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [tool.hatch.version]
 source = "versioningit"
